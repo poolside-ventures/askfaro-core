@@ -1,0 +1,21 @@
+# askfaro-core-stt — on-device speech-to-text for the Faro on-device SDK.
+#
+# Public, MIT, askfaro-branded from birth (no rename on mirror). Self-contained
+# (explicit package fields, not workspace-inherited) so it copies verbatim into
+# the standalone public `askfaro-core` repo. Pulls a heavy native dep (ort via
+# parakeet-rs), so it is NOT a default workspace member — the server/Python wheel
+# build never compiles it.
+[package]
+name = "askfaro-core-stt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "On-device speech-to-text (NVIDIA Parakeet via ONNX Runtime) for the Faro on-device SDK."
+repository = "https://github.com/poolside-ventures/askfaro-core"
+
+[dependencies]
+parakeet-rs = "0.3.6"
+thiserror = "2"
+
+[dev-dependencies]
+hound = "3"

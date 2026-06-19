@@ -1,0 +1,9 @@
+# askfaro-core — the public Faro on-device SDK (Rust).
+#
+# This repo is a generated mirror: the crate sources under each member directory
+# are the source of truth in the private monorepo (poolside-ventures/faro,
+# `faro-core/`) and are synced here. Do not hand-edit the mirrored crate sources;
+# edit them in the monorepo and re-sync.
+[workspace]
+resolver = "2"
+members = ["core-stt"]
