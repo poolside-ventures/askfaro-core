@@ -15,6 +15,8 @@
 //! # Ok::<(), askfaro_core_stt::SttError>(())
 //! ```
 
+pub mod models;
+
 use std::path::Path;
 
 use parakeet_rs::{ParakeetTDT, Transcriber};

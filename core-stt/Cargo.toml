@@ -16,6 +16,11 @@ repository = "https://github.com/poolside-ventures/askfaro-core"
 [dependencies]
 parakeet-rs = "0.3.6"
 thiserror = "2"
+# Model verification only (sha256 of downloaded files). Pure-Rust, cross-compiles
+# to every mobile target unchanged. The crate stays network-free — the HOST
+# downloads; the crate owns the spec + verification.
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 hound = "3"
