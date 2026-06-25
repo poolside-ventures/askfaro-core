@@ -6,4 +6,4 @@
 # edit them in the monorepo and re-sync.
 [workspace]
 resolver = "2"
-members = ["core-stt"]
+members = ["askfaro-core"]

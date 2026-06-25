@@ -1,10 +1,10 @@
 //! Minimal end-to-end check: load a model, transcribe a 16 kHz wav, print RTF.
 //!
-//!   cargo run -p askfaro-core-stt --example transcribe --release -- <model_dir> <wav>
+//!   cargo run -p askfaro-core --example transcribe --features stt --release -- <model_dir> <wav>
 
 use std::time::Instant;
 
-use askfaro_core_stt::SttEngine;
+use askfaro_core::stt::SttEngine;
 
 fn main() {
     let model_dir = std::env::args()

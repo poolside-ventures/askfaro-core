@@ -1,4 +1,4 @@
-//! # askfaro-core-stt
+//! # askfaro-core::stt
 //!
 //! On-device speech-to-text for the Faro on-device SDK. A thin, host-facing wrapper
 //! over a Parakeet TDT model running on ONNX Runtime (via `parakeet-rs`) — the
@@ -8,11 +8,12 @@
 //! server/Python build never includes it, so the wheel stays small.
 //!
 //! ```no_run
-//! use askfaro_core_stt::SttEngine;
+//! use askfaro_core::stt::SttEngine;
+//! # let pcm_f32: Vec<f32> = vec![];
 //! let mut engine = SttEngine::load("/path/to/parakeet-model")?;
 //! let transcript = engine.transcribe(pcm_f32, 16_000, 1)?;
 //! println!("{}", transcript.text);
-//! # Ok::<(), askfaro_core_stt::SttError>(())
+//! # Ok::<(), askfaro_core::stt::SttError>(())
 //! ```
 
 pub mod models;

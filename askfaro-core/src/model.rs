@@ -1,13 +1,15 @@
-//! Model provisioning — the canonical *spec* for the on-device speech model
-//! (files, source URLs, sizes, sha256) plus presence/verification helpers.
+//! Shared on-device model provisioning — the *mechanism* (files, sizes, sha256,
+//! presence/verification) that both `core-stt` and `core-search` build on. Each
+//! domain crate owns its own [`ModelSpec`] constants; this crate owns the type
+//! and the verify subsystem.
 //!
 //! Network-free by design: the crate owns the spec and verification; the **host**
 //! performs the actual download with its platform-native transport (so it can do
 //! background download, Wi-Fi-only, and progress UI). That keeps this crate
 //! dependency-light and cross-compiling unchanged to every mobile target.
 //!
-//! Typical host flow: [`missing`] → download each file → [`verify`] → then
-//! [`crate::SttEngine::load`] on [`ModelSpec::dir`].
+//! Typical host flow: [`missing`] → download each file → [`verify`] → then load
+//! the model from [`ModelSpec::dir`].
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -46,32 +48,6 @@ impl ModelSpec {
         cache_root.join(self.id)
     }
 }
-
-/// The validated default: NVIDIA Parakeet TDT 0.6B v3, int8, multilingual.
-pub const PARAKEET_TDT_V3_INT8: ModelSpec = ModelSpec {
-    id: "parakeet-tdt-0.6b-v3-int8",
-    display_name: "Parakeet TDT 0.6B v3 (multilingual)",
-    files: &[
-        ModelFile {
-            name: "encoder-model.int8.onnx",
-            url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
-            sha256: "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09",
-            size: 652_183_999,
-        },
-        ModelFile {
-            name: "decoder_joint-model.int8.onnx",
-            url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
-            sha256: "eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70",
-            size: 18_202_004,
-        },
-        ModelFile {
-            name: "vocab.txt",
-            url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
-            sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
-            size: 93_939,
-        },
-    ],
-};
 
 /// True if every file is present at the right size (cheap; no hashing).
 pub fn is_present(spec: &ModelSpec, cache_root: &Path) -> bool {

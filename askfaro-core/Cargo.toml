@@ -1,0 +1,91 @@
+# askfaro-core — the single on-device SDK core for Faro.
+#
+# ONE crate, ONE import; every capability is a cargo feature. This replaces the
+# former per-capability crates (core-model/stt/search/generation/progressive) so
+# consumers add a single git/crates.io dependency and switch capabilities on with
+# features rather than juggling a fistful of packages:
+#
+#   askfaro-core = { git = "...", default-features = false, features = ["stt"] }
+#
+# Heavy/platform deps are pulled ONLY by the feature that needs them, so the
+# default build stays light and cross-compiles unchanged:
+#   - search        rusqlite (bundled FTS5 SQLite) + md5 bag-of-words embedder
+#   - embeddinggemma  ort + tokenizers (the EmbeddingGemma vector embedder)
+#   - stt           parakeet-rs (ONNX Runtime) for speech-to-text
+#   - apple-fm      swift-rs + a vendored Swift bridge (Apple Foundation Models),
+#                   compiled only on macOS/iOS in build.rs
+#
+# Public, MIT, askfaro-branded. Self-contained (explicit package fields) so it
+# copies verbatim into the public poolside-ventures/askfaro-core repo.
+[package]
+name = "askfaro-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "On-device SDK core for Faro: model provisioning, embedded search, text generation + tool-calling, and progressive catalog selection. One crate, capabilities behind features."
+repository = "https://github.com/poolside-ventures/askfaro-core"
+
+[features]
+# Light, broadly-useful defaults; heavy/platform capabilities are opt-in.
+default = ["search", "generation", "progressive"]
+# Shared model provisioning (sha256 spec + verify). Internal; pulled by stt/search.
+model = ["dep:sha2", "dep:hex"]
+# Embedded hybrid search (FTS5 lexical + bag-of-words semantic, RRF).
+search = ["model", "dep:rusqlite", "dep:md5"]
+# Provider-agnostic text generation + tool-calling types (model-free).
+generation = []
+# Catalog selector: relevance ranking + progressive budget-bounded pcx expansion.
+progressive = ["search", "generation"]
+# On-device speech-to-text (NVIDIA Parakeet via ONNX Runtime).
+stt = ["model", "dep:parakeet-rs"]
+# The EmbeddingGemma-300M ONNX embedder for `search` (heavy: ort + tokenizers).
+embeddinggemma = ["search", "dep:ort", "dep:tokenizers"]
+# Apple Foundation Models generation provider (macOS/iOS 26+; compiled in build.rs).
+apple-fm = ["generation", "dep:swift-rs"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# --- model feature ---
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+
+# --- search feature ---
+# Bundled SQLite is compiled with FTS5 enabled — the lexical retriever needs it.
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+md5 = { version = "0.7", optional = true }
+
+# --- stt feature ---
+parakeet-rs = { version = "0.3.6", optional = true }
+
+# --- embeddinggemma feature ---
+ort = { version = "=2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", optional = true }
+
+# --- apple-fm feature (runtime FFI marshalling types) ---
+swift-rs = { version = "1.0.7", optional = true }
+
+[build-dependencies]
+# Drives SwiftPM to compile + link the vendored Apple FM bridge. Same optional
+# dependency name as the runtime dep, so the `apple-fm` feature activates both.
+swift-rs = { version = "1.0.7", features = ["build"], optional = true }
+
+[dev-dependencies]
+hound = "3"
+
+# The STT transcription example only compiles with the stt feature.
+[[example]]
+name = "transcribe"
+required-features = ["stt"]
+
+# Retrieval-parity conformance suite (lexical + BoW); needs the search backend.
+[[test]]
+name = "conformance"
+required-features = ["search"]
+
+# EmbeddingGemma end-to-end test; needs the heavy ONNX embedder.
+[[test]]
+name = "gemma_e2e"
+required-features = ["embeddinggemma"]

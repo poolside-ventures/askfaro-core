@@ -1,0 +1,4 @@
+# SwiftPM build output if someone runs `swift build` in the vendored package
+# directly (swift-rs normally builds into Cargo's OUT_DIR, not here). Package.swift
+# and Package.resolved ARE committed for reproducible builds.
+/swift/.build/

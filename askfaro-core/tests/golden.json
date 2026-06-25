@@ -1,0 +1,205 @@
+{
+  "corpus": [
+    [
+      "note",
+      "n1",
+      "Grocery list",
+      "milk eggs bread butter",
+      {
+        "folder": "home"
+      }
+    ],
+    [
+      "note",
+      "n2",
+      "Quantum entanglement",
+      "spooky action at a distance physics",
+      {
+        "folder": "science"
+      }
+    ],
+    [
+      "note",
+      "n3",
+      "Bread recipe",
+      "flour water yeast salt baking oven",
+      {
+        "folder": "home"
+      }
+    ],
+    [
+      "task",
+      "t1",
+      "Fix login bug",
+      "oauth redirect loop authentication",
+      {
+        "folder": "work"
+      }
+    ],
+    [
+      "task",
+      "t2",
+      "Quarterly planning",
+      "roadmap milestones objectives",
+      {
+        "folder": "work"
+      }
+    ],
+    [
+      "contact",
+      "c1",
+      "Ada Lovelace",
+      "mathematician analytical engine",
+      {
+        "folder": "people"
+      }
+    ],
+    [
+      "contact",
+      "c2",
+      "Grace Hopper",
+      "compiler nanosecond navy programming",
+      {
+        "folder": "people"
+      }
+    ],
+    [
+      "email",
+      "e1",
+      "Invoice due",
+      "payment reminder client overdue",
+      {
+        "folder": "mail"
+      }
+    ],
+    [
+      "tool",
+      "tl1",
+      "Stripe payments",
+      "charge card customer checkout",
+      {
+        "folder": "finance"
+      }
+    ]
+  ],
+  "queries": [
+    {
+      "query": {
+        "query": "groceries"
+      },
+      "ranked": [
+        [
+          "n1",
+          "keyword"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "bread baking yeast"
+      },
+      "ranked": [
+        [
+          "n3",
+          "hybrid"
+        ],
+        [
+          "n1",
+          "semantic"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "quantum physics distance"
+      },
+      "ranked": [
+        [
+          "n2",
+          "hybrid"
+        ],
+        [
+          "t1",
+          "semantic"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "roadmap planning",
+        "object_types": [
+          "task"
+        ]
+      },
+      "ranked": [
+        [
+          "t2",
+          "hybrid"
+        ],
+        [
+          "t1",
+          "semantic"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "yeast",
+        "attrs": {
+          "folder": "home"
+        }
+      },
+      "ranked": [
+        [
+          "n3",
+          "hybrid"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "oauth authentication login"
+      },
+      "ranked": [
+        [
+          "t1",
+          "hybrid"
+        ],
+        [
+          "t2",
+          "semantic"
+        ],
+        [
+          "n2",
+          "semantic"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "compiler programming"
+      },
+      "ranked": [
+        [
+          "c2",
+          "hybrid"
+        ]
+      ]
+    },
+    {
+      "query": {
+        "query": "card payment checkout"
+      },
+      "ranked": [
+        [
+          "tl1",
+          "hybrid"
+        ],
+        [
+          "e1",
+          "semantic"
+        ]
+      ]
+    }
+  ]
+}
