@@ -1,0 +1,245 @@
+{
+  "pcx_version": "0.2",
+  "usage": "This is a progressive-context (pcx) manifest: a compact, navigable index of a much larger body of content, meant to be read under a small token budget. You are seeing descriptors, NOT full content. Each node has `what` (what it is), `when` (when it is relevant), a token cost, and either `children` (a branch) or a `payload` (a leaf). Two features let you navigate faster than scanning the whole tree, and you should reach for them FIRST:\n\u2022 FILTER BEFORE YOU SCAN. If you already know which kind/category/type of thing you need, narrow with `facets` (a map of orthogonal tags like kind/category/output) before reading any descriptors \u2014 call the `filter` tool (or match `facets` yourself). Facet-first is multiplicative precision: it cuts the space cheaply so you rank a handful of candidates, not the whole catalog. Skip it only when you can't name a facet value up front.\n\u2022 FOLLOW SEE-ALSO WHEN CLOSE-BUT-NOT-EXACT. When you open a node and it's *nearly* what you want but not quite, do NOT restart from the top \u2014 check its `links` (see-also references `{to, why}` to related nodes in OTHER branches). The `why` says how each is related; follow the one that matches your gap. This is the lateral move the tree can't express, and it's usually one hop instead of a fresh descent.\nOtherwise, to find something cold: (1) scan the descriptors under `root.children`; (2) follow the node whose `when` best matches your goal; (3) for a branch, look up its child ids in `nodes` to go deeper; (4) for a leaf, fetch the full verbatim content by resolving `payload.ref` (e.g. `node://<id>`) \u2014 a leaf's content is not in this file. Expand only what you need and stay within `variant.budget` tokens. If your host exposes navigation tools (index / open / look / related / filter), prefer those; otherwise resolve `node://` refs yourself.",
+  "source": {
+    "id": "scope-tools",
+    "kind": "tools",
+    "content_hash": "sha256:6b885c9dc8adb991",
+    "generated_at": "2026-07-08T08:17:19.986020+00:00"
+  },
+  "variant": {
+    "budget": 4096,
+    "manifest_tokens": 112,
+    "siblings": []
+  },
+  "full_tokens": 513,
+  "root": {
+    "id": "r",
+    "title": "scope-tools tools",
+    "what": "Callable tools and their schemas.",
+    "when": "Consult for anything about scope-tools tools.",
+    "children": [
+      "crm",
+      "mail",
+      "tasks"
+    ]
+  },
+  "nodes": {
+    "crm": {
+      "tier": 1,
+      "title": "crm",
+      "what": "Tools in the crm namespace.",
+      "when": "Consult for anything about crm.",
+      "tokens": 0,
+      "desc_tokens": 26,
+      "subtree_tokens": 164,
+      "content_hash": "sha256:451a63e685612791",
+      "keywords": [
+        "crm",
+        "contact",
+        "upsert",
+        "save",
+        "person",
+        "record"
+      ],
+      "links": [
+        {
+          "to": "mail",
+          "why": "related: both involve consult, contact, namespace"
+        }
+      ],
+      "children": [
+        "crm-contact-upsert",
+        "crm-company-upsert"
+      ]
+    },
+    "crm-contact-upsert": {
+      "tier": 2,
+      "title": "crm.contact_upsert",
+      "what": "crm.contact_upsert: Save a contact person record with their name and email address.",
+      "when": "Use when the task involves crm.contact_upsert.",
+      "tokens": 82,
+      "desc_tokens": 42,
+      "subtree_tokens": 82,
+      "content_hash": "sha256:78829959bd0f8e88",
+      "keywords": [
+        "crm",
+        "contact_upsert"
+      ],
+      "links": [
+        {
+          "to": "mail-draft",
+          "why": "related: both involve address, contact, email"
+        }
+      ],
+      "payload": {
+        "ref": "node://crm-contact-upsert",
+        "format": "json",
+        "render": [
+          "full"
+        ]
+      }
+    },
+    "crm-company-upsert": {
+      "tier": 2,
+      "title": "crm.company_upsert",
+      "what": "crm.company_upsert: Create or update a CRM company record, with name and domain.",
+      "when": "Use when the task involves crm.company_upsert.",
+      "tokens": 82,
+      "desc_tokens": 42,
+      "subtree_tokens": 82,
+      "content_hash": "sha256:0b4fbb7c70d8f0ae",
+      "keywords": [
+        "crm",
+        "company_upsert"
+      ],
+      "payload": {
+        "ref": "node://crm-company-upsert",
+        "format": "json",
+        "render": [
+          "full"
+        ]
+      }
+    },
+    "mail": {
+      "tier": 1,
+      "title": "mail",
+      "what": "Tools in the mail namespace.",
+      "when": "Consult for anything about mail.",
+      "tokens": 0,
+      "desc_tokens": 26,
+      "subtree_tokens": 149,
+      "content_hash": "sha256:194c804910c6462a",
+      "keywords": [
+        "mail",
+        "draft",
+        "email",
+        "contact",
+        "person",
+        "using"
+      ],
+      "links": [
+        {
+          "to": "crm",
+          "why": "related: both involve consult, contact, namespace"
+        }
+      ],
+      "children": [
+        "mail-draft",
+        "mail-send"
+      ]
+    },
+    "mail-draft": {
+      "tier": 2,
+      "title": "mail.draft",
+      "what": "mail.draft: Draft an email to a contact person using their name and email address.",
+      "when": "Use when the task involves mail.draft.",
+      "tokens": 81,
+      "desc_tokens": 36,
+      "subtree_tokens": 81,
+      "content_hash": "sha256:1db50e9799bd23b4",
+      "keywords": [
+        "mail",
+        "draft"
+      ],
+      "links": [
+        {
+          "to": "crm-contact-upsert",
+          "why": "related: both involve address, contact, email"
+        }
+      ],
+      "payload": {
+        "ref": "node://mail-draft",
+        "format": "json",
+        "render": [
+          "full"
+        ]
+      }
+    },
+    "mail-send": {
+      "tier": 2,
+      "title": "mail.send",
+      "what": "mail.send: Send a previously drafted email to its recipient contact.",
+      "when": "Use when the task involves mail.send.",
+      "tokens": 68,
+      "desc_tokens": 32,
+      "subtree_tokens": 68,
+      "content_hash": "sha256:c7c6e5a901be99d2",
+      "keywords": [
+        "mail",
+        "send"
+      ],
+      "payload": {
+        "ref": "node://mail-send",
+        "format": "json",
+        "render": [
+          "full"
+        ]
+      }
+    },
+    "tasks": {
+      "tier": 1,
+      "title": "tasks",
+      "what": "Tools in the tasks namespace.",
+      "when": "Consult for anything about tasks.",
+      "tokens": 0,
+      "desc_tokens": 28,
+      "subtree_tokens": 200,
+      "content_hash": "sha256:ad1a291fdbaca001",
+      "keywords": [
+        "tasks",
+        "update",
+        "existing",
+        "task",
+        "mark",
+        "completed"
+      ],
+      "children": [
+        "tasks-update",
+        "tasks-create"
+      ]
+    },
+    "tasks-update": {
+      "tier": 2,
+      "title": "tasks.update",
+      "what": "tasks.update: Update an existing task: mark it completed or cancelled, change its priority, reschedule, or delete it.",
+      "when": "Use when the task involves tasks.update.",
+      "tokens": 130,
+      "desc_tokens": 46,
+      "subtree_tokens": 130,
+      "content_hash": "sha256:44bc1e3753a5e10a",
+      "keywords": [
+        "tasks",
+        "update"
+      ],
+      "payload": {
+        "ref": "node://tasks-update",
+        "format": "json",
+        "render": [
+          "full"
+        ]
+      }
+    },
+    "tasks-create": {
+      "tier": 2,
+      "title": "tasks.create",
+      "what": "tasks.create: Create a brand-new task with a title, optional priority and schedule.",
+      "when": "Use when the task involves tasks.create.",
+      "tokens": 70,
+      "desc_tokens": 38,
+      "subtree_tokens": 70,
+      "content_hash": "sha256:ee4285cf1e865f2a",
+      "keywords": [
+        "tasks",
+        "create"
+      ],
+      "payload": {
+        "ref": "node://tasks-create",
+        "format": "json",
+        "render": [
+          "full"
+        ]
+      }
+    }
+  }
+}

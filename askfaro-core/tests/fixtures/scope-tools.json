@@ -1,0 +1,59 @@
+[
+  {
+    "name": "tasks.update",
+    "description": "Update an existing task: mark it completed or cancelled, change its priority, reschedule, or delete it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task_id": {"type": "string", "description": "The task id, e.g. t_8f3a"},
+        "status": {"type": "string", "enum": ["completed", "in_progress", "cancelled"]}
+      },
+      "required": ["task_id"]
+    }
+  },
+  {
+    "name": "tasks.create",
+    "description": "Create a brand-new task with a title, optional priority and schedule.",
+    "parameters": {
+      "type": "object",
+      "properties": {"title": {"type": "string"}},
+      "required": ["title"]
+    }
+  },
+  {
+    "name": "crm.contact_upsert",
+    "description": "Save a contact person record with their name and email address.",
+    "parameters": {
+      "type": "object",
+      "properties": {"name": {"type": "string"}, "email": {"type": "string"}},
+      "required": ["name"]
+    }
+  },
+  {
+    "name": "crm.company_upsert",
+    "description": "Create or update a CRM company record, with name and domain.",
+    "parameters": {
+      "type": "object",
+      "properties": {"name": {"type": "string"}, "domain": {"type": "string"}},
+      "required": ["name"]
+    }
+  },
+  {
+    "name": "mail.draft",
+    "description": "Draft an email to a contact person using their name and email address.",
+    "parameters": {
+      "type": "object",
+      "properties": {"to": {"type": "string"}, "subject": {"type": "string"}},
+      "required": ["to"]
+    }
+  },
+  {
+    "name": "mail.send",
+    "description": "Send a previously drafted email to its recipient contact.",
+    "parameters": {
+      "type": "object",
+      "properties": {"draft_id": {"type": "string"}},
+      "required": ["draft_id"]
+    }
+  }
+]

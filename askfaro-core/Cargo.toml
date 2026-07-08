@@ -85,6 +85,11 @@ required-features = ["stt"]
 name = "conformance"
 required-features = ["search"]
 
+# pcx 0.2 parity against real askfaro-progressive-context builder output.
+[[test]]
+name = "pcx_fixtures"
+required-features = ["progressive"]
+
 # EmbeddingGemma end-to-end test; needs the heavy ONNX embedder.
 [[test]]
 name = "gemma_e2e"

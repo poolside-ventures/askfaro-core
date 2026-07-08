@@ -30,12 +30,21 @@ use crate::search::sqlite::SqliteBackend;
 use crate::search::{BowEmbedder, IndexDoc, SearchIndex, SearchParams};
 use serde_json::{json, Value};
 
-use pcx::{Node, PcxManifest};
+use pcx::{Link, Node, PcxManifest};
+use std::collections::BTreeMap;
 
-/// Apple Foundation Models' context window is 4,096 tokens. The default budget
-/// keeps the returned subset well under it so the prompt + the model's own
-/// reasoning have room.
-pub const APPLE_FM_SAFE_MAX_TOKENS: usize = 3_800;
+/// Apple Foundation Models' context window is 4,096 tokens — and it covers
+/// EVERYTHING: instructions, transcript, tool schemas, and the model's own
+/// output.
+pub const APPLE_FM_CONTEXT_TOKENS: usize = 4_096;
+
+/// Default host reserve: the window share kept free for the system prompt,
+/// transcript, and the model's generated output. What remains
+/// (`window - reserve`, ~2.3k by default) is the tool subset's hard ceiling —
+/// comfortably above the ~2k a `top_k = 8` selection of real catalog leaves
+/// (~110-250 tokens each) costs, so the reserve, not luck, is what keeps
+/// prompts inside the window.
+pub const DEFAULT_HOST_RESERVE_TOKENS: usize = 1_800;
 
 /// The embedding space the in-memory index uses (single space; identity is the
 /// bag-of-words embedder).
@@ -45,19 +54,61 @@ const SPACE: &str = "default";
 /// `estimate_tokens` so token math agrees with the server-built manifest.
 const CHARS_PER_TOKEN: usize = 4;
 
-/// How much to select. `max_tokens` is a HARD ceiling on the returned subset's
-/// token cost; `top_k` caps the count.
+/// How much to select, stated as the real constraint: a total token `window`
+/// minus a host `reserve`, mirroring `askfaro-progressive-context`'s
+/// `Runtime(budget, reserve)`. The tool subset's HARD ceiling is
+/// [`tool_tokens`](SelectBudget::tool_tokens) = `window - reserve`; `top_k`
+/// caps the count.
+///
+/// The split keeps the semantics honest: the window is the model's whole
+/// context (prompt + transcript + tools + output), so a budget that only
+/// capped the tool subset at "under the window" would leave no room for
+/// anything else.
 #[derive(Debug, Clone)]
 pub struct SelectBudget {
     pub top_k: usize,
-    pub max_tokens: usize,
+    /// Total token window the selection targets (e.g. the model's context
+    /// window).
+    pub window: usize,
+    /// Host headroom reserved out of `window`: system prompt, transcript, and
+    /// the model's generated output.
+    pub reserve: usize,
+}
+
+impl SelectBudget {
+    /// A budget for `window` total tokens with `reserve` kept for the host.
+    ///
+    /// # Panics
+    /// Panics when `reserve >= window` — a zero-token tool budget is a
+    /// misconfiguration, and it should fail loudly at construction (the Python
+    /// runtime raises on `reserve >= budget` the same way), not surface as a
+    /// silently empty selection. Constructing the struct literally skips this
+    /// check.
+    pub fn for_window(window: usize, reserve: usize) -> Self {
+        assert!(
+            reserve < window,
+            "SelectBudget reserve ({reserve}) must be smaller than the window ({window}): \
+             nothing would be left for tools"
+        );
+        SelectBudget {
+            top_k: 8,
+            window,
+            reserve,
+        }
+    }
+
+    /// The HARD ceiling on the returned subset's token cost.
+    pub fn tool_tokens(&self) -> usize {
+        self.window.saturating_sub(self.reserve)
+    }
 }
 
 impl Default for SelectBudget {
     fn default() -> Self {
         SelectBudget {
             top_k: 8,
-            max_tokens: APPLE_FM_SAFE_MAX_TOKENS,
+            window: APPLE_FM_CONTEXT_TOKENS,
+            reserve: DEFAULT_HOST_RESERVE_TOKENS,
         }
     }
 }
@@ -87,12 +138,34 @@ struct ToolEntry {
     tokens: usize,
     /// Tier (for stable ordering among equally-relevant tools).
     tier: u32,
+    /// Orthogonal facets (pcx 0.2), for filter-before-rank narrowing.
+    facets: BTreeMap<String, String>,
+    /// Lateral see-also links (pcx 0.2) out of this node.
+    links: Vec<Link>,
+}
+
+impl ToolEntry {
+    /// True when every `(key, value)` pair is present verbatim in this tool's
+    /// facets. An empty filter matches everything (including 0.1 catalogs,
+    /// where no node has facets).
+    fn matches_facets(&self, facets: &[(&str, &str)]) -> bool {
+        facets
+            .iter()
+            .all(|(k, v)| self.facets.get(*k).is_some_and(|have| have == v))
+    }
 }
 
 impl Selector {
     /// Index a catalog. Every leaf node becomes a searchable tool; branches are
     /// the progressive tiers walked to reach them.
     pub fn load(catalog: PcxManifest) -> Result<Self, SelectError> {
+        if !catalog.version_supported() {
+            return Err(SelectError::Manifest(format!(
+                "unsupported pcx_version {:?} (this crate reads {:?})",
+                catalog.pcx_version,
+                pcx::SUPPORTED_PCX_VERSIONS
+            )));
+        }
         let backend =
             SqliteBackend::open_in_memory(&[SPACE]).map_err(|e| SelectError::Backend(e.to_string()))?;
         let index = SearchIndex::new(backend, BowEmbedder::new(SPACE));
@@ -106,13 +179,21 @@ impl Selector {
             }
             let schema = tool_schema(id, node);
             let tokens = leaf_tokens(node, &schema);
-            // Index over name + description + keywords so both lexical and
-            // semantic retrieval have signal.
+            // Index over name + description + keywords + facet values so both
+            // lexical and semantic retrieval have signal (a query naming a
+            // facet value, e.g. a category, still ranks the right tools).
+            let facet_text = node
+                .facets
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
             let body = format!(
-                "{}\n{}\n{}",
+                "{}\n{}\n{}\n{}",
                 node.what,
                 node.when,
-                node.keywords.join(" ")
+                node.keywords.join(" "),
+                facet_text
             );
             docs.push(IndexDoc::leaf("tool", id, &schema.name, &body));
             tools.insert(
@@ -121,6 +202,8 @@ impl Selector {
                     schema,
                     tokens,
                     tier: node.tier.unwrap_or(0),
+                    facets: node.facets.clone(),
+                    links: node.links.clone(),
                 },
             );
         }
@@ -141,10 +224,26 @@ impl Selector {
     /// Select the tool subset for `query` under `budget`.
     ///
     /// Relevance ranking orders the candidates; then tools are admitted in rank
-    /// order while the cumulative pcx token cost stays within `budget.max_tokens`
-    /// (hard) and the count stays within `budget.top_k`. A too-large tool is
-    /// skipped, not truncated, so the budget is never exceeded.
+    /// order while the cumulative pcx token cost stays within
+    /// [`budget.tool_tokens()`](SelectBudget::tool_tokens) (hard) and the count
+    /// stays within `budget.top_k`. A too-large tool is skipped, not truncated,
+    /// so the budget is never exceeded.
     pub fn select(&self, query: &str, budget: &SelectBudget) -> Vec<ToolSchema> {
+        self.select_filtered(query, &[], budget)
+    }
+
+    /// [`select`](Selector::select) with a facet pre-filter (pcx 0.2): only
+    /// tools whose `facets` contain every given `(key, value)` pair are
+    /// candidates. Filter-before-rank is the manifest's own guidance — it cuts
+    /// the space cheaply so ranking runs over a handful of candidates, not the
+    /// whole catalog. An empty filter behaves exactly like `select` (and 0.1
+    /// catalogs, which have no facets, are only ever matched by empty filters).
+    pub fn select_filtered(
+        &self,
+        query: &str,
+        facets: &[(&str, &str)],
+        budget: &SelectBudget,
+    ) -> Vec<ToolSchema> {
         // Pull a generous candidate list, then apply the budget ourselves.
         let params = SearchParams {
             k: self.tools.len().max(budget.top_k),
@@ -155,11 +254,16 @@ impl Selector {
             Ok(hits) => hits
                 .iter()
                 .filter_map(|h| self.tools.get(&h.object_id))
+                .filter(|t| t.matches_facets(facets))
                 .collect(),
             // Search failures degrade to tier-ordered selection rather than
             // returning nothing.
             Err(_) => {
-                let mut all: Vec<&ToolEntry> = self.tools.values().collect();
+                let mut all: Vec<&ToolEntry> = self
+                    .tools
+                    .values()
+                    .filter(|t| t.matches_facets(facets))
+                    .collect();
                 all.sort_by_key(|t| (t.tier, t.schema.name.clone()));
                 all
             }
@@ -173,7 +277,7 @@ impl Selector {
             let mut rest: Vec<&ToolEntry> = self
                 .tools
                 .values()
-                .filter(|t| !seen.contains(t.schema.name.as_str()))
+                .filter(|t| !seen.contains(t.schema.name.as_str()) && t.matches_facets(facets))
                 .collect();
             rest.sort_by_key(|t| (t.tier, t.schema.name.clone()));
             for t in rest {
@@ -182,19 +286,39 @@ impl Selector {
             }
         }
 
+        let max_tokens = budget.tool_tokens();
         let mut selected = Vec::new();
         let mut spent = 0usize;
         for entry in ranked {
             if selected.len() >= budget.top_k {
                 break;
             }
-            if spent + entry.tokens > budget.max_tokens {
+            if spent + entry.tokens > max_tokens {
                 continue; // hard budget: skip, keep scanning for smaller tools
             }
             spent += entry.tokens;
             selected.push(entry.schema.clone());
         }
         selected
+    }
+
+    /// See-also tools for `node_id` (pcx 0.2 `links`): the lateral move when a
+    /// selected tool is close-but-not-exact. Returns each linked tool with its
+    /// why-phrase. Links to nodes that are not leaf tools in this catalog
+    /// (branches, dangling ids) are skipped; 0.1 catalogs always return empty.
+    pub fn related(&self, node_id: &str) -> Vec<(ToolSchema, String)> {
+        let Some(entry) = self.tools.get(node_id) else {
+            return Vec::new();
+        };
+        entry
+            .links
+            .iter()
+            .filter_map(|link| {
+                self.tools
+                    .get(&link.to)
+                    .map(|target| (target.schema.clone(), link.why.clone()))
+            })
+            .collect()
     }
 }
 
@@ -257,9 +381,13 @@ mod tests {
         keywords: &[&str],
         params: Value,
         tokens: u32,
+        category: &str,
     ) -> Node {
         let mut meta = Map::new();
         meta.insert("parameters".into(), params);
+        let mut facets = BTreeMap::new();
+        facets.insert("kind".to_string(), "tool".to_string());
+        facets.insert("category".to_string(), category.to_string());
         Node {
             id: None,
             tier: Some(2),
@@ -267,6 +395,8 @@ mod tests {
             what: what.into(),
             when: when.into(),
             keywords: keywords.iter().map(|s| s.to_string()).collect(),
+            links: vec![],
+            facets,
             desc_tokens: None,
             tokens,
             summary_tokens: None,
@@ -301,6 +431,7 @@ mod tests {
                     "required": ["task_id"]
                 }),
                 140,
+                "tasks",
             ),
         );
         nodes.insert(
@@ -316,6 +447,7 @@ mod tests {
                     "required": ["title"]
                 }),
                 120,
+                "tasks",
             ),
         );
         nodes.insert(
@@ -331,6 +463,7 @@ mod tests {
                     "required": ["name"]
                 }),
                 110,
+                "crm",
             ),
         );
         nodes.insert(
@@ -346,8 +479,15 @@ mod tests {
                     "required": ["to"]
                 }),
                 115,
+                "communication",
             ),
         );
+        // A lateral see-also: drafting an email to someone often follows from
+        // (or needs) their CRM contact record.
+        nodes.get_mut("scope_email").unwrap().links = vec![Link {
+            to: "scope_contact".into(),
+            why: "related: the recipient is a CRM contact".into(),
+        }];
 
         let root = Node {
             id: Some("r".into()),
@@ -356,6 +496,8 @@ mod tests {
             what: "Scope assistant capabilities: tasks, CRM, email.".into(),
             when: "Consult to act on tasks, contacts, or email.".into(),
             keywords: vec![],
+            links: vec![],
+            facets: BTreeMap::new(),
             desc_tokens: None,
             tokens: 0,
             summary_tokens: None,
@@ -396,7 +538,8 @@ mod tests {
         let selector = Selector::load(scope_catalog()).expect("load catalog");
         let budget = SelectBudget {
             top_k: 3,
-            max_tokens: 300,
+            window: 300,
+            reserve: 0,
         };
         let tools = selector.select("Mark task t_8f3a as completed", &budget);
 
@@ -418,7 +561,8 @@ mod tests {
         // Only room for one ~140-token tool.
         let budget = SelectBudget {
             top_k: 10,
-            max_tokens: 150,
+            window: 150,
+            reserve: 0,
         };
         let tools = selector.select("Mark task t_8f3a as completed", &budget);
         assert_eq!(tools.len(), 1, "only one tool fits in 150 tokens");
@@ -426,14 +570,106 @@ mod tests {
     }
 
     #[test]
+    fn reserve_shrinks_the_tool_ceiling() {
+        let selector = Selector::load(scope_catalog()).expect("load catalog");
+        // Same 150-token effective ceiling as `budget_is_enforced_hard`, but
+        // expressed as window minus reserve.
+        let budget = SelectBudget::for_window(4096, 3946);
+        assert_eq!(budget.tool_tokens(), 150);
+        let tools = selector.select("Mark task t_8f3a as completed", &budget);
+        assert_eq!(tools.len(), 1, "only one tool fits in the unreserved 150 tokens");
+        assert_eq!(tools[0].name, "scope_task");
+
+        // The default budget leaves real room for prompt + output: the tool
+        // ceiling is far below the window, yet fits a full top_k selection.
+        let default = SelectBudget::default();
+        assert_eq!(default.window, APPLE_FM_CONTEXT_TOKENS);
+        assert!(default.tool_tokens() <= default.window - 1_500);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be smaller than the window")]
+    fn reserve_swallowing_the_window_fails_loudly() {
+        let _ = SelectBudget::for_window(4096, 4096);
+    }
+
+    #[test]
     fn manifest_roundtrips_through_json() {
         let manifest = scope_catalog();
         let s = serde_json::to_string(&manifest).unwrap();
         let back: PcxManifest = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.pcx_version, "0.1");
+        assert_eq!(back.pcx_version, "0.2");
         assert_eq!(back.nodes.len(), 4);
         assert!(back.nodes["scope_task"].is_leaf());
         assert!(back.root.is_branch());
+        // 0.2 additions survive the round trip.
+        assert_eq!(back.nodes["scope_email"].links, manifest.nodes["scope_email"].links);
+        assert_eq!(back.nodes["scope_task"].facets, manifest.nodes["scope_task"].facets);
+        // meta is flattened (Python parity): `parameters` sits beside `what`,
+        // there is no nested "meta" key on the wire.
+        let raw: Value = serde_json::from_str(&s).unwrap();
+        let task = &raw["nodes"]["scope_task"];
+        assert!(task.get("parameters").is_some());
+        assert!(task.get("meta").is_none());
+        assert_eq!(back, manifest);
+    }
+
+    #[test]
+    fn v01_manifest_without_links_or_facets_loads() {
+        // A 0.1 manifest is 0.2 minus links/facets: strip them and re-declare.
+        let mut manifest = scope_catalog();
+        manifest.pcx_version = "0.1".into();
+        for node in manifest.nodes.values_mut() {
+            node.links.clear();
+            node.facets.clear();
+        }
+        let selector = Selector::load(manifest).expect("0.1 catalog loads");
+        let tools = selector.select("Mark task t_8f3a as completed", &SelectBudget::default());
+        assert!(!tools.is_empty());
+        // No facets anywhere: a facet filter matches nothing.
+        assert!(selector
+            .select_filtered("task", &[("kind", "tool")], &SelectBudget::default())
+            .is_empty());
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected() {
+        let mut manifest = scope_catalog();
+        manifest.pcx_version = "9.9".into();
+        let err = match Selector::load(manifest) {
+            Ok(_) => panic!("future version must not load"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("9.9"), "got: {err}");
+    }
+
+    #[test]
+    fn facet_filter_narrows_candidates() {
+        let selector = Selector::load(scope_catalog()).expect("load catalog");
+        let budget = SelectBudget::default();
+        // "create" is ambiguous between tasks and CRM; the facet disambiguates.
+        let names: Vec<String> = selector
+            .select_filtered("create a new record", &[("category", "crm")], &budget)
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(names, vec!["scope_contact"]);
+        // A facet value no node carries selects nothing.
+        assert!(selector
+            .select_filtered("create", &[("category", "nope")], &budget)
+            .is_empty());
+    }
+
+    #[test]
+    fn related_follows_see_also_links() {
+        let selector = Selector::load(scope_catalog()).expect("load catalog");
+        let related = selector.related("scope_email");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].0.name, "scope_contact");
+        assert_eq!(related[0].1, "related: the recipient is a CRM contact");
+        // Unlinked and unknown ids return empty, never error.
+        assert!(selector.related("scope_task").is_empty());
+        assert!(selector.related("no_such_node").is_empty());
     }
 
     #[test]

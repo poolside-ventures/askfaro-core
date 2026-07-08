@@ -1,23 +1,31 @@
 //! The progressive-context (`pcx`) manifest types, modelled to round-trip with
-//! `askfaro-progressive-context`'s pcx 0.1 schema
-//! (`schema/pcx-0.1.schema.json`). A catalog authored by that Python library (or
+//! `askfaro-progressive-context`'s pcx schema (`schema/pcx-0.2.schema.json`,
+//! and its 0.1 predecessor). A catalog authored by that Python library (or
 //! served by faro-api's `/pcx/*` endpoints) deserializes here unchanged, so
 //! catalogs are portable between the server builder and this on-device selector.
+//!
+//! pcx 0.2 added lateral [`Link`]s (see-also cross-references between branches)
+//! and orthogonal `facets` (filter-first classification dimensions) on nodes.
+//! Both versions parse here: 0.1 manifests simply have no links/facets.
 //!
 //! This crate *accesses* a catalog; it does not build one. The consumer supplies
 //! the manifest (e.g. from a bundled file or a cached HTTP fetch).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// The pcx schema version this crate reads/writes.
-pub const PCX_VERSION: &str = "0.1";
+/// The pcx schema version this crate writes.
+pub const PCX_VERSION: &str = "0.2";
+
+/// The pcx schema versions this crate reads. 0.1 is 0.2 minus links/facets, so
+/// one model parses both.
+pub const SUPPORTED_PCX_VERSIONS: &[&str] = &["0.1", "0.2"];
 
 /// A complete progressive-context manifest: a tree of [`Node`]s addressed by id,
 /// built for one token `budget`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PcxManifest {
     #[serde(default = "default_pcx_version")]
     pub pcx_version: String,
@@ -35,12 +43,21 @@ pub struct PcxManifest {
     pub nodes: HashMap<String, Node>,
 }
 
+impl PcxManifest {
+    /// Whether this manifest's declared `pcx_version` is one this crate reads.
+    /// Loaders should fail loudly on unsupported versions rather than silently
+    /// mis-reading a future format.
+    pub fn version_supported(&self) -> bool {
+        SUPPORTED_PCX_VERSIONS.contains(&self.pcx_version.as_str())
+    }
+}
+
 fn default_pcx_version() -> String {
     PCX_VERSION.to_string()
 }
 
 /// What the manifest was built from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub id: String,
     /// e.g. `"tools"`, `"skills"`, `"docs"`, `"website"`, `"memory"`, `"file"`.
@@ -52,7 +69,7 @@ pub struct Source {
 }
 
 /// The budget variant this manifest was generated for.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Variant {
     /// Target context window (tokens) this variant targets.
     pub budget: u64,
@@ -60,14 +77,15 @@ pub struct Variant {
     /// descriptors). Estimated when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_tokens: Option<u64>,
-    /// Other budgets this source was also built at.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Other budgets this source was also built at. Always written (the Python
+    /// builder emits `[]` for a single-budget build).
+    #[serde(default)]
     pub siblings: Vec<u64>,
 }
 
 /// One unit of content. A node is either a **branch** (has `children`) or a
 /// **leaf** (has `payload`) — never both (pcx schema `oneOf`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     /// Stable id. Often omitted inside the `nodes` map (the map key is the id);
     /// [`PcxManifest`] consumers should prefer the map key.
@@ -84,6 +102,15 @@ pub struct Node {
     pub when: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<String>,
+    /// Lateral see-also cross-links to related nodes in OTHER branches — the
+    /// contextual navigation a pure tree can't express (pcx 0.2; empty on 0.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Link>,
+    /// Orthogonal classification dimensions (e.g. kind/category/output). Filter
+    /// on facets BEFORE ranking descriptors (pcx 0.2; empty on 0.1). BTreeMap
+    /// keeps serialization deterministic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facets: BTreeMap<String, String>,
     /// Cost of showing THIS node's descriptor in a frontier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desc_tokens: Option<u32>,
@@ -103,9 +130,12 @@ pub struct Node {
     /// Leaf payload pointer. Mutually exclusive with `children`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Payload>,
-    /// Domain-specific attributes preserved verbatim. For a `tools` catalog this
-    /// carries the tool's `parameters` JSON Schema under `meta["parameters"]`.
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    /// Domain-specific attributes preserved verbatim. Like the Python
+    /// `Node.meta`, these are the node's UNKNOWN top-level keys (flattened in
+    /// the JSON, e.g. `skill_id` or `parameters` sit beside `what`/`when`), not
+    /// a nested `"meta"` object. For a `tools` catalog this carries the tool's
+    /// `parameters` JSON Schema under `meta["parameters"]`.
+    #[serde(flatten)]
     pub meta: Map<String, Value>,
 }
 
@@ -121,8 +151,19 @@ impl Node {
     }
 }
 
+/// A lateral see-also edge to a related node in another branch (pcx 0.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Link {
+    /// Target node id (resolves within the same manifest).
+    pub to: String,
+    /// One line: why these relate (the reason to follow the link). The Python
+    /// builder omits the key when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
 /// Pointer to a leaf's verbatim content (never inlined into the manifest).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Payload {
     /// Content reference, e.g. `node://<id>`.
     #[serde(rename = "ref")]

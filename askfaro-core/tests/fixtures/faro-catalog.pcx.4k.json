@@ -1,0 +1,2365 @@
+{
+  "pcx_version": "0.2",
+  "usage": "This is a progressive-context (pcx) manifest: a compact, navigable index of a much larger body of content, meant to be read under a small token budget. You are seeing descriptors, NOT full content. Each node has `what` (what it is), `when` (when it is relevant), a token cost, and either `children` (a branch) or a `payload` (a leaf). To find what you need: (1) scan the descriptors under `root.children`; (2) follow the node whose `when` best matches your goal; (3) for a branch, look up its child ids in `nodes` to go deeper; (4) for a leaf, fetch the full verbatim content by resolving `payload.ref` (e.g. `node://<id>`) \u2014 a leaf's content is not in this file. A node may also carry `links` (see-also references `{to, why}` to related nodes in OTHER branches \u2014 follow them to explore laterally) and `facets` (a map of orthogonal tags like type/status \u2014 filter on these to narrow before reading descriptors). Expand only what you need and stay within `variant.budget` tokens. If your host exposes navigation tools (index / open / look / related / filter), prefer those; otherwise resolve `node://` refs yourself.",
+  "source": {
+    "id": "faro-catalog",
+    "kind": "tools",
+    "content_hash": "sha256:c087bbc4d939265f"
+  },
+  "variant": {
+    "budget": 4096,
+    "manifest_tokens": 550,
+    "siblings": [
+      32768
+    ]
+  },
+  "full_tokens": 22147,
+  "root": {
+    "id": "r",
+    "title": "Faro catalog",
+    "what": "Route requests to the right data and media tool",
+    "when": "You need a broad starting point to pick the right content or data capability",
+    "children": [
+      "cat-audio-video",
+      "cat-business-companies",
+      "cat-developer-tools",
+      "cat-documents",
+      "cat-finance-markets",
+      "cat-images",
+      "cat-knowledge-reference",
+      "cat-maps-weather",
+      "cat-sharing",
+      "cat-time",
+      "cat-web-search"
+    ]
+  },
+  "nodes": {
+    "cat-audio-video": {
+      "tier": 1,
+      "title": "Audio & Video",
+      "what": "Process audio and video content",
+      "when": "Need transcript, speakers, timestamps, chapters, or video generation/editing",
+      "tokens": 0,
+      "desc_tokens": 39,
+      "subtree_tokens": 851,
+      "content_hash": "sha256:aad2e0302395f2a2",
+      "keywords": [
+        "audio",
+        "video",
+        "transcript",
+        "chapters"
+      ],
+      "links": [
+        {
+          "to": "cat-images",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-web-search",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-maps-weather",
+          "why": "related: shares need"
+        }
+      ],
+      "children": [
+        "skill-audio-intelligence",
+        "skill-speech-to-text",
+        "skill-video"
+      ]
+    },
+    "skill-audio-intelligence": {
+      "tier": 2,
+      "title": "Audio Intelligence",
+      "what": "Turns a recording into a structured transcript, labeling who said what and optionally chaptering it.",
+      "when": "You have a recording and need its words as text, with speaker turns and optional chapter summaries. Not for: Live or streaming captioning, translation, naming the actual speakers, or detecting sentiment, entities, or sensitive content.",
+      "tokens": 247,
+      "desc_tokens": 107,
+      "subtree_tokens": 247,
+      "content_hash": "sha256:8fbe8b39e8edfd17",
+      "keywords": [
+        "audio",
+        "intelligence",
+        "turns",
+        "recording",
+        "into",
+        "structured",
+        "transcript",
+        "labeling"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Audio & Video",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-audio-intelligence",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "audio-intelligence"
+    },
+    "skill-speech-to-text": {
+      "tier": 2,
+      "title": "Speech to Text",
+      "what": "Transcribes the speech in an audio file to text, multilingual, on Faro's own infrastructure.",
+      "when": "You have an audio file and need its spoken words as text. Not for: Generating speech from text, translating, separating speakers, or analyzing non-speech audio.",
+      "tokens": 177,
+      "desc_tokens": 82,
+      "subtree_tokens": 177,
+      "content_hash": "sha256:61d83d2b59f16fcd",
+      "keywords": [
+        "speech",
+        "text",
+        "transcribes",
+        "audio",
+        "file",
+        "multilingual",
+        "faro",
+        "own"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Audio & Video",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-speech-to-text",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "speech-to-text"
+    },
+    "skill-video": {
+      "tier": 2,
+      "title": "Video",
+      "what": "Finds, generates, and edits video, routing the request to the right approach.",
+      "when": "You need a video, whether to find real stock footage, generate a new clip, or edit one you have. Not for: Pure audio work, transcription, reading text out of a video, or live streaming.",
+      "tokens": 427,
+      "desc_tokens": 82,
+      "subtree_tokens": 427,
+      "content_hash": "sha256:a6215892c5a7f451",
+      "keywords": [
+        "video",
+        "finds",
+        "generates",
+        "edits",
+        "routing",
+        "request",
+        "right",
+        "approach"
+      ],
+      "links": [
+        {
+          "to": "skill-image",
+          "why": "related: shares approach, edits, find"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Audio & Video",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-video",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "video"
+    },
+    "cat-business-companies": {
+      "tier": 1,
+      "title": "Business & Companies",
+      "what": "Lookup company and contact business data",
+      "when": "Need company identity, firmographics, contacts, or verify emails/phones",
+      "tokens": 0,
+      "desc_tokens": 45,
+      "subtree_tokens": 2091,
+      "content_hash": "sha256:7bde4c653b4f2275",
+      "keywords": [
+        "company",
+        "contacts",
+        "firmographics",
+        "verification"
+      ],
+      "links": [
+        {
+          "to": "cat-finance-markets",
+          "why": "related: shares data, need"
+        },
+        {
+          "to": "cat-web-search",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-knowledge-reference",
+          "why": "related: shares data, lookup"
+        }
+      ],
+      "children": [
+        "skill-company-data",
+        "skill-company-logo",
+        "skill-contact-data",
+        "skill-email-verification",
+        "skill-phone",
+        "skill-vat-validation"
+      ]
+    },
+    "skill-company-data": {
+      "tier": 2,
+      "title": "Company Data",
+      "what": "Returns a company's firmographics plus sourced signals like funding, hiring, technology, news, and open source, all by domain.",
+      "when": "You have a company's website or name and want structured facts about it and the live signals around it. Not for: Finding companies you cannot yet name, people or contact details, live stock prices or regulatory filings, or company logos.",
+      "tokens": 668,
+      "desc_tokens": 110,
+      "subtree_tokens": 668,
+      "content_hash": "sha256:08e11dfdbdb5bf7a",
+      "keywords": [
+        "company",
+        "data",
+        "returns",
+        "firmographics",
+        "plus",
+        "sourced",
+        "signals",
+        "like"
+      ],
+      "links": [
+        {
+          "to": "skill-sec-filings",
+          "why": "related: shares companies, company, filings"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Business & Companies",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-company-data",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "company-data"
+    },
+    "skill-company-logo": {
+      "tier": 2,
+      "title": "Company Logo",
+      "what": "Resolves a company domain or brand name to its canonical name, primary domain, and a hosted logo image URL.",
+      "when": "You need a company's logo image or its official domain to enrich a record, render an avatar, or build autocomplete. Not for: Brand colors or fonts, firmographics like employees or revenue, designing a new logo, or verifying that a company is legitimate.",
+      "tokens": 183,
+      "desc_tokens": 107,
+      "subtree_tokens": 183,
+      "content_hash": "sha256:e0cada7f8076c0fb",
+      "keywords": [
+        "company",
+        "logo",
+        "resolves",
+        "domain",
+        "brand",
+        "name",
+        "its",
+        "canonical"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Business & Companies",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-company-logo",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "company-logo"
+    },
+    "skill-contact-data": {
+      "tier": 2,
+      "title": "Contact Data",
+      "what": "Finds people at a company (names and titles, or with verified work emails and phone numbers) and verifies emails/phones for people you already know.",
+      "when": "You need decision-makers at a target company (with or without their contact details), or a verified work email or phone for a known person. Not for: Consumer or personal contact data, residential phones, profiling someone by name with no employer, or company firmographics by domain (use Company Data).",
+      "tokens": 648,
+      "desc_tokens": 130,
+      "subtree_tokens": 648,
+      "content_hash": "sha256:a409dd660688067d",
+      "keywords": [
+        "contact",
+        "data",
+        "finds",
+        "people",
+        "company",
+        "names",
+        "titles",
+        "verified"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Business & Companies",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-contact-data",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "contact-data"
+    },
+    "skill-email-verification": {
+      "tier": 2,
+      "title": "Email Verification",
+      "what": "Checks whether one email address is real and likely to receive mail, with a deliverability score and risk flags.",
+      "when": "You need to confirm a single address is deliverable before sending to it, accepting it at signup, or trusting it. Not for: Sending or delivering mail, bulk-list batch verification, finding or discovering addresses, user login, spam-content scanning, or replacing a real confirmation email.",
+      "tokens": 186,
+      "desc_tokens": 120,
+      "subtree_tokens": 186,
+      "content_hash": "sha256:979a4982f721b3e1",
+      "keywords": [
+        "email",
+        "verification",
+        "checks",
+        "whether",
+        "one",
+        "address",
+        "real",
+        "likely"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Business & Companies",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-email-verification",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "email-verification"
+    },
+    "skill-phone": {
+      "tier": 2,
+      "title": "Phone Number Tools",
+      "what": "Parses a phone number into its parts and reformats it to a standard form.",
+      "when": "You need to validate, inspect, or normalize a phone number. Not for: Looking up a number's owner, carrier lookups, or sending messages.",
+      "tokens": 190,
+      "desc_tokens": 70,
+      "subtree_tokens": 190,
+      "content_hash": "sha256:2c2ff18854f256c6",
+      "keywords": [
+        "phone",
+        "number",
+        "tools",
+        "parses",
+        "into",
+        "its",
+        "parts",
+        "reformats"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Business & Companies",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-phone",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "phone"
+    },
+    "skill-vat-validation": {
+      "tier": 2,
+      "title": "VAT Validation",
+      "what": "Confirms whether one EU VAT number is real against the official EU registry and returns the registered business name and address.",
+      "when": "You need to confirm an EU VAT number is valid and registered before invoicing, zero-rating a cross-border supply, or trusting a business. Not for: UK VAT numbers, US tax IDs or sales tax, format or checksum only validation, tax rate lookups, full company data enrichment, or batch lists.",
+      "tokens": 216,
+      "desc_tokens": 122,
+      "subtree_tokens": 216,
+      "content_hash": "sha256:e978dd906996e10e",
+      "keywords": [
+        "vat",
+        "validation",
+        "confirms",
+        "whether",
+        "one",
+        "number",
+        "real",
+        "against"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Business & Companies",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-vat-validation",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "vat-validation"
+    },
+    "cat-developer-tools": {
+      "tier": 1,
+      "title": "Developer Tools",
+      "what": "Use developer utility tools",
+      "when": "Need exact numeric, encoding, UUID, random, data store, wait, or unit conversion",
+      "tokens": 0,
+      "desc_tokens": 53,
+      "subtree_tokens": 2133,
+      "content_hash": "sha256:6b6b63e142cca70a",
+      "keywords": [
+        "calculator",
+        "encode decode",
+        "uuid",
+        "random",
+        "key-value",
+        "collection",
+        "sleep",
+        "units",
+        "jwt",
+        "webhook inbox"
+      ],
+      "links": [
+        {
+          "to": "cat-documents",
+          "why": "related: shares conversion, need"
+        },
+        {
+          "to": "skill-tech-stack",
+          "why": "related: shares tools"
+        }
+      ],
+      "children": [
+        "skill-calc-evaluate",
+        "skill-encoding",
+        "skill-hooks",
+        "skill-kv",
+        "skill-random",
+        "skill-tables",
+        "skill-timer",
+        "skill-units"
+      ]
+    },
+    "skill-calc-evaluate": {
+      "tier": 2,
+      "title": "Calculator",
+      "what": "Evaluates arithmetic exactly, converts numbers between bases, and converts Roman numerals.",
+      "when": "You need exact arithmetic, base conversion, or Roman numerals the model should not eyeball. Not for: Symbolic math, unit conversion (use units), or word problems.",
+      "tokens": 161,
+      "desc_tokens": 84,
+      "subtree_tokens": 161,
+      "content_hash": "sha256:6a41a99aaaf1c028",
+      "keywords": [
+        "calculator",
+        "evaluates",
+        "arithmetic",
+        "exactly",
+        "converts",
+        "numbers",
+        "between",
+        "bases"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-calc-evaluate",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "calc.evaluate"
+    },
+    "skill-encoding": {
+      "tier": 2,
+      "title": "Encoding",
+      "what": "Hashes, base64/URL encodes or decodes, generates UUIDs, and decodes JWTs, exactly.",
+      "when": "You need an exact digest, encoded string, UUID, or JWT payload the model should not guess. Not for: Verifying a JWT signature, encrypting data, or decoding formats other than base64 or URL.",
+      "tokens": 291,
+      "desc_tokens": 85,
+      "subtree_tokens": 291,
+      "content_hash": "sha256:d846dd4e4d294584",
+      "keywords": [
+        "encoding",
+        "hashes",
+        "base64",
+        "url",
+        "encodes",
+        "decodes",
+        "generates",
+        "uuids"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-encoding",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "encoding"
+    },
+    "skill-hooks": {
+      "tier": 2,
+      "title": "Webhook Inbox",
+      "what": "Creates a throwaway inbox that captures incoming webhooks, then polls it for what arrived.",
+      "when": "You need a URL to receive webhooks or callbacks and read them back. Not for: Sending a request yourself, or scheduling an outgoing call (use schedule).",
+      "tokens": 270,
+      "desc_tokens": 80,
+      "subtree_tokens": 270,
+      "content_hash": "sha256:20a8401cc25fb849",
+      "keywords": [
+        "webhook",
+        "inbox",
+        "creates",
+        "throwaway",
+        "that",
+        "captures",
+        "incoming",
+        "webhooks"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-hooks",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "hooks"
+    },
+    "skill-kv": {
+      "tier": 2,
+      "title": "Key-Value Store",
+      "what": "Stores, reads, and deletes small values by key, with an optional expiry.",
+      "when": "You need to stash a small value between calls and read it back later by key. Not for: Large blobs or files (use the file share), or structured records you query (use tables).",
+      "tokens": 264,
+      "desc_tokens": 79,
+      "subtree_tokens": 264,
+      "content_hash": "sha256:d6ee9a64da1360c6",
+      "keywords": [
+        "key",
+        "value",
+        "store",
+        "stores",
+        "reads",
+        "deletes",
+        "small",
+        "values"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-kv",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "kv"
+    },
+    "skill-random": {
+      "tier": 2,
+      "title": "Random",
+      "what": "Generates unpredictable random integers, picks, shuffles, and strings from a secure source.",
+      "when": "You need genuine randomness the model cannot produce, like a dice roll, a pick, or a token. Not for: Reproducible or seeded sequences, statistical sampling with a fixed seed, or UUIDs (use encoding).",
+      "tokens": 302,
+      "desc_tokens": 92,
+      "subtree_tokens": 302,
+      "content_hash": "sha256:ddf60628814134f3",
+      "keywords": [
+        "random",
+        "generates",
+        "unpredictable",
+        "integers",
+        "picks",
+        "shuffles",
+        "strings",
+        "from"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-random",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "random"
+    },
+    "skill-tables": {
+      "tier": 2,
+      "title": "Tables",
+      "what": "Stores records in a collection and filters, searches, updates, counts, or deletes them.",
+      "when": "You need a small structured store you can query by field or search by meaning. Not for: A single value by key (use the key-value store), or a file (use the file share).",
+      "tokens": 539,
+      "desc_tokens": 82,
+      "subtree_tokens": 539,
+      "content_hash": "sha256:3fd85926ebd8ecc4",
+      "keywords": [
+        "tables",
+        "stores",
+        "records",
+        "collection",
+        "filters",
+        "searches",
+        "updates",
+        "counts"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-tables",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "tables"
+    },
+    "skill-timer": {
+      "tier": 2,
+      "title": "Wait",
+      "what": "Pauses for a set number of seconds, then continues.",
+      "when": "You need a real inline delay for pacing a polling loop, retry backoff, or rate-limiting. Not for: Firing an action later without blocking, or waits longer than 30 seconds (use schedule).",
+      "tokens": 120,
+      "desc_tokens": 74,
+      "subtree_tokens": 120,
+      "content_hash": "sha256:272eaa3041e442e0",
+      "keywords": [
+        "wait",
+        "pauses",
+        "set",
+        "number",
+        "seconds",
+        "then",
+        "continues",
+        "need"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-timer",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "timer"
+    },
+    "skill-units": {
+      "tier": 2,
+      "title": "Unit Converter",
+      "what": "Converts a value between physical units and lists units by dimension.",
+      "when": "You need an exact unit conversion the model should not approximate. Not for: Currency conversion (use currency) or plain arithmetic (use calc).",
+      "tokens": 186,
+      "desc_tokens": 72,
+      "subtree_tokens": 186,
+      "content_hash": "sha256:75f69d6a4064eb46",
+      "keywords": [
+        "unit",
+        "converter",
+        "converts",
+        "value",
+        "between",
+        "physical",
+        "units",
+        "lists"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Developer Tools",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-units",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "units"
+    },
+    "cat-documents": {
+      "tier": 1,
+      "title": "Documents",
+      "what": "Work with documents and archives",
+      "when": "Need PDF/DOC conversion, extraction, OCR, rendering, or document editing",
+      "tokens": 0,
+      "desc_tokens": 36,
+      "subtree_tokens": 3346,
+      "content_hash": "sha256:1d2039c771e7e4f1",
+      "keywords": [
+        "documents",
+        "pdf",
+        "ocr",
+        "conversion"
+      ],
+      "links": [
+        {
+          "to": "cat-images",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-sharing",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-developer-tools",
+          "why": "related: shares conversion, need"
+        }
+      ],
+      "children": [
+        "skill-archive",
+        "skill-document-converter",
+        "skill-email-extraction",
+        "skill-ocr",
+        "skill-office-to-pdf",
+        "skill-pdf",
+        "skill-tabular",
+        "skill-word-document"
+      ]
+    },
+    "skill-archive": {
+      "tier": 2,
+      "title": "Archive",
+      "what": "Packs files into a zip, extracts a zip or 7z archive, or lists an archive's entries.",
+      "when": "You need to bundle files into one download, unpack an archive, or see what is inside one. Not for: tar, gz, or rar archives, creating 7z files, password-protected archives, or converting file formats.",
+      "tokens": 342,
+      "desc_tokens": 87,
+      "subtree_tokens": 342,
+      "content_hash": "sha256:9bfa245dab579439",
+      "keywords": [
+        "archive",
+        "packs",
+        "files",
+        "into",
+        "zip",
+        "extracts",
+        "lists",
+        "entries"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-archive",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "archive"
+    },
+    "skill-document-converter": {
+      "tier": 2,
+      "title": "Document Converter",
+      "what": "Converts one document between Markdown, Word, HTML, PDF, EPUB, and other text and markup formats, returning a download link.",
+      "when": "You have one file in one format and need it in another, e.g. Markdown to Word, HTML to PDF, or a Word doc back to clean Markdown. Not for: Reading text or tables out of a PDF, OCR of scanned pages, math or citations rendered into a PDF, branded or templated Word from a corporate reference doc, spreadsheets or slide decks, or merging several files into one.",
+      "tokens": 596,
+      "desc_tokens": 141,
+      "subtree_tokens": 596,
+      "content_hash": "sha256:ec913eac62ef2342",
+      "keywords": [
+        "document",
+        "converter",
+        "converts",
+        "one",
+        "between",
+        "markdown",
+        "word",
+        "html"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-document-converter",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "document-converter"
+    },
+    "skill-email-extraction": {
+      "tier": 2,
+      "title": "Email Extraction",
+      "what": "Removes quoted history and replies from an email, returning just the new content with offsets to the original.",
+      "when": "You have a raw email and want only the new reply, e.g. to cut token cost before feeding it to a model. Not for: Generating or summarizing email, parsing attachments, or fetching mail from a provider (you supply the body).",
+      "tokens": 306,
+      "desc_tokens": 103,
+      "subtree_tokens": 306,
+      "content_hash": "sha256:5e53cb250ee9872b",
+      "keywords": [
+        "email",
+        "extraction",
+        "removes",
+        "quoted",
+        "history",
+        "replies",
+        "from",
+        "returning"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-email-extraction",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "email-extraction"
+    },
+    "skill-ocr": {
+      "tier": 2,
+      "title": "OCR",
+      "what": "Reads the text off a scanned or photographed document and returns it as layout-aware markdown, tables included.",
+      "when": "You have a scanned PDF or a photo of a document with no selectable text layer and need its contents as text. Not for: PDFs that already have a selectable text layer, answering questions about a document, describing photos, or translating.",
+      "tokens": 267,
+      "desc_tokens": 103,
+      "subtree_tokens": 267,
+      "content_hash": "sha256:a223483ecb22469d",
+      "keywords": [
+        "ocr",
+        "reads",
+        "text",
+        "off",
+        "scanned",
+        "photographed",
+        "document",
+        "returns"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-ocr",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "ocr"
+    },
+    "skill-office-to-pdf": {
+      "tier": 2,
+      "title": "Office to PDF",
+      "what": "Renders Office, OpenDocument, and markup files to a layout-faithful PDF, routing by source type.",
+      "when": "You have a Word document, slide deck, spreadsheet, or HTML/text file and need a PDF of it. Not for: Extracting text or data from a file, editing or filling it, converting to anything but PDF, or merging and splitting PDFs.",
+      "tokens": 460,
+      "desc_tokens": 99,
+      "subtree_tokens": 460,
+      "content_hash": "sha256:c542ab30f9a6d01a",
+      "keywords": [
+        "office",
+        "pdf",
+        "renders",
+        "opendocument",
+        "markup",
+        "files",
+        "layout",
+        "faithful"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-office-to-pdf",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "office-to-pdf"
+    },
+    "skill-pdf": {
+      "tier": 2,
+      "title": "PDF",
+      "what": "Merges, splits, extracts text and tables, fills forms, stamps, and compresses PDFs, routing to the right job.",
+      "when": "You have one or more PDFs to combine, break apart, read, fill, watermark, or shrink. Not for: Reading scanned or photographed PDFs (OCR), creating a PDF from scratch or from Office files, encrypting, rotating, or redacting.",
+      "tokens": 548,
+      "desc_tokens": 97,
+      "subtree_tokens": 548,
+      "content_hash": "sha256:56e799b00566bb2b",
+      "keywords": [
+        "pdf",
+        "merges",
+        "splits",
+        "extracts",
+        "text",
+        "tables",
+        "fills",
+        "forms"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-pdf",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "pdf"
+    },
+    "skill-tabular": {
+      "tier": 2,
+      "title": "Tabular",
+      "what": "Converts CSV, JSON, and XLSX between each other and reshapes a table by selecting columns, filtering rows, sorting, and limiting, returning a download link.",
+      "when": "You have a CSV, JSON, or XLSX file and need it in another of those formats, or trimmed to the columns and rows you want. Not for: Computing totals, averages, group-by, pivots, deduplication, joining files, renaming or deriving columns, running SQL or formulas, reading the values into your reasoning, or handling nested JSON, TSV, or Parquet.",
+      "tokens": 503,
+      "desc_tokens": 140,
+      "subtree_tokens": 503,
+      "content_hash": "sha256:15e2bba180185871",
+      "keywords": [
+        "tabular",
+        "converts",
+        "csv",
+        "json",
+        "xlsx",
+        "between",
+        "each",
+        "other"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-tabular",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "tabular"
+    },
+    "skill-word-document": {
+      "tier": 2,
+      "title": "Word Document",
+      "what": "Builds a Microsoft Word (.docx) file from your content, with headings, paragraphs, lists, and tables.",
+      "when": "You want a finished .docx report, proposal, memo, letter, resume, minutes, or record created from your content. Not for: Editing, reading, or merging an existing .docx, PDF, slides, or spreadsheet, or adding letterhead, logos, footers, page numbers, or images.",
+      "tokens": 324,
+      "desc_tokens": 108,
+      "subtree_tokens": 324,
+      "content_hash": "sha256:69b066be6666c5f4",
+      "keywords": [
+        "word",
+        "document",
+        "builds",
+        "microsoft",
+        "docx",
+        "file",
+        "from",
+        "content"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Documents",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-word-document",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "word-document"
+    },
+    "cat-finance-markets": {
+      "tier": 1,
+      "title": "Finance & Markets",
+      "what": "Get market, economic, filing, and exchange data",
+      "when": "Need prices, tickers, exchanges, filings, macro indicators, or trading dates",
+      "tokens": 0,
+      "desc_tokens": 43,
+      "subtree_tokens": 2383,
+      "content_hash": "sha256:64b4aff6a8666472",
+      "keywords": [
+        "markets",
+        "prices",
+        "filings",
+        "macro"
+      ],
+      "links": [
+        {
+          "to": "cat-business-companies",
+          "why": "related: shares data, need"
+        },
+        {
+          "to": "cat-maps-weather",
+          "why": "related: shares data, need"
+        }
+      ],
+      "children": [
+        "skill-crypto",
+        "skill-currency",
+        "skill-economic-data",
+        "skill-sec-filings",
+        "skill-us-stocks"
+      ]
+    },
+    "skill-crypto": {
+      "tier": 2,
+      "title": "Crypto Prices",
+      "what": "Returns current price, market cap, volume, change, and history for coins and tokens, routing to the right lookup.",
+      "when": "You need a live, accurate crypto market reference instead of a stale guess from training data. Not for: Placing trades or moving funds, reading a wallet's balance or transactions, NFT floor prices, fiat exchange rates, or investment advice.",
+      "tokens": 476,
+      "desc_tokens": 106,
+      "subtree_tokens": 476,
+      "content_hash": "sha256:cb8cc93d4e525c43",
+      "keywords": [
+        "crypto",
+        "prices",
+        "returns",
+        "current",
+        "price",
+        "market",
+        "cap",
+        "volume"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Finance & Markets",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-crypto",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "crypto"
+    },
+    "skill-currency": {
+      "tier": 2,
+      "title": "Currency Rates",
+      "what": "Converts money between currencies and returns reference exchange rates for today, a past date, or a range.",
+      "when": "You need an exchange rate or a currency conversion grounded in published reference rates instead of a guessed number. Not for: Live trading or dealer spreads, crypto prices, intraday or real-time tick rates, or rates for currencies outside the supported list.",
+      "tokens": 507,
+      "desc_tokens": 112,
+      "subtree_tokens": 507,
+      "content_hash": "sha256:c583ef9b22737f48",
+      "keywords": [
+        "currency",
+        "rates",
+        "converts",
+        "money",
+        "between",
+        "currencies",
+        "returns",
+        "reference"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Finance & Markets",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-currency",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "currency"
+    },
+    "skill-economic-data": {
+      "tier": 2,
+      "title": "Economic & Demographic Data",
+      "what": "Returns exact official economic and demographic figures by place and year, resolving the request to the right series.",
+      "when": "You need a precise economic or population statistic for a country or US geography instead of an approximate recalled number. Not for: Live market prices, company financials, forecasts or projections, and statistics for places or years the official sources do not cover.",
+      "tokens": 545,
+      "desc_tokens": 120,
+      "subtree_tokens": 545,
+      "content_hash": "sha256:580ea3dbcefb92d6",
+      "keywords": [
+        "economic",
+        "demographic",
+        "data",
+        "returns",
+        "exact",
+        "official",
+        "figures",
+        "place"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Finance & Markets",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-economic-data",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "economic-data"
+    },
+    "skill-sec-filings": {
+      "tier": 2,
+      "title": "Company Filings & Fundamentals (US)",
+      "what": "Returns exact reported figures and filing metadata for US public companies from official disclosures.",
+      "when": "You need a real reported number or a filing record for a US-listed company, not an estimate. Not for: Stock prices or quotes, real-time news, analyst estimates, non-US or private companies, full filing text, or insider-trade line items.",
+      "tokens": 544,
+      "desc_tokens": 111,
+      "subtree_tokens": 544,
+      "content_hash": "sha256:f6f704565d8ef87e",
+      "keywords": [
+        "company",
+        "filings",
+        "fundamentals",
+        "returns",
+        "exact",
+        "reported",
+        "figures",
+        "filing"
+      ],
+      "links": [
+        {
+          "to": "skill-company-data",
+          "why": "related: shares companies, company, filings"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Finance & Markets",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-sec-filings",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "sec-filings"
+    },
+    "skill-us-stocks": {
+      "tier": 2,
+      "title": "US Stocks",
+      "what": "Returns real historical price bars (open, high, low, close, volume) for US-listed stocks, daily or hourly.",
+      "when": "You need actual past US stock prices over a date range instead of made-up numbers, for one or many tickers. Not for: Live or latest quotes, sub-hourly or trade-level data, fundamentals, earnings, dividends, splits, news, analyst ratings, options, futures, crypto, forex, or non-US listings.",
+      "tokens": 311,
+      "desc_tokens": 115,
+      "subtree_tokens": 311,
+      "content_hash": "sha256:1f632fc89374c637",
+      "keywords": [
+        "stocks",
+        "returns",
+        "real",
+        "historical",
+        "price",
+        "bars",
+        "open",
+        "high"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Finance & Markets",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-us-stocks",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "us-stocks"
+    },
+    "cat-images": {
+      "tier": 1,
+      "title": "Images",
+      "what": "Handle image tasks",
+      "when": "Need to create, edit, enhance, inspect, or safety-check images",
+      "tokens": 0,
+      "desc_tokens": 30,
+      "subtree_tokens": 927,
+      "content_hash": "sha256:7e1a36f42687f422",
+      "keywords": [
+        "images",
+        "edit",
+        "generate",
+        "inspect"
+      ],
+      "links": [
+        {
+          "to": "cat-audio-video",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-documents",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-sharing",
+          "why": "related: shares create, need"
+        }
+      ],
+      "children": [
+        "skill-content-moderation",
+        "skill-image"
+      ]
+    },
+    "skill-content-moderation": {
+      "tier": 2,
+      "title": "Content Moderation",
+      "what": "Scores text and images across harm categories and returns a verdict before you act on content.",
+      "when": "You want to check user or generated content for unsafe material before showing, storing, or acting on it. Not for: Blocking or enforcement, reading text out of an image, virus or malware scanning, AI or deepfake detection, copyright or personal-data detection, or any legal reporting pipeline.",
+      "tokens": 433,
+      "desc_tokens": 117,
+      "subtree_tokens": 433,
+      "content_hash": "sha256:d1906320fa91685b",
+      "keywords": [
+        "content",
+        "moderation",
+        "scores",
+        "text",
+        "images",
+        "across",
+        "harm",
+        "categories"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Images",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-content-moderation",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "content-moderation"
+    },
+    "skill-image": {
+      "tier": 2,
+      "title": "Images",
+      "what": "Creates, finds, edits, and enhances images, routing the request to the right approach.",
+      "when": "You need an image, whether to generate one, find a real stock photo, or improve an existing image. Not for: Moderating images, reading text out of an image (OCR), making logos, or generating QR codes.",
+      "tokens": 494,
+      "desc_tokens": 88,
+      "subtree_tokens": 494,
+      "content_hash": "sha256:95f06d58a85ea673",
+      "keywords": [
+        "images",
+        "creates",
+        "finds",
+        "edits",
+        "enhances",
+        "routing",
+        "request",
+        "right"
+      ],
+      "links": [
+        {
+          "to": "skill-video",
+          "why": "related: shares approach, edits, find"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Images",
+        "output": "file"
+      },
+      "payload": {
+        "ref": "node://skill-image",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "image"
+    },
+    "cat-knowledge-reference": {
+      "tier": 1,
+      "title": "Knowledge & Reference",
+      "what": "Look up structured reference facts",
+      "when": "Use for factual lookups in curated databases and reference sources",
+      "tokens": 0,
+      "desc_tokens": 69,
+      "subtree_tokens": 4151,
+      "content_hash": "sha256:4d9584d93276256d",
+      "keywords": [
+        "reference lookup",
+        "structured facts",
+        "encyclopedia",
+        "dictionary",
+        "bibliography",
+        "court opinions",
+        "music metadata",
+        "nutrition facts",
+        "NASA data",
+        "sports scores",
+        "TV metadata"
+      ],
+      "links": [
+        {
+          "to": "cat-web-search",
+          "why": "related: shares sources"
+        },
+        {
+          "to": "cat-business-companies",
+          "why": "related: shares data, lookup"
+        }
+      ],
+      "children": [
+        "skill-books",
+        "skill-case-law",
+        "skill-dictionary",
+        "skill-knowledge",
+        "skill-music",
+        "skill-nutrition",
+        "skill-space",
+        "skill-sports",
+        "skill-tv"
+      ]
+    },
+    "skill-books": {
+      "tier": 2,
+      "title": "Books",
+      "what": "Looks up real bibliographic data for books by title, author, keyword, or ISBN.",
+      "when": "You need accurate book facts, the right edition, an ISBN, or an author's works instead of guessing from memory. Not for: Reading or borrowing full book text, buying or pricing books, author biographies or photos, reviews, ratings, or bestseller lists.",
+      "tokens": 410,
+      "desc_tokens": 99,
+      "subtree_tokens": 410,
+      "content_hash": "sha256:9c2d7f41ab2ecd1b",
+      "keywords": [
+        "books",
+        "looks",
+        "real",
+        "bibliographic",
+        "data",
+        "title",
+        "author",
+        "keyword"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-books",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "books"
+    },
+    "skill-case-law": {
+      "tier": 2,
+      "title": "Case Law",
+      "what": "Finds and reads real, citable US court opinions, dockets, and oral arguments.",
+      "when": "You need verifiable US case law to ground a legal citation, read a ruling, or pull a case record instead of trusting a hallucinated cite. Not for: Legal advice, foreign or international law, statutes and regulations, citation formatting, live court-filing purchases, or confirming a case is still good law.",
+      "tokens": 531,
+      "desc_tokens": 111,
+      "subtree_tokens": 531,
+      "content_hash": "sha256:88a208f91751029b",
+      "keywords": [
+        "case",
+        "law",
+        "finds",
+        "reads",
+        "real",
+        "citable",
+        "court",
+        "opinions"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-case-law",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "case-law"
+    },
+    "skill-dictionary": {
+      "tier": 2,
+      "title": "Dictionary",
+      "what": "Looks up real definitions, parts of speech, phonetics, pronunciation, synonyms, and examples for a word.",
+      "when": "You need an authoritative definition or pronunciation of an English word instead of improvising one. Not for: Translating between languages, a thesaurus-first synonym dump, deep etymology, spell-correction, or a word-of-the-day.",
+      "tokens": 197,
+      "desc_tokens": 104,
+      "subtree_tokens": 197,
+      "content_hash": "sha256:f2cf5ac2de71f89d",
+      "keywords": [
+        "dictionary",
+        "looks",
+        "real",
+        "definitions",
+        "parts",
+        "speech",
+        "phonetics",
+        "pronunciation"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-dictionary",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "dictionary"
+    },
+    "skill-knowledge": {
+      "tier": 2,
+      "title": "Knowledge & Facts",
+      "what": "Returns current, sourced facts from an encyclopedia and a structured knowledge base, instead of guessing.",
+      "when": "You need a grounded, citable fact about a topic, person, place, or thing rather than recalling it from training data. Not for: General web search or current events, real-time data like prices or weather, scraping arbitrary URLs, or full article bodies.",
+      "tokens": 502,
+      "desc_tokens": 112,
+      "subtree_tokens": 502,
+      "content_hash": "sha256:e02077ee67021f36",
+      "keywords": [
+        "knowledge",
+        "facts",
+        "returns",
+        "current",
+        "sourced",
+        "from",
+        "encyclopedia",
+        "structured"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-knowledge",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "knowledge"
+    },
+    "skill-music": {
+      "tier": 2,
+      "title": "Music Metadata",
+      "what": "Identifies artists, albums, songs, and labels and returns their facts, relationships, and stable identifiers.",
+      "when": "You need authoritative music facts, like a discography, tracklist, band members, or who wrote a song. Not for: Playing or streaming audio, previews, lyrics, charts, sales or stream counts, playlists, or audio fingerprinting.",
+      "tokens": 388,
+      "desc_tokens": 103,
+      "subtree_tokens": 388,
+      "content_hash": "sha256:3c6b188024728b99",
+      "keywords": [
+        "music",
+        "metadata",
+        "identifies",
+        "artists",
+        "albums",
+        "songs",
+        "labels",
+        "returns"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-music",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "music"
+    },
+    "skill-nutrition": {
+      "tier": 2,
+      "title": "Nutrition",
+      "what": "Returns real food and nutrition facts (calories, macros, ingredients) from authoritative sources.",
+      "when": "You need verified calorie, macro, or ingredient numbers for a food or a packaged product instead of guessing. Not for: Personalized diet or medical advice, computing %DV or daily-value targets, summing a full dish across its ingredients, restaurant or menu items, or live food prices.",
+      "tokens": 497,
+      "desc_tokens": 114,
+      "subtree_tokens": 497,
+      "content_hash": "sha256:2cbea1feafa884f5",
+      "keywords": [
+        "nutrition",
+        "returns",
+        "real",
+        "food",
+        "facts",
+        "calories",
+        "macros",
+        "ingredients"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-nutrition",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "nutrition"
+    },
+    "skill-space": {
+      "tier": 2,
+      "title": "Space & Science",
+      "what": "Returns NASA space data, routing to the daily astronomy image, asteroid approaches, or Mars rover photos.",
+      "when": "You want the Astronomy Picture of the Day, near-Earth asteroid approaches, or photos taken by a Mars rover. Not for: General web search, live launch schedules, satellite tracking, weather, star charts, or astrology.",
+      "tokens": 415,
+      "desc_tokens": 99,
+      "subtree_tokens": 415,
+      "content_hash": "sha256:859f0f5be0150383",
+      "keywords": [
+        "space",
+        "science",
+        "returns",
+        "nasa",
+        "data",
+        "routing",
+        "daily",
+        "astronomy"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-space",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "space"
+    },
+    "skill-sports": {
+      "tier": 2,
+      "title": "Sports",
+      "what": "Gets live scores, fixtures, results, and details for teams, leagues, players, and events across many sports.",
+      "when": "You need current sports scores, upcoming fixtures, recent results, or real team and player facts instead of stale training data. Not for: Betting odds, predictions, win probabilities, statistics tables, injury news, standings tables, or play-by-play commentary.",
+      "tokens": 551,
+      "desc_tokens": 108,
+      "subtree_tokens": 551,
+      "content_hash": "sha256:84661419b6b8fa0f",
+      "keywords": [
+        "sports",
+        "gets",
+        "live",
+        "scores",
+        "fixtures",
+        "results",
+        "details",
+        "teams"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-sports",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "sports"
+    },
+    "skill-tv": {
+      "tier": 2,
+      "title": "TV Shows",
+      "what": "Returns real television metadata, finding shows and people and pulling series details, episodes, cast, and schedules.",
+      "when": "You need accurate, current facts about a TV series, its episodes, its cast, a TV actor, or what is airing on a date. Not for: Movies, where to stream a show or regional availability, aggregated critic ratings, personal watchlists, or plot recaps beyond the provided summary.",
+      "tokens": 660,
+      "desc_tokens": 116,
+      "subtree_tokens": 660,
+      "content_hash": "sha256:5427bdd83d46b2cb",
+      "keywords": [
+        "shows",
+        "returns",
+        "real",
+        "television",
+        "metadata",
+        "finding",
+        "people",
+        "pulling"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Knowledge & Reference",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-tv",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "tv"
+    },
+    "cat-maps-weather": {
+      "tier": 1,
+      "title": "Maps & Weather",
+      "what": "Lookup location, weather, and astronomy data",
+      "when": "Need places, maps, routes, forecasts, or sun/moon times",
+      "tokens": 0,
+      "desc_tokens": 37,
+      "subtree_tokens": 1266,
+      "content_hash": "sha256:f45a9a287d3ba34c",
+      "keywords": [
+        "maps",
+        "weather",
+        "routes",
+        "astronomy"
+      ],
+      "links": [
+        {
+          "to": "cat-web-search",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-audio-video",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-images",
+          "why": "related: shares need"
+        }
+      ],
+      "children": [
+        "skill-astronomy",
+        "skill-maps",
+        "skill-weather"
+      ]
+    },
+    "skill-astronomy": {
+      "tier": 2,
+      "title": "Sun and Moon Times",
+      "what": "Computes sunrise, sunset, and twilight for a location, and the moon phase for a date.",
+      "when": "You need exact daylight or moon-phase figures the model should not guess. Not for: Weather conditions or forecasts (use weather), or star and planet positions.",
+      "tokens": 204,
+      "desc_tokens": 81,
+      "subtree_tokens": 204,
+      "content_hash": "sha256:b30c3d757ba79506",
+      "keywords": [
+        "sun",
+        "moon",
+        "times",
+        "computes",
+        "sunrise",
+        "sunset",
+        "twilight",
+        "location"
+      ],
+      "links": [
+        {
+          "to": "skill-timezone",
+          "why": "related: shares date, exact, need"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Maps & Weather",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-astronomy",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "astronomy"
+    },
+    "skill-maps": {
+      "tier": 2,
+      "title": "Maps",
+      "what": "Turns addresses into coordinates and back, finds nearby places, and gives directions.",
+      "when": "You need to resolve a location, label a coordinate, find places near a point, or get travel distance and time. Not for: Live traffic or transit schedules, map images or embeddable maps, device GPS or tracking, postal address validation, or bulk geocoding of large lists.",
+      "tokens": 518,
+      "desc_tokens": 105,
+      "subtree_tokens": 518,
+      "content_hash": "sha256:d2fe84ca972dc3af",
+      "keywords": [
+        "maps",
+        "turns",
+        "addresses",
+        "into",
+        "coordinates",
+        "back",
+        "finds",
+        "nearby"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Maps & Weather",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-maps",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "maps"
+    },
+    "skill-weather": {
+      "tier": 2,
+      "title": "Weather",
+      "what": "Gives current conditions and the forecast for any place, looking up coordinates from a name first.",
+      "when": "You need live weather or a forecast for a location, by place name or by coordinates. Not for: Past or historical weather, climate normals, air quality, guaranteed severe-weather alerts, or safety-critical marine, aviation, or evacuation decisions.",
+      "tokens": 544,
+      "desc_tokens": 104,
+      "subtree_tokens": 544,
+      "content_hash": "sha256:000e29a5f302fc39",
+      "keywords": [
+        "weather",
+        "gives",
+        "current",
+        "conditions",
+        "forecast",
+        "any",
+        "place",
+        "looking"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Maps & Weather",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-weather",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "weather"
+    },
+    "cat-sharing": {
+      "tier": 1,
+      "title": "Sharing",
+      "what": "Share content with links, short URLs, snippets, and QR codes",
+      "when": "Choose when you already have a specific item and need to create a shareable link, short URL, snippet, or QR code for it",
+      "tokens": 0,
+      "desc_tokens": 57,
+      "subtree_tokens": 1117,
+      "content_hash": "sha256:4f6cd0bb6dd20f49",
+      "keywords": [
+        "share",
+        "link",
+        "short url",
+        "snippet",
+        "qr code"
+      ],
+      "links": [
+        {
+          "to": "cat-documents",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-images",
+          "why": "related: shares create, need"
+        }
+      ],
+      "children": [
+        "skill-files",
+        "skill-link",
+        "skill-paste",
+        "skill-qr-code"
+      ]
+    },
+    "skill-files": {
+      "tier": 2,
+      "title": "File Share",
+      "what": "Shares a file at a download link with optional expiry, password, or one-time access, and revokes it.",
+      "when": "You need a temporary download link for a file or a URL's contents. Not for: A short text snippet (use the pastebin) or a small value by key (use the key-value store).",
+      "tokens": 338,
+      "desc_tokens": 84,
+      "subtree_tokens": 338,
+      "content_hash": "sha256:0505cfbae323f904",
+      "keywords": [
+        "file",
+        "share",
+        "shares",
+        "download",
+        "link",
+        "optional",
+        "expiry",
+        "password"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Sharing",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-files",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "files"
+    },
+    "skill-link": {
+      "tier": 2,
+      "title": "URL Shortener",
+      "what": "Shortens a URL and reports click stats for a short code.",
+      "when": "You need a short link to share, or the click count for one you made. Not for: Hosting a file or page (use the file share or pastebin).",
+      "tokens": 212,
+      "desc_tokens": 65,
+      "subtree_tokens": 212,
+      "content_hash": "sha256:ef697b770e389daa",
+      "keywords": [
+        "url",
+        "shortener",
+        "shortens",
+        "reports",
+        "click",
+        "stats",
+        "short",
+        "code"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Sharing",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-link",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "link"
+    },
+    "skill-paste": {
+      "tier": 2,
+      "title": "Pastebin",
+      "what": "Stores a text snippet at a link with optional syntax, expiry, password, or one-time access, and deletes it.",
+      "when": "You need to share a block of text or code at a link. Not for: Sharing a binary file (use the file share) or a small value by key (use the key-value store).",
+      "tokens": 289,
+      "desc_tokens": 83,
+      "subtree_tokens": 289,
+      "content_hash": "sha256:d800d7109687b0c5",
+      "keywords": [
+        "pastebin",
+        "stores",
+        "text",
+        "snippet",
+        "link",
+        "optional",
+        "syntax",
+        "expiry"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Sharing",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-paste",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "paste"
+    },
+    "skill-qr-code": {
+      "tier": 2,
+      "title": "QR Code",
+      "what": "Turns a URL, text, or structured payload like WiFi or a contact into a scannable QR code image.",
+      "when": "You need a QR code someone can scan with a phone to open a link, join WiFi, save a contact, or read text. Not for: Reading or decoding an existing code, generating barcodes, tracking scans, or branded color and logo styling.",
+      "tokens": 278,
+      "desc_tokens": 95,
+      "subtree_tokens": 278,
+      "content_hash": "sha256:cb5a1cf9a23c79ee",
+      "keywords": [
+        "code",
+        "turns",
+        "url",
+        "text",
+        "structured",
+        "payload",
+        "like",
+        "wifi"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Sharing",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-qr-code",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "qr-code"
+    },
+    "cat-time": {
+      "tier": 1,
+      "title": "Time",
+      "what": "Handle date, holiday, scheduling, and time zone tasks",
+      "when": "Choose for date or time reasoning, calendar math, holidays, deadlines, or time zones when you do not need live web lookup",
+      "tokens": 0,
+      "desc_tokens": 55,
+      "subtree_tokens": 1439,
+      "content_hash": "sha256:0480f541def8cd95",
+      "keywords": [
+        "date",
+        "time",
+        "holiday",
+        "schedule",
+        "time zone"
+      ],
+      "links": [
+        {
+          "to": "cat-images",
+          "why": "related: shares handle, need, tasks"
+        },
+        {
+          "to": "cat-audio-video",
+          "why": "related: shares need"
+        }
+      ],
+      "children": [
+        "skill-datetime",
+        "skill-holidays",
+        "skill-schedule",
+        "skill-timezone"
+      ]
+    },
+    "skill-datetime": {
+      "tier": 2,
+      "title": "Date Calculator",
+      "what": "Computes date differences, shifts dates, and answers weekday and business-day questions.",
+      "when": "You need exact date arithmetic the model should not count by hand. Not for: Timezone conversion or current time (use timezone), or calendar holidays lookups (use holidays).",
+      "tokens": 353,
+      "desc_tokens": 86,
+      "subtree_tokens": 353,
+      "content_hash": "sha256:bb126174bca916f8",
+      "keywords": [
+        "date",
+        "calculator",
+        "computes",
+        "differences",
+        "shifts",
+        "dates",
+        "answers",
+        "weekday"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Time",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-datetime",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "datetime"
+    },
+    "skill-holidays": {
+      "tier": 2,
+      "title": "Public Holidays",
+      "what": "Returns the real public-holiday calendar for a country, checks a date, finds upcoming holidays, and lists supported countries.",
+      "when": "You need accurate public holidays for scheduling, business-day logic, or to gate a job on a date instead of guessing. Not for: Company or personal calendars, religious-calendar conversion, long-weekend detection, event or concert dates, or weekend and business-day counting on their own.",
+      "tokens": 485,
+      "desc_tokens": 123,
+      "subtree_tokens": 485,
+      "content_hash": "sha256:04f742accff0b049",
+      "keywords": [
+        "public",
+        "holidays",
+        "returns",
+        "real",
+        "holiday",
+        "calendar",
+        "country",
+        "checks"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Time",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-holidays",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "holidays"
+    },
+    "skill-schedule": {
+      "tier": 2,
+      "title": "Scheduled Callback",
+      "what": "Schedules an HTTP callback to fire at a later time, and cancels a scheduled one.",
+      "when": "You need an action to happen later without blocking, or longer than a 30 second wait. Not for: Pausing inline right now (use timer), or sending a request immediately.",
+      "tokens": 319,
+      "desc_tokens": 81,
+      "subtree_tokens": 319,
+      "content_hash": "sha256:cdfc5cb269a5404b",
+      "keywords": [
+        "scheduled",
+        "callback",
+        "schedules",
+        "http",
+        "fire",
+        "later",
+        "time",
+        "cancels"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Time",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-schedule",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "schedule"
+    },
+    "skill-timezone": {
+      "tier": 2,
+      "title": "Timezone Tools",
+      "what": "Gives the current time in a zone, converts times between zones, and describes a zone.",
+      "when": "You need the time in a specific timezone or an exact conversion between zones. Not for: Date arithmetic such as differences or shifts (use datetime).",
+      "tokens": 282,
+      "desc_tokens": 76,
+      "subtree_tokens": 282,
+      "content_hash": "sha256:0a719976ec0c01b7",
+      "keywords": [
+        "timezone",
+        "tools",
+        "gives",
+        "current",
+        "time",
+        "zone",
+        "converts",
+        "times"
+      ],
+      "links": [
+        {
+          "to": "skill-astronomy",
+          "why": "related: shares date, exact, need"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Time",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-timezone",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "timezone"
+    },
+    "cat-web-search": {
+      "tier": 1,
+      "title": "Web & Search",
+      "what": "Search and research the live web",
+      "when": "Choose when you need current web results, browsing, or cited research rather than a site-specific scraper or parser",
+      "tokens": 0,
+      "desc_tokens": 51,
+      "subtree_tokens": 2443,
+      "content_hash": "sha256:afaaa940b6602b47",
+      "keywords": [
+        "web search",
+        "research",
+        "live web",
+        "cited sources"
+      ],
+      "links": [
+        {
+          "to": "cat-audio-video",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-maps-weather",
+          "why": "related: shares need"
+        },
+        {
+          "to": "cat-business-companies",
+          "why": "related: shares need"
+        }
+      ],
+      "children": [
+        "skill-research",
+        "skill-site-scrapers",
+        "skill-tech-stack",
+        "skill-web-scraping",
+        "skill-web-search"
+      ]
+    },
+    "skill-research": {
+      "tier": 2,
+      "title": "Research",
+      "what": "Answers questions with live, cited research, routing to the right depth for the job.",
+      "when": "You need a current, source-backed answer instead of guessing from stale training data. Not for: Pure chat or reasoning with no lookup, math or code generation, creative writing, or fetching one known URL's full content.",
+      "tokens": 421,
+      "desc_tokens": 93,
+      "subtree_tokens": 421,
+      "content_hash": "sha256:d70b811bfde48f41",
+      "keywords": [
+        "research",
+        "answers",
+        "questions",
+        "live",
+        "cited",
+        "routing",
+        "right",
+        "depth"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Web & Search",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-research",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "research"
+    },
+    "skill-site-scrapers": {
+      "tier": 2,
+      "title": "Site Scrapers",
+      "what": "Pulls clean, structured records from specific platforms, routing to the right scraper for the target.",
+      "when": "You need structured items from a known platform such as social, maps, marketplaces, reviews, jobs, listings, or video. Not for: Crawling arbitrary websites, pages behind your own login, or low-latency single lookups; use general web scraping or research for those.",
+      "tokens": 705,
+      "desc_tokens": 110,
+      "subtree_tokens": 705,
+      "content_hash": "sha256:d6eb76a27ce792aa",
+      "keywords": [
+        "site",
+        "scrapers",
+        "pulls",
+        "clean",
+        "structured",
+        "records",
+        "from",
+        "specific"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Web & Search",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-site-scrapers",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "site-scrapers"
+    },
+    "skill-tech-stack": {
+      "tier": 2,
+      "title": "Tech Stack",
+      "what": "Detects the technologies a website runs, like its CMS, frameworks, servers, analytics, hosting, and payment tools.",
+      "when": "You want a per-site profile of the client-observable technologies one or more websites are built on. Not for: Finding companies that use a given technology, reading hidden backend databases or languages, historical adoption trends, or pages behind a login.",
+      "tokens": 189,
+      "desc_tokens": 109,
+      "subtree_tokens": 189,
+      "content_hash": "sha256:b185470887bd99f7",
+      "keywords": [
+        "tech",
+        "stack",
+        "detects",
+        "technologies",
+        "website",
+        "runs",
+        "like",
+        "its"
+      ],
+      "links": [
+        {
+          "to": "cat-developer-tools",
+          "why": "related: shares tools"
+        }
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Web & Search",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-tech-stack",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "tech-stack"
+    },
+    "skill-web-scraping": {
+      "tier": 2,
+      "title": "Generic Scrapers",
+      "what": "Turns any public web page into clean, LLM-ready content or structured data, maps a site, unlocks blocked pages, and returns parsed search-engine results.",
+      "when": "You have a URL (or a site, or a search query) and need the real page content, specific fields off it, or what a search engine ranks, not a model guess. Not for: Platform-specific scrapers like LinkedIn, Amazon, or maps reviews (use Site Scrapers), open-web research to find URLs first (use Web Search), pages behind a personal login, or browser-automation scripting.",
+      "tokens": 642,
+      "desc_tokens": 147,
+      "subtree_tokens": 642,
+      "content_hash": "sha256:a9ebb620f1cecdb2",
+      "keywords": [
+        "generic",
+        "scrapers",
+        "turns",
+        "any",
+        "public",
+        "web",
+        "page",
+        "into"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Web & Search",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-web-scraping",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "web-scraping"
+    },
+    "skill-web-search": {
+      "tier": 2,
+      "title": "Web Search",
+      "what": "Searches the live web and returns ranked results with titles, links, and snippets.",
+      "when": "You need fresh, external, or verifiable information from the live web rather than memory. Not for: Reading a full page's text, AI-synthesized cited answers, or image, video, or local-business search.",
+      "tokens": 486,
+      "desc_tokens": 87,
+      "subtree_tokens": 486,
+      "content_hash": "sha256:498cda82222912cf",
+      "keywords": [
+        "web",
+        "search",
+        "searches",
+        "live",
+        "returns",
+        "ranked",
+        "results",
+        "titles"
+      ],
+      "facets": {
+        "kind": "skill",
+        "category": "Web & Search",
+        "output": "information"
+      },
+      "payload": {
+        "ref": "node://skill-web-search",
+        "format": "md",
+        "render": [
+          "full"
+        ]
+      },
+      "skill_id": "web-search"
+    }
+  }
+}
