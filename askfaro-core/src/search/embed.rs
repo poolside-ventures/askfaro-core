@@ -43,7 +43,7 @@ impl BowEmbedder {
     fn vector(text: &str) -> Vec<f32> {
         let mut vec = vec![0.0f32; BOW_DIM];
         for token in tokenize_lower(text) {
-            let digest = md5::compute(token.as_bytes());
+            let digest = md5_bow::compute(token.as_bytes());
             let bucket = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize
                 % BOW_DIM;
             vec[bucket] += 1.0;

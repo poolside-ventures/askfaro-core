@@ -31,11 +31,19 @@ default = ["search", "generation", "progressive"]
 # Shared model provisioning (sha256 spec + verify). Internal; pulled by stt/search.
 model = ["dep:sha2", "dep:hex"]
 # Embedded hybrid search (FTS5 lexical + bag-of-words semantic, RRF).
-search = ["model", "dep:rusqlite", "dep:md5"]
+search = ["model", "dep:rusqlite", "dep:md5-bow"]
 # Provider-agnostic text generation + tool-calling types (model-free).
 generation = []
 # Catalog selector: relevance ranking + progressive budget-bounded pcx expansion.
 progressive = ["search", "generation"]
+# Free / local tools: deterministic in-process capabilities (calc, units,
+# datetime, encoding, phone, random, timer, timezone, astronomy). Pure-Rust, no
+# network — vendored from the open-source faro-core-free crate.
+free-tools = [
+    "dep:base64", "dep:sha1", "dep:md-5", "dep:sha2", "dep:hex",
+    "dep:percent-encoding", "dep:getrandom", "dep:fasteval", "dep:rink-core",
+    "dep:phonenumber", "dep:suncalc", "dep:jiff", "dep:holidays", "dep:chrono",
+]
 # On-device speech-to-text (NVIDIA Parakeet via ONNX Runtime).
 stt = ["model", "dep:parakeet-rs"]
 # The EmbeddingGemma-300M ONNX embedder for `search` (heavy: ort + tokenizers).
@@ -55,7 +63,26 @@ hex = { version = "0.4", optional = true }
 # --- search feature ---
 # Bundled SQLite is compiled with FTS5 enabled — the lexical retriever needs it.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-md5 = { version = "0.7", optional = true }
+# The bag-of-words embedder's token bucketing. Renamed off its default `md5`
+# extern name so it can coexist with the free-tools `md-5` (RustCrypto) hasher,
+# which also exposes an `md5` crate name.
+md5-bow = { version = "0.7", package = "md5", optional = true }
+
+# --- free-tools feature ---
+# All pure-Rust so the on-device SDK cross-compiles unchanged. Kept byte-compatible
+# with faro-core/core-free/Cargo.toml (the vendored source is generated from it).
+base64 = { version = "0.22", optional = true }
+sha1 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+percent-encoding = { version = "2", optional = true }
+getrandom = { version = "0.2", optional = true }
+fasteval = { version = "0.2", optional = true }
+rink-core = { version = "0.9.0", features = ["bundle-files"], optional = true }
+phonenumber = { version = "0.3.9", optional = true }
+suncalc = { version = "0.4.0", optional = true }
+jiff = { version = "0.2", optional = true }
+holidays = { version = "0.1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 
 # --- stt feature ---
 parakeet-rs = { version = "0.3.6", optional = true }
@@ -94,3 +121,8 @@ required-features = ["progressive"]
 [[test]]
 name = "gemma_e2e"
 required-features = ["embeddinggemma"]
+
+# On-device free-tool surface (public re-exports of the vendored slice).
+[[test]]
+name = "free_tools"
+required-features = ["free-tools"]
