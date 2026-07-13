@@ -44,3 +44,18 @@ fn unknown_tool_fails_closed_without_panicking() {
     assert_eq!(v["status"], "failed");
     assert_eq!(v["error"]["code"], "not_found");
 }
+
+#[test]
+fn full_raw_tool_id_routes_to_the_sub_operation() {
+    // The point of this change: a host (Scope's faro_invoke) can pass the full
+    // `namespace.operation` id straight through and reach a non-default operation
+    // on-device — no need to replicate the id -> operation convention.
+    let out = free_tools::execute_free_tool_json(
+        "calc.base_convert",
+        r#"{"value": "255", "to_base": 16}"#,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["result"]["data"]["result"], "ff");
+    assert_eq!(v["skill"], "calc.run");
+}

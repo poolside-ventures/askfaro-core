@@ -32,9 +32,17 @@ pub fn available() -> Vec<&'static str> {
 /// Execute a free tool by name with JSON `params`, returning a `SkillResult`
 /// envelope. Errors are mapped to buyer-safe envelope errors, never panics.
 pub fn execute(name: &str, params: serde_json::Value) -> SkillResult {
-    let skill = format!("{name}.run");
+    // `name` is either a base tool name (`calc`) or a full raw-tool id
+    // (`calc.base_convert`). A full id resolves to the base executor with its
+    // `operation` param injected — byte-identical to the server, which does
+    // `namespace, _, operation = handler.partition("."); {**args, "operation": operation}`
+    // (faro-api services/internal_tools/__init__.py::_run_via_core). A bare base
+    // name passes through untouched, so the operation comes from the params (or the
+    // tool's own default) exactly as before.
+    let (base, params) = resolve_id(name, params);
+    let skill = format!("{base}.run");
     let started = now_ms();
-    let outcome = match name {
+    let outcome = match base {
         "astronomy" => astronomy::run(params),
         "calc" => calc::run(params),
         "datetime" => datetime::run(params),
@@ -53,6 +61,31 @@ pub fn execute(name: &str, params: serde_json::Value) -> SkillResult {
             .with_meta(Meta { credits_charged: Some(0.0), latency_ms: Some(latency), ..Default::default() }),
         Err(e) => SkillResult::error(&skill, e.code(), e.to_string(), e.retryable())
             .with_meta(Meta { credits_charged: Some(0.0), latency_ms: Some(latency), ..Default::default() }),
+    }
+}
+
+/// Split a raw-tool id into `(base, params)`, injecting the addressed operation.
+///
+/// A `name` containing a `.` is `<namespace>.<operation>` (split on the FIRST dot,
+/// like the server's `str.partition`): the operation is written into the params,
+/// overriding any `operation` already there, so the id always wins — matching the
+/// server's `{**args, "operation": operation}`. A bare name is returned unchanged.
+fn resolve_id(name: &str, params: serde_json::Value) -> (&str, serde_json::Value) {
+    match name.split_once('.') {
+        Some((base, operation)) => {
+            let mut params = params;
+            match params.as_object_mut() {
+                Some(map) => {
+                    map.insert("operation".to_string(), serde_json::Value::String(operation.to_string()));
+                }
+                // The tools expect an object; if a caller passes something else,
+                // build the minimal object the dispatch needs (the server always
+                // sends a dict, so this only guards odd on-device inputs).
+                None => params = serde_json::json!({ "operation": operation }),
+            }
+            (base, params)
+        }
+        None => (name, params),
     }
 }
 
@@ -90,6 +123,57 @@ mod tests {
         assert_eq!(v["status"], "success");
         assert_eq!(v["result"]["data"]["result"], 8);
         assert_eq!(v["meta"]["credits_charged"], 0.0);
+    }
+
+    #[test]
+    fn full_id_routes_to_non_default_operation() {
+        // A raw-tool id reaches a sub-operation the base default would never hit.
+        let r = execute("calc.base_convert", serde_json::json!({"value": "255", "to_base": 16}));
+        let v: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["result"]["data"]["result"], "ff");
+        // The envelope skill stays the BASE name, identical to the server calling
+        // execute_free_tool("calc", { .., operation: "base_convert" }).
+        assert_eq!(v["skill"], "calc.run");
+    }
+
+    #[test]
+    fn id_operation_overrides_one_in_params() {
+        // Server parity: `{**args, "operation": operation}` — the id wins.
+        let r = execute(
+            "calc.base_convert",
+            serde_json::json!({"operation": "evaluate", "value": "255", "to_base": 16}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["result"]["data"]["result"], "ff");
+    }
+
+    #[test]
+    fn bare_base_name_still_uses_the_tool_default() {
+        // No dot -> params untouched -> calc's own `evaluate` default applies.
+        let r = execute("calc", serde_json::json!({"expression": "6 / 2"}));
+        let v: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["result"]["data"]["result"], 3);
+    }
+
+    #[test]
+    fn unknown_base_in_a_full_id_is_not_found() {
+        let r = execute("nope.thing", serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["code"], "not_found");
+    }
+
+    #[test]
+    fn unknown_operation_in_a_full_id_is_invalid_input() {
+        // Known base, bogus operation -> the base tool's own "unknown operation"
+        // error, exactly as the server would surface it.
+        let r = execute("calc.bogus", serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["code"], "invalid_input");
     }
 }
 
