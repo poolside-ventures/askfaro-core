@@ -23,6 +23,7 @@
 pub mod embed;
 pub mod fusion;
 pub mod models;
+pub mod shard;
 pub mod sqlite;
 pub mod types;
 
@@ -30,6 +31,7 @@ pub mod types;
 pub mod gemma;
 
 pub use embed::{BowEmbedder, EmbedEngine};
+pub use shard::{apply_delta, apply_full, row_count, verify_shard, ShardError};
 pub use sqlite::{BackendError, SqliteBackend, UpsertRow};
 pub use types::{Filters, IndexDoc, MatchType, RawHit, SearchResult};
 
@@ -90,25 +92,53 @@ impl Default for SearchParams {
 /// Wire a backend to an embedder and get incremental upsert plus hybrid search.
 /// All ranking logic lives here and in [`fusion`], so any two backends return
 /// identically-ranked results for the same corpus and query.
+///
+/// The embedder is **optional**: with one, queries and upserts get the semantic
+/// half; without one (`new_lexical`), the index runs keyword-only (FTS5/BM25).
+/// This is the graceful degrade a consumer wants before the (large) embedding
+/// model is downloaded — `hybrid_search` already collapses to lexical when the
+/// query vector is `None`, so lexical-only search is the same ranking minus the
+/// semantic candidates, not a different code path.
 pub struct SearchIndex<E: EmbedEngine> {
     backend: SqliteBackend,
-    embedder: E,
+    embedder: Option<E>,
 }
 
 impl<E: EmbedEngine> SearchIndex<E> {
     pub fn new(backend: SqliteBackend, embedder: E) -> Self {
-        SearchIndex { backend, embedder }
+        SearchIndex {
+            backend,
+            embedder: Some(embedder),
+        }
+    }
+
+    /// A keyword-only index — no embedder, so no model download required.
+    /// Queries and upserts run lexical-only.
+    pub fn new_lexical(backend: SqliteBackend) -> Self {
+        SearchIndex {
+            backend,
+            embedder: None,
+        }
     }
 
     pub fn backend(&self) -> &SqliteBackend {
         &self.backend
     }
 
+    /// Whether this index has an embedder (semantic search available).
+    pub fn has_embedder(&self) -> bool {
+        self.embedder.is_some()
+    }
+
     /// Index documents incrementally — one upsert per doc, no rebuilds. A doc
     /// can opt out of the space via `embed_spaces`; embedding failure is
-    /// non-fatal (the row is written lexical-only).
+    /// non-fatal (the row is written lexical-only). With no embedder, every
+    /// row is written lexical-only.
     pub fn upsert_many(&self, docs: &[IndexDoc]) -> Result<(), BackendError> {
-        let space = self.embedder.space();
+        let Some(embedder) = self.embedder.as_ref() else {
+            return self.upsert_lexical(docs);
+        };
+        let space = embedder.space();
         let texts: Vec<String> = docs.iter().map(|d| d.index_text()).collect();
 
         // Embed only the docs that opt into this space.
@@ -123,7 +153,7 @@ impl<E: EmbedEngine> SearchIndex<E> {
             .map(|(i, _)| i)
             .collect();
         let to_embed: Vec<&str> = opted.iter().map(|&i| texts[i].as_str()).collect();
-        let embedded = self.embedder.embed_documents(&to_embed);
+        let embedded = embedder.embed_documents(&to_embed);
 
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; docs.len()];
         for (j, &i) in opted.iter().enumerate() {
@@ -154,22 +184,40 @@ impl<E: EmbedEngine> SearchIndex<E> {
         Ok(())
     }
 
-    /// Hybrid search: embeds the query with this index's embedder, then fuses
-    /// lexical + semantic candidates by RRF, optionally collapsing to one row per
-    /// object, truncated to `k`.
+    /// Hybrid search: embeds the query with this index's embedder (when it has
+    /// one), then fuses lexical + semantic candidates by RRF, optionally
+    /// collapsing to one row per object, truncated to `k`. With no embedder the
+    /// query is lexical-only.
     pub fn search(
         &self,
         query: &str,
         params: &SearchParams,
     ) -> Result<Vec<SearchResult>, BackendError> {
-        let query_vec = self.embedder.embed_query(query);
-        hybrid_search(
-            &self.backend,
-            query,
-            query_vec.as_deref(),
-            self.embedder.space(),
-            params,
-        )
+        let query_vec = self.embedder.as_ref().and_then(|e| e.embed_query(query));
+        // `space` is only consulted for the semantic half; with no query vector
+        // it is unused, so an empty name is fine for the lexical-only path.
+        let space = self.embedder.as_ref().map_or("", |e| e.space());
+        hybrid_search(&self.backend, query, query_vec.as_deref(), space, params)
+    }
+
+    /// Upsert rows with no vectors (the no-embedder path).
+    fn upsert_lexical(&self, docs: &[IndexDoc]) -> Result<(), BackendError> {
+        for doc in docs {
+            self.backend.upsert(&UpsertRow {
+                object_type: &doc.object_type,
+                object_id: &doc.object_id,
+                node_kind: &doc.node_kind,
+                partition: doc.partition.as_deref(),
+                title: doc.title.as_deref(),
+                body: doc.body.as_deref(),
+                payload: doc.payload.as_deref(),
+                attrs: doc.attrs.as_deref(),
+                source_updated_at: &doc.source_updated_at,
+                embedding_indexed_at: None,
+                embeddings: &[],
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -218,4 +266,30 @@ pub fn fuse(
     }
     results.truncate(k);
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::sqlite::SqliteBackend;
+
+    #[test]
+    fn lexical_index_searches_without_an_embedder() {
+        let backend = SqliteBackend::open_in_memory(&["default"]).unwrap();
+        let index: SearchIndex<BowEmbedder> = SearchIndex::new_lexical(backend);
+        assert!(!index.has_embedder());
+
+        index
+            .upsert_many(&[
+                IndexDoc::leaf("note", "n1", "Groceries", "milk eggs bread"),
+                IndexDoc::leaf("note", "n2", "Todo", "call the dentist"),
+            ])
+            .unwrap();
+
+        // Keyword (FTS/BM25) ranking works with no model present.
+        let hits = index.search("bread", &SearchParams::default()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].object_id, "n1");
+        assert!(matches!(hits[0].match_type, MatchType::Keyword));
+    }
 }
