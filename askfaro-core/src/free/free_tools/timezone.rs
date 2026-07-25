@@ -25,6 +25,18 @@ fn parse_zone(name: Option<&str>, field: &str) -> Result<TimeZone, CoreError> {
     TimeZone::get(n).map_err(|_| invalid(format!("unknown timezone `{n}`; use list_timezones for valid IANA names")))
 }
 
+/// Like `parse_zone`, but a missing/empty name defaults to UTC instead of
+/// erroring. `current_time` uses this so "what day/time is it" answers with no
+/// arguments — the caller often has no IANA zone to hand — while a supplied zone
+/// still localizes. A wrong zone is still rejected; only absence is lenient.
+fn parse_zone_or_utc(name: Option<&str>) -> Result<TimeZone, CoreError> {
+    match name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => TimeZone::get(n)
+            .map_err(|_| invalid(format!("unknown timezone `{n}`; use list_timezones for valid IANA names"))),
+        None => Ok(TimeZone::UTC),
+    }
+}
+
 fn fmt_offset(total_secs: i32) -> String {
     let sign = if total_secs >= 0 { "+" } else { "-" };
     let a = total_secs.unsigned_abs();
@@ -76,7 +88,7 @@ fn zone_label(tz: &TimeZone) -> String {
 }
 
 fn current_time(p: &serde_json::Value) -> ToolOutput {
-    let tz = parse_zone(s(p, "timezone"), "timezone")?;
+    let tz = parse_zone_or_utc(s(p, "timezone"))?;
     let now = Timestamp::now().to_zoned(tz.clone());
     let utc = now.timestamp().to_zoned(TimeZone::UTC);
     let mut data = serde_json::json!({
@@ -211,6 +223,21 @@ mod tests {
         assert_eq!(r["utc_offset"], "+00:00");
         assert_eq!(r["timezone"], "UTC");
         assert_eq!(r["abbreviation"], "UTC");
+    }
+    #[test]
+    fn current_time_defaults_to_utc_when_zone_omitted() {
+        // "What day is it today?" must answer with no arguments — a missing zone
+        // falls back to UTC rather than erroring (the production failure it fixes).
+        let r = d(serde_json::json!({"operation":"current_time"}));
+        assert_eq!(r["timezone"], "UTC");
+        assert_eq!(r["utc_offset"], "+00:00");
+        assert!(r["date"].as_str().is_some_and(|s| s.len() == 10)); // YYYY-MM-DD
+        assert!(r["day_of_week"].as_str().is_some());
+    }
+    #[test]
+    fn current_time_still_rejects_a_bad_zone() {
+        // Leniency is for absence only; a supplied-but-invalid zone still errors.
+        assert!(run(serde_json::json!({"operation":"current_time","timezone":"Mars/Olympus_Mons"})).is_err());
     }
     #[test]
     fn convert_ny_to_london_winter() {
