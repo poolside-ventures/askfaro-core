@@ -84,12 +84,18 @@ impl RawHit {
     }
 }
 
-/// How a result matched: keyword-only, semantic-only, or both.
+/// How a result matched: keyword-only, semantic-only, both, or neither.
+///
+/// `Filter` is the last case: a row returned by [`crate::search::list`], which
+/// retrieves by attribute equality with no query text at all. It is not a
+/// degenerate keyword hit, and calling it one would make an unranked listing
+/// indistinguishable from a BM25 result to anything reading `match_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchType {
     Keyword,
     Semantic,
     Hybrid,
+    Filter,
 }
 
 impl MatchType {
@@ -98,6 +104,7 @@ impl MatchType {
             MatchType::Keyword => "keyword",
             MatchType::Semantic => "semantic",
             MatchType::Hybrid => "hybrid",
+            MatchType::Filter => "filter",
         }
     }
 }
@@ -125,6 +132,11 @@ pub struct Filters {
     pub partition: Option<String>,
     pub object_types: Option<Vec<String>>,
     pub node_kinds: Option<Vec<String>>,
-    /// Equality match on stored `IndexDoc.attrs` (key -> JSON-encoded value).
+    /// Equality match on stored `IndexDoc.attrs`.
+    ///
+    /// Key to JSON scalar: `"true"`, `"42"`, `"\"pending\""`. A bare string
+    /// (`"pending"`) is accepted as itself, so string attrs need no quoting.
+    /// The value is bound with the type `json_extract` returns for it, which is
+    /// what makes boolean and numeric attrs match at all.
     pub attrs: Option<Vec<(String, String)>>,
 }

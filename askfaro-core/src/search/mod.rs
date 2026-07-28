@@ -200,6 +200,11 @@ impl<E: EmbedEngine> SearchIndex<E> {
         hybrid_search(&self.backend, query, query_vec.as_deref(), space, params)
     }
 
+    /// Filter-only listing over this index (see the free [`list`] function).
+    pub fn list(&self, params: &SearchParams) -> Result<Vec<SearchResult>, BackendError> {
+        list(&self.backend, params)
+    }
+
     /// Upsert rows with no vectors (the no-embedder path).
     fn upsert_lexical(&self, docs: &[IndexDoc]) -> Result<(), BackendError> {
         for doc in docs {
@@ -248,6 +253,42 @@ pub fn hybrid_search(
     Ok(fuse(&lexical, &semantic, params.k, params.collapse))
 }
 
+/// Filter-only retrieval: the rows matching `params.filters`, newest first.
+///
+/// [`hybrid_search`] returns nothing for an empty query, which is right for
+/// search and leaves listings unserved: "my pending tasks" is entirely filters
+/// and has no search terms to rank against. Consumers were left either
+/// synthesising a query string, which ranks on words the user never typed, or
+/// going back to the network for data already on the device.
+///
+/// Ordering is `source_updated_at` descending, not a relevance score, and hits
+/// come back with [`MatchType::Filter`] so a caller can tell an unranked listing
+/// from a BM25 result. `params.min_semantic_score` is ignored; nothing here is
+/// scored.
+pub fn list(
+    backend: &SqliteBackend,
+    params: &SearchParams,
+) -> Result<Vec<SearchResult>, BackendError> {
+    let rows = backend.list(&params.filters, params.k, params.collapse)?;
+    Ok(rows
+        .into_iter()
+        .map(|h| SearchResult {
+            object_type: h.object_type,
+            object_id: h.object_id,
+            node_kind: h.node_kind.clone(),
+            partition: h.partition,
+            title: h.title,
+            payload: h.payload,
+            score: 0.0,
+            match_type: MatchType::Filter,
+            lexical_rank: None,
+            semantic_rank: None,
+            semantic_score: None,
+            matched_node_kinds: vec![h.node_kind],
+        })
+        .collect())
+}
+
 /// Fuse caller-supplied candidate lists into the canonical ranking — the
 /// DB-agnostic half of [`hybrid_search`]. `lexical` and `semantic` are each in
 /// retriever-rank order (list position == rank); semantic hits carry their cosine
@@ -272,6 +313,128 @@ pub fn fuse(
 mod tests {
     use super::*;
     use crate::search::sqlite::SqliteBackend;
+
+    /// Two notes, one archived, both indexed with an `archived` attr.
+    fn seeded_index() -> SearchIndex<BowEmbedder> {
+        let backend = SqliteBackend::open_in_memory(&["default"]).unwrap();
+        let index: SearchIndex<BowEmbedder> = SearchIndex::new_lexical(backend);
+        let mut live = IndexDoc::leaf("note", "n1", "Groceries", "milk eggs bread");
+        live.attrs = Some(r#"{"archived": false}"#.into());
+        live.source_updated_at = "2026-07-01T00:00:00Z".into();
+        let mut old = IndexDoc::leaf("note", "n2", "Todo", "call the dentist");
+        old.attrs = Some(r#"{"archived": true}"#.into());
+        old.source_updated_at = "2026-06-01T00:00:00Z".into();
+        index.upsert_many(&[live, old]).unwrap();
+        index
+    }
+
+    #[test]
+    fn list_returns_rows_with_no_query_text() {
+        let hits = seeded_index().list(&SearchParams::default()).unwrap();
+        assert_eq!(hits.len(), 2);
+        // Newest first, and marked as unranked rather than as a keyword hit.
+        assert_eq!(hits[0].object_id, "n1");
+        assert!(matches!(hits[0].match_type, MatchType::Filter));
+    }
+
+    #[test]
+    fn list_applies_attrs_equality() {
+        let params = SearchParams {
+            filters: Filters {
+                attrs: Some(vec![("archived".into(), "true".into())]),
+                ..Filters::default()
+            },
+            ..SearchParams::default()
+        };
+        let hits = seeded_index().list(&params).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].object_id, "n2");
+    }
+
+    #[test]
+    fn list_matches_string_attrs_bare_or_json_quoted() {
+        let backend = SqliteBackend::open_in_memory(&["default"]).unwrap();
+        let index: SearchIndex<BowEmbedder> = SearchIndex::new_lexical(backend);
+        let mut doc = IndexDoc::leaf("task", "t1", "Ship it", "");
+        doc.attrs = Some(r#"{"status": "pending"}"#.into());
+        index.upsert_many(&[doc]).unwrap();
+
+        for value in ["pending", r#""pending""#] {
+            let params = SearchParams {
+                filters: Filters {
+                    attrs: Some(vec![("status".into(), value.into())]),
+                    ..Filters::default()
+                },
+                ..SearchParams::default()
+            };
+            assert_eq!(index.list(&params).unwrap().len(), 1, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn list_matches_numeric_attrs() {
+        let backend = SqliteBackend::open_in_memory(&["default"]).unwrap();
+        let index: SearchIndex<BowEmbedder> = SearchIndex::new_lexical(backend);
+        let mut doc = IndexDoc::leaf("task", "t1", "Ship it", "");
+        doc.attrs = Some(r#"{"attempts": 3}"#.into());
+        index.upsert_many(&[doc]).unwrap();
+
+        let params = SearchParams {
+            filters: Filters {
+                attrs: Some(vec![("attempts".into(), "3".into())]),
+                ..Filters::default()
+            },
+            ..SearchParams::default()
+        };
+        assert_eq!(index.list(&params).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_honours_k() {
+        let params = SearchParams {
+            k: 1,
+            ..SearchParams::default()
+        };
+        assert_eq!(seeded_index().list(&params).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn list_skips_tombstoned_rows() {
+        let index = seeded_index();
+        index.backend().delete("note", "n1", None).unwrap();
+        let hits = index.list(&SearchParams::default()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].object_id, "n2");
+    }
+
+    #[test]
+    fn an_attrs_key_cannot_inject_sql() {
+        // The key is interpolated into a json_extract path, so it has to be
+        // rejected rather than bound. Callers now pass these through from tool
+        // arguments, which is to say from a model.
+        let params = SearchParams {
+            filters: Filters {
+                attrs: Some(vec![("a') = 1 OR json_extract(si.attrs, '$.b".into(), "1".into())]),
+                ..Filters::default()
+            },
+            ..SearchParams::default()
+        };
+        let err = seeded_index().list(&params).unwrap_err();
+        assert!(matches!(err, BackendError::InvalidAttrKey(_)), "{err:?}");
+    }
+
+    #[test]
+    fn hybrid_search_still_rejects_a_bad_attrs_key() {
+        let params = SearchParams {
+            filters: Filters {
+                attrs: Some(vec![("bad key".into(), "1".into())]),
+                ..Filters::default()
+            },
+            ..SearchParams::default()
+        };
+        let err = seeded_index().search("bread", &params).unwrap_err();
+        assert!(matches!(err, BackendError::InvalidAttrKey(_)), "{err:?}");
+    }
 
     #[test]
     fn lexical_index_searches_without_an_embedder() {

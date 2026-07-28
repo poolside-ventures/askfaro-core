@@ -65,6 +65,52 @@ pub enum BackendError {
     Sqlite(#[from] rusqlite::Error),
     #[error("invalid embedding space name {0:?}: must match [a-z][a-z0-9_]*")]
     InvalidSpace(String),
+    #[error("invalid attrs filter key {0:?}: must match [A-Za-z_][A-Za-z0-9_]*")]
+    InvalidAttrKey(String),
+}
+
+/// Bind an attrs filter value with the type `json_extract` will produce for it.
+///
+/// `json_extract` returns SQLite's own types: JSON `true` comes back as INTEGER
+/// 1, a JSON number as INTEGER or REAL, a JSON string as TEXT. Neither side of
+/// that comparison is a column, so SQLite applies no type affinity and
+/// `1 = '1'` is false. Binding every value as text therefore made attrs
+/// filtering work for strings and silently match nothing for booleans and
+/// numbers, which is the worse failure: a filter that quietly returns an empty
+/// list reads as "no such rows".
+///
+/// Values are JSON scalars per [`Filters::attrs`], with bare strings accepted
+/// too, since a bare string is what a caller naturally passes for a string attr.
+fn attr_param(value: &str) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(serde_json::Value::Bool(b)) => Value::Integer(b as i64),
+        Ok(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .map(Value::Integer)
+            .or_else(|| n.as_f64().map(Value::Real))
+            .unwrap_or_else(|| Value::Text(value.to_string())),
+        Ok(serde_json::Value::String(s)) => Value::Text(s),
+        // Objects, arrays, null and anything that is not JSON at all: compare as
+        // written. json_extract yields TEXT for a JSON string attr, so a bare
+        // string lands on the right type here.
+        _ => Value::Text(value.to_string()),
+    }
+}
+
+/// Attribute keys are interpolated into the JSON path of a `json_extract`, so
+/// they cannot be bound as parameters and must be constrained instead. Callers
+/// increasingly pass these through from outside the process (a tool call names
+/// the field to filter on), so an unvalidated key is a SQL injection.
+fn validate_attr_key(key: &str) -> Result<(), BackendError> {
+    let mut chars = key.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(BackendError::InvalidAttrKey(key.to_string()))
+    }
 }
 
 fn validate_space(name: &str) -> Result<(), BackendError> {
@@ -337,7 +383,10 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn filter_sql(&self, filters: &Filters) -> (String, Vec<rusqlite::types::Value>) {
+    fn filter_sql(
+        &self,
+        filters: &Filters,
+    ) -> Result<(String, Vec<rusqlite::types::Value>), BackendError> {
         let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(p) = &filters.partition {
@@ -364,15 +413,63 @@ impl SqliteBackend {
         }
         if let Some(attrs) = &filters.attrs {
             for (key, value) in attrs {
+                validate_attr_key(key)?;
                 clauses.push(format!("json_extract(si.attrs, '$.{key}') = ?"));
-                params.push(value.clone().into());
+                params.push(attr_param(value));
             }
         }
-        if clauses.is_empty() {
+        Ok(if clauses.is_empty() {
             (String::new(), params)
         } else {
             (format!(" AND {}", clauses.join(" AND ")), params)
-        }
+        })
+    }
+
+    /// Filter-only retrieval: no query text, no ranking, newest first.
+    ///
+    /// The hybrid path needs something to rank against and returns nothing for
+    /// an empty query, which is correct for search and useless for a listing
+    /// ("my pending tasks" carries filters and no search terms). This is that
+    /// listing: attribute equality straight off `search_index`, ordered by
+    /// `source_updated_at`, with the same `deleted_at IS NULL` tombstone rule
+    /// the ranked retrievers use so a soft-deleted row cannot reappear here.
+    pub fn list(
+        &self,
+        filters: &Filters,
+        limit: usize,
+        collapse: bool,
+    ) -> Result<Vec<RawHit>, BackendError> {
+        let (where_sql, fparams) = self.filter_sql(filters)?;
+        // Collapsing takes the newest node per object. SQLite resolves the bare
+        // columns from the row that produced MAX(), which is the row we want.
+        let group_sql = if collapse {
+            " GROUP BY si.object_type, si.object_id"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT si.object_type, si.object_id, si.node_kind, si.partition_key, \
+                    si.title, si.payload, MAX(si.source_updated_at) AS sua \
+             FROM search_index si \
+             WHERE si.deleted_at IS NULL{where_sql}{group_sql} \
+             ORDER BY sua DESC, si.object_id DESC LIMIT ?"
+        );
+        let mut params: Vec<rusqlite::types::Value> = fparams;
+        params.push((limit as i64).into());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params), |r| {
+            Ok(RawHit {
+                object_type: r.get(0)?,
+                object_id: r.get(1)?,
+                node_kind: r.get(2)?,
+                partition: r.get(3)?,
+                title: r.get(4)?,
+                payload: r.get(5)?,
+                sim: None,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// FTS5 / bm25 lexical retrieval (best first).
@@ -385,7 +482,7 @@ impl SqliteBackend {
         let Some(matchq) = fts_query(query) else {
             return Ok(Vec::new());
         };
-        let (where_sql, fparams) = self.filter_sql(filters);
+        let (where_sql, fparams) = self.filter_sql(filters)?;
         let sql = format!(
             "SELECT si.object_type, si.object_id, si.node_kind, si.partition_key, \
                     si.title, si.payload \
@@ -426,7 +523,7 @@ impl SqliteBackend {
             return Ok(Vec::new());
         }
         let c = col(space);
-        let (where_sql, params) = self.filter_sql(filters);
+        let (where_sql, params) = self.filter_sql(filters)?;
         let sql = format!(
             "SELECT si.object_type, si.object_id, si.node_kind, si.partition_key, \
                     si.title, si.payload, si.{c} \
