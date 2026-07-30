@@ -40,6 +40,22 @@ pub mod apple_fm;
 #[cfg(all(target_os = "macos", feature = "apple-fm"))]
 pub use apple_fm::AppleFmEngine;
 
+/// In-process llama.cpp. Not OS-gated, unlike `apple_fm`: the same code runs on
+/// every platform and the accelerator is chosen by the consumer's `llama-cpp-2`
+/// features. That is the whole reason it was preferred over an Apple-only
+/// runtime.
+#[cfg(feature = "llama-cpp")]
+pub mod llama_cpp;
+
+/// Weight specs for the local providers. Gated on `model` (the shared
+/// provisioning types) rather than on a specific engine, so a host can offer the
+/// download before deciding to compile a runtime in.
+#[cfg(feature = "model")]
+pub mod models;
+
+#[cfg(feature = "llama-cpp")]
+pub use llama_cpp::{LlamaCppConfig, LlamaCppEngine};
+
 /// One conversation turn. `role` is the OpenAI role (`"system"`, `"user"`,
 /// `"assistant"`, `"tool"`); the engine maps it to the provider's transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +106,50 @@ pub struct GenerateResponse {
     pub abstained: bool,
     /// Wall-clock inference time in milliseconds.
     pub model_ms: u64,
+
+    /// The model's reasoning, separated from `text`.
+    ///
+    /// Reasoning models emit a distinct channel before the answer, and on Gemma 4
+    /// roughly 96% of decode goes here. Folding it into `text` is not cosmetic:
+    /// it is how a turn comes back looking empty. Empty for engines whose model
+    /// does not reason, or when reasoning was disabled.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+
+    /// Where the time went. `model_ms` alone cannot tell a caller *why* a turn
+    /// was slow, and every on-device latency decision so far has rested on this
+    /// split: fewer tools fixes prefill, fewer output tokens fixes decode,
+    /// keep-alive fixes load. Engines fill what they can measure and leave the
+    /// rest zero.
+    #[serde(default, skip_serializing_if = "Timings::is_empty")]
+    pub timings: Timings,
+}
+
+/// Per-turn cost attribution. All durations in milliseconds; zero means "not
+/// measured by this engine", not "instant".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timings {
+    /// Weight load. Non-zero only when the engine had to (re)load the model,
+    /// which is why it is reported apart from prefill rather than folded in.
+    pub load_ms: u64,
+    /// Reading the prompt. Scales with how much you send, so this is the number
+    /// tool selection moves.
+    pub prefill_ms: u64,
+    /// Writing the answer. Scales with how much the model says, so this is the
+    /// number a reasoning budget moves.
+    pub decode_ms: u64,
+    pub prompt_tokens: u32,
+    pub output_tokens: u32,
+    /// True when generation stopped at a cap rather than at end-of-turn, so a
+    /// truncated answer is never mistaken for a brief one.
+    pub truncated: bool,
+}
+
+impl Timings {
+    /// True when nothing was measured, so the field can be omitted from JSON.
+    pub fn is_empty(&self) -> bool {
+        *self == Timings::default()
+    }
 }
 
 /// Whether an engine can run on this device *right now*, cheaply (no model load).

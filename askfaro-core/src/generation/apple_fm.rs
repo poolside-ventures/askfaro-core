@@ -15,7 +15,9 @@
 use serde::Deserialize;
 use swift_rs::{swift, SRString};
 
-use crate::generation::{Availability, GenError, GenerateRequest, GenerateResponse, GenerationEngine, ToolCall};
+use crate::generation::{
+    Availability, GenError, GenerateRequest, GenerateResponse, GenerationEngine, Timings, ToolCall,
+};
 
 swift!(fn afm_availability() -> SRString);
 swift!(fn afm_generate(request_json: &SRString) -> SRString);
@@ -115,6 +117,18 @@ impl GenerationEngine for AppleFmEngine {
             tool_calls: parsed.tool_calls,
             abstained: parsed.abstained,
             model_ms: parsed.model_ms,
+            // Apple FM exposes neither of these, and saying so explicitly beats
+            // `..Default::default()`: when a future field is added, this engine
+            // should fail to compile and be made to answer for it, exactly as it
+            // did here.
+            //
+            // `reasoning` is empty because the system model does not surface a
+            // reasoning channel. `timings` is empty because the Swift bridge
+            // reports one wall-clock number and the OS owns weight residency, so
+            // there is no load/prefill/decode split to report. Zero means "not
+            // measured", never "instant".
+            reasoning: String::new(),
+            timings: Timings::default(),
         })
     }
 }

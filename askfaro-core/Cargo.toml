@@ -50,6 +50,14 @@ stt = ["model", "dep:parakeet-rs"]
 embeddinggemma = ["search", "dep:ort", "dep:tokenizers"]
 # Apple Foundation Models generation provider (macOS/iOS 26+; compiled in build.rs).
 apple-fm = ["generation", "dep:swift-rs"]
+# In-process llama.cpp generation provider (GGUF weights, Metal/CUDA/Vulkan/CPU).
+#
+# A SIBLING of `apple-fm`, never a parent or child of it. The two have disjoint
+# dependency trees -- a Linux consumer enabling this must not pull swift-rs and a
+# Swift bridge, and an Apple-FM-only consumer must not pull a llama.cpp GPU
+# build. Both are non-default for the same reason: a consumer who only wants
+# `search` must never inherit an inference runtime.
+llama-cpp = ["generation", "model", "dep:llama-cpp-2", "dep:cc"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -94,7 +102,23 @@ tokenizers = { version = "0.21", optional = true }
 # --- apple-fm feature (runtime FFI marshalling types) ---
 swift-rs = { version = "1.0.7", optional = true }
 
+# --- llama-cpp feature ---
+# Rust bindings to llama.cpp. GPU backends are selected by the CONSUMER via
+# llama-cpp-2's own features (metal / cuda / vulkan), because which accelerator
+# to build for is a property of the app's target, not of this crate.
+llama-cpp-2 = { version = "0.1.153", optional = true, default-features = true }
+
+# The end-to-end smoke test needs the provider AND multi-GB weights, so it must
+# not be built by a default `cargo build --all-targets`. Without this the mirror
+# validation fails on an example that cannot compile without the feature, which
+# is exactly what happened on the first push.
+[[example]]
+name = "llama_generate"
+required-features = ["llama-cpp"]
+
 [build-dependencies]
+# Compiles the chat shim for the `llama-cpp` feature (see build.rs).
+cc = { version = "1", optional = true }
 # Drives SwiftPM to compile + link the vendored Apple FM bridge. Same optional
 # dependency name as the runtime dep, so the `apple-fm` feature activates both.
 swift-rs = { version = "1.0.7", features = ["build"], optional = true }
