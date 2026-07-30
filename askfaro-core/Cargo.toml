@@ -116,6 +116,11 @@ llama-cpp-2 = { version = "0.1.153", optional = true, default-features = true }
 name = "llama_generate"
 required-features = ["llama-cpp"]
 
+# The parity bench against Scope's own cases. Same reason for the gate.
+[[example]]
+name = "llama_bench"
+required-features = ["llama-cpp"]
+
 [build-dependencies]
 # Compiles the chat shim for the `llama-cpp` feature (see build.rs).
 cc = { version = "1", optional = true }

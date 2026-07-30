@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -95,19 +96,50 @@ impl Default for LlamaCppConfig {
 pub struct LlamaCppEngine {
     cfg: LlamaCppConfig,
     loaded: Option<Loaded>,
+    /// Kept beside `loaded` rather than inside it: the shim holds no borrow of
+    /// the model (it is built from the template STRING), so it does not
+    /// participate in the drop-order constraint above.
+    chat: Option<ffi::Chat>,
 }
 
+/// The loaded engine.
+///
+/// **Field order is load-bearing.** Rust drops fields in declaration order, and
+/// `ctx` borrows `model`, which borrows `backend`, so they must be declared in
+/// that order to be torn down in it. Getting this wrong is not a leak, it is a
+/// SIGABRT: ggml-metal asserts at exit that its resource sets were released
+/// (`GGML_ASSERT([rsets->data count] == 0)`), which in an app reads as a crash on
+/// quit. An earlier version leaked the model to dodge the self-reference and hit
+/// exactly that.
 struct Loaded {
-    backend: LlamaBackend,
-    model: LlamaModel,
-    chat: ffi::Chat,
+    /// Lives across turns, and so does its KV cache.
+    ///
+    /// Rebuilding it per turn is what the first version did, and it cost **16.8s
+    /// of prefill on every turn** in the 20-case parity bench: a thread replays
+    /// an identical multi-thousand-token prefix each turn and a fresh context
+    /// re-reads all of it. Phase 0 measured prefix reuse at 165x, so discarding
+    /// the cache is the most expensive mistake available here.
+    ///
+    /// The `'static` is a lifetime extension over `model` below, sound because
+    /// `model` is boxed (a stable address, never moved) and this field is dropped
+    /// first.
+    ctx: LlamaContext<'static>,
+    /// The tokens currently in the KV cache, so the next turn decodes only what
+    /// diverges from them.
+    cached: Vec<llama_cpp_2::token::LlamaToken>,
+    /// Boxed for a stable address that `ctx` can borrow. Dropped after `ctx`.
+    #[allow(dead_code)]
+    model: Box<LlamaModel>,
+    /// Dropped last; llama.cpp requires it to outlive the model.
+    #[allow(dead_code)]
+    backend: Box<LlamaBackend>,
 }
 
 impl LlamaCppEngine {
     /// Cheap to construct; loads nothing. Check
     /// [`availability`](GenerationEngine::availability) first.
     pub fn new(cfg: LlamaCppConfig) -> Self {
-        Self { cfg, loaded: None }
+        Self { cfg, loaded: None, chat: None }
     }
 
     /// True once the weights are resident.
@@ -134,10 +166,13 @@ impl LlamaCppEngine {
             return Ok(0);
         }
         let t = Instant::now();
-        let backend = LlamaBackend::init().map_err(|e| GenError::Generate(e.to_string()))?;
+        let backend = Box::new(LlamaBackend::init().map_err(|e| GenError::Generate(e.to_string()))?);
         let params = LlamaModelParams::default().with_n_gpu_layers(self.cfg.n_gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &self.cfg.model_path, &params)
-            .map_err(|e| GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display())))?;
+        let model = Box::new(
+            LlamaModel::load_from_file(&*backend, &self.cfg.model_path, &params).map_err(|e| {
+                GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display()))
+            })?,
+        );
 
         // The template comes from the GGUF itself, so the shim never has to guess
         // which model family it is rendering for.
@@ -149,7 +184,28 @@ impl LlamaCppEngine {
         let chat = ffi::Chat::new(&template)
             .map_err(|e| GenError::Generate(format!("chat shim init: {e}")))?;
 
-        self.loaded = Some(Loaded { backend, model, chat });
+        // n_batch caps how many tokens one decode() call may carry, and it
+        // defaults far below a real prompt: the Gemma 4 template renders the tool
+        // schemas into tens of thousands of characters, which asserts out at
+        // `n_tokens_all <= cparams.n_batch`. Size it to the window.
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(self.cfg.n_ctx))
+            .with_n_batch(self.cfg.n_ctx);
+        // SAFETY: `model` and `backend` are boxed, so their addresses are stable
+        // and outlive `ctx`; `Loaded` declares `ctx` first so it is dropped first.
+        let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
+        let backend_ref: &'static LlamaBackend = unsafe { &*(&*backend as *const LlamaBackend) };
+        let ctx = model_ref
+            .new_context(backend_ref, ctx_params)
+            .map_err(|e| GenError::Generate(e.to_string()))?;
+
+        self.loaded = Some(Loaded {
+            ctx,
+            cached: Vec::new(),
+            model,
+            backend,
+        });
+        self.chat = Some(chat);
         Ok(t.elapsed().as_millis() as u64)
     }
 }
@@ -168,24 +224,15 @@ impl GenerationEngine for LlamaCppEngine {
         let loaded = self.loaded.as_mut().expect("just loaded");
 
         // --- render the prompt through the model's own template -------------
-        let applied = loaded
+        let applied = self
             .chat
+            .as_mut()
+            .expect("chat is set with loaded")
             .apply(&req, enable_thinking)
             .map_err(|e| GenError::Generate(format!("chat template: {e}")))?;
 
         // prompt + generation_prompt. See failure mode 2 in the module docs.
         let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            // n_batch caps one decode() call. It defaults far below a real
-            // prompt: five tool schemas render to ~18k chars and llama.cpp
-            // asserts `n_tokens_all <= cparams.n_batch`. Size it to the window.
-            .with_n_batch(n_ctx);
-        let mut ctx = loaded
-            .model
-            .new_context(&loaded.backend, ctx_params)
-            .map_err(|e| GenError::Generate(e.to_string()))?;
 
         let tokens = loaded
             .model
@@ -195,29 +242,55 @@ impl GenerationEngine for LlamaCppEngine {
             return Err(GenError::ContextWindowExceeded);
         }
 
-        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
-        let last = tokens.len() - 1;
-        for (i, t) in tokens.iter().enumerate() {
+        // --- prefix reuse -----------------------------------------------------
+        // A thread replays an identical prefix every turn (system prompt, tool
+        // schemas, history), so only the divergent tail needs decoding. Trim the
+        // cache at the first differing token and prefill from there.
+        //
+        // `reuse` is capped one below the common length: llama.cpp needs at least
+        // one token to decode in order to produce logits to sample from, so
+        // reusing the ENTIRE prompt would leave nothing to run.
+        let common = loaded
+            .cached
+            .iter()
+            .zip(tokens.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let reuse = common.min(tokens.len().saturating_sub(1));
+        if reuse < loaded.cached.len() {
+            loaded
+                .ctx
+                .kv_cache_seq_rm(0, Some(reuse as u32), None)
+                .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
+        }
+        let fresh = &tokens[reuse..];
+
+        let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
+        let last = fresh.len() - 1;
+        for (i, t) in fresh.iter().enumerate() {
             batch
-                .add(*t, i as i32, &[0], i == last)
+                .add(*t, (reuse + i) as i32, &[0], i == last)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
         }
 
         let t_prefill = Instant::now();
-        ctx.decode(&mut batch)
+        loaded.ctx.decode(&mut batch)
             .map_err(|e| GenError::Generate(e.to_string()))?;
         let prefill_ms = t_prefill.elapsed().as_millis() as u64;
 
         // --- decode ---------------------------------------------------------
         let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
         let mut n_cur = tokens.len() as i32;
+        // What the cache holds once this turn's prompt is in. Generated tokens are
+        // appended below so the next turn's common-prefix scan sees them too.
+        let mut cached = tokens.clone();
         let mut raw = String::new();
         let mut output_tokens = 0usize;
         let mut truncated = true;
 
         let t_decode = Instant::now();
         while output_tokens < MAX_OUTPUT_TOKENS {
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+            let token = sampler.sample(&loaded.ctx, batch.n_tokens() - 1);
             sampler.accept(token);
             // The end-of-turn token stays in the text: the parser's grammar
             // matches a complete turn. See failure mode 3 in the module docs.
@@ -237,14 +310,19 @@ impl GenerationEngine for LlamaCppEngine {
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
             n_cur += 1;
-            ctx.decode(&mut batch)
+            cached.push(token);
+            loaded.ctx
+                .decode(&mut batch)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
         }
+        loaded.cached = cached;
         let decode_ms = t_decode.elapsed().as_millis() as u64;
 
         // --- parse ----------------------------------------------------------
-        let parsed = loaded
+        let parsed = self
             .chat
+            .as_mut()
+            .expect("chat is set with loaded")
             .parse(&raw)
             .map_err(|e| GenError::Generate(format!("chat parse: {e}")))?;
 
