@@ -135,6 +135,25 @@ struct Loaded {
     backend: Box<LlamaBackend>,
 }
 
+/// SAFETY: the engine owns raw llama.cpp handles (`LlamaContext`, and the
+/// sampler it builds per turn), which are not `Sync` and so make the struct
+/// non-`Send` by inference. It IS safe to move between threads:
+///
+///  - llama.cpp contexts are not bound to the thread that created them; the
+///    constraint is that a context must not be used CONCURRENTLY.
+///  - every method here takes `&mut self`, so Rust already forbids concurrent
+///    use through a shared reference, and a host that wants cross-thread access
+///    holds it behind a lock (the desktop keeps it in `Arc<Mutex<Option<_>>>`).
+///
+/// `Sync` is deliberately NOT implemented: a `Mutex<LlamaCppEngine>` is `Sync`
+/// on the strength of `Send` alone, so nothing needs it, and claiming it would
+/// assert concurrent-use safety that llama.cpp does not offer.
+///
+/// This became necessary when the context moved into the struct to keep the KV
+/// cache across turns; before that the engine held only handles that were
+/// already `Send`.
+unsafe impl Send for LlamaCppEngine {}
+
 impl LlamaCppEngine {
     /// Cheap to construct; loads nothing. Check
     /// [`availability`](GenerationEngine::availability) first.
