@@ -60,11 +60,18 @@ fn main() {
                 .join(" ")
         })
         .unwrap_or_default();
+    // STABLE ONLY, mirroring the app. Nothing here may change between turns.
+    //
+    // This bench used to put `scopy_context` in the system block with a FROZEN
+    // clock, which is how it reported 233ms warm prefill while the app paid
+    // 27,495ms on every turn: the app's clock has minute resolution, so the
+    // prefix diverged at about token 20 and re-prefilled all ~7,700 tokens. The
+    // one variable that mattered was the one the harness held still. The clock
+    // now moves per case, below, so this class of regression is measurable here
+    // instead of arriving as "the app feels slow" weeks later.
     let system = format!(
         "You are Scopy, a fast on-device assistant.\n\n\
-         scopy_context: {{\"now\":\"{now}\",\"timezone\":\"UTC\"}}\n\n\
          response_style: {style} {rules}\n\n{loop_guidance}\n\n{index}",
-        now = "2026-07-30 08:00",
         style = prompt_consts["responseStyle"].as_str().unwrap_or(""),
         rules = style_rules,
         loop_guidance = prompt_consts["toolLoopGuidance"].as_str().unwrap_or(""),
@@ -106,11 +113,18 @@ fn main() {
         let prompt = c["prompt"].as_str().unwrap_or("");
         eprint!("\r  {}/{} {id:<24}", i + 1, case_list.len());
 
+        // Volatile context on the USER turn, which the template renders after
+        // the tools, so the stable prefix survives. The minute ticks per case on
+        // purpose: a real session's clock moves, and a bench that freezes it
+        // cannot see the most expensive prompt bug there is.
         let req = GenerateRequest {
             system: system.clone(),
             messages: vec![Msg {
                 role: "user".into(),
-                content: prompt.to_string(),
+                content: format!(
+                    "scopy_context: {{\"now\":\"2026-07-30 08:{:02}\",\"timezone\":\"UTC\"}}\n\n{prompt}",
+                    i % 60,
+                ),
             }],
             tools: tools.clone(),
         };
