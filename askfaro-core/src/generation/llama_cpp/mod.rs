@@ -716,7 +716,19 @@ impl LlamaCppEngine {
         std::fs::rename(&tmp, path)
             .map_err(|e| GenError::Generate(format!("prefix cache rename: {e}")))?;
         loaded.cached.insert(0, prefix.clone());
-        loaded.prefix = PrefixState::Live;
+        // Trusted only when this was checked against a real prompt.
+        //
+        // A host-initiated build (`ensure_prefix`, with no prompt to check
+        // against) is a GUESS at what the app will send: it assembles the
+        // system block and tool set from a second place in the code, and if
+        // that drifts by one character the prefix is wrong. Left as
+        // `Restored`, so the first real turn validates it exactly as it
+        // validates one read off disk, and discards it whole rather than
+        // trimming into a sliding window it cannot cover.
+        loaded.prefix = match tokens {
+            Some(_) => PrefixState::Live,
+            None => PrefixState::Restored(prefix.len()),
+        };
 
         // Anything under a different key is dead by construction: only one
         // configuration is live per install, and a model upgrade would otherwise
@@ -833,8 +845,12 @@ impl LlamaCppEngine {
                     .is_some_and(|c| c.starts_with(&prefix))
         };
         if current {
-            let loaded = self.loaded.as_mut().expect("loaded");
-            loaded.prefix = PrefixState::Live;
+            // Deliberately does NOT promote to `Live`. Agreeing with the file on
+            // disk is not validation when this call is the thing that WROTE that
+            // file: a host whose prompt assembly has drifted produces a prefix
+            // that matches its own last one perfectly and matches the app's real
+            // turn not at all. Whatever state the restore left stands, so the
+            // first real prompt is still the arbiter.
             return Ok(PrefixReport {
                 tokens: prefix.len() as u32,
                 bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
