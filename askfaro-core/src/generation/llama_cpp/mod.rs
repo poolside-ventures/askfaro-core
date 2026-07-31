@@ -1214,3 +1214,140 @@ impl GenerationEngine for LlamaCppEngine {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every field the persisted state depends on, at a non-default value, so a
+    /// test can flip exactly one and see the key move.
+    fn cfg() -> LlamaCppConfig {
+        LlamaCppConfig {
+            model_path: PathBuf::from("/models/a.gguf"),
+            draft_path: Some(PathBuf::from("/models/draft.gguf")),
+            n_ctx: 16384,
+            n_slots: 2,
+            n_gpu_layers: 1000,
+            enable_thinking: true,
+            prefix_cache_dir: Some(PathBuf::from("/cache")),
+            state_key: "model-sha-aaa".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The key is what stops a state file being opened by a configuration it was
+    /// not computed for, and a wrong answer here is not an error: llama.cpp
+    /// validates the SHAPE of a saved state and nothing about which weights
+    /// produced it, so a mismatched file deserializes happily and answers
+    /// plausible nonsense. Each of these fields changes the tokens or the cache
+    /// layout, so each MUST change the file name.
+    #[test]
+    fn every_input_that_changes_the_state_changes_the_key() {
+        let base = LlamaCppEngine::prefix_key_for(&cfg());
+
+        let mut c = cfg();
+        c.state_key = "model-sha-bbb".into();
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "state_key");
+
+        let mut c = cfg();
+        c.model_path = PathBuf::from("/models/b.gguf");
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "model_path");
+
+        let mut c = cfg();
+        c.n_ctx = 8192;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "n_ctx");
+
+        let mut c = cfg();
+        c.n_slots = 1;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "n_slots");
+
+        let mut c = cfg();
+        c.n_gpu_layers = 0;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "n_gpu_layers");
+
+        let mut c = cfg();
+        c.enable_thinking = false;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "enable_thinking");
+
+        // The drafter shares the target's KV memory, so attaching or removing
+        // one changes what is in the cache.
+        let mut c = cfg();
+        c.draft_path = None;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "drafter removed");
+
+        let mut c = cfg();
+        c.draft_path = Some(PathBuf::from("/models/other-draft.gguf"));
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "drafter swapped");
+    }
+
+    /// The mirror of the above, and the half that makes the cache worth having:
+    /// an unchanged configuration must resolve to the SAME file every launch, or
+    /// nothing is ever reused and every start rebuilds.
+    #[test]
+    fn an_unchanged_configuration_keeps_its_key() {
+        assert_eq!(
+            LlamaCppEngine::prefix_key_for(&cfg()),
+            LlamaCppEngine::prefix_key_for(&cfg())
+        );
+    }
+
+    /// Where the file lives is policy the host sets; moving the directory must
+    /// not rename the file inside it, or a host that relocates its cache silently
+    /// orphans every prefix it has ever built.
+    #[test]
+    fn the_directory_is_not_part_of_the_key() {
+        let mut c = cfg();
+        c.prefix_cache_dir = Some(PathBuf::from("/somewhere/else"));
+        assert_eq!(
+            LlamaCppEngine::prefix_key_for(&cfg()),
+            LlamaCppEngine::prefix_key_for(&c)
+        );
+    }
+
+    #[test]
+    fn no_cache_directory_means_no_path() {
+        let mut c = cfg();
+        c.prefix_cache_dir = None;
+        assert!(LlamaCppEngine::prefix_path_for(&c).is_none());
+        let p = LlamaCppEngine::prefix_path_for(&cfg()).expect("configured");
+        assert_eq!(p.parent().unwrap(), Path::new("/cache"));
+        assert!(p.file_name().unwrap().to_string_lossy().starts_with("prefix-"));
+        assert_eq!(p.extension().unwrap(), "kv");
+    }
+
+    /// `sweep_stale_prefixes` deletes superseded state files, and it runs in a
+    /// directory that also holds multi-gigabyte weights. It must remove only what
+    /// it wrote.
+    #[test]
+    fn the_sweep_removes_old_prefixes_and_nothing_else() {
+        let dir = std::env::temp_dir().join("faro-prefix-sweep-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let keep = dir.join("prefix-keepme.kv");
+        for name in [
+            "prefix-keepme.kv",
+            "prefix-old.kv",
+            "prefix-older.kv.tmp",
+            "weights.gguf",
+            "prefix-inputs.json",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        LlamaCppEngine::sweep_stale_prefixes(&keep);
+
+        assert!(keep.exists(), "the live prefix must survive");
+        assert!(!dir.join("prefix-old.kv").exists(), "a superseded prefix must go");
+        assert!(!dir.join("prefix-older.kv.tmp").exists(), "a half-written prefix must go");
+        // The weights are the expensive thing in this directory; a sweep that
+        // took them would cost a multi-gigabyte re-download.
+        assert!(dir.join("weights.gguf").exists(), "weights must never be touched");
+        // The host keeps its own records here too.
+        assert!(dir.join("prefix-inputs.json").exists(), "host sidecars must survive");
+        assert!(dir.join("notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
