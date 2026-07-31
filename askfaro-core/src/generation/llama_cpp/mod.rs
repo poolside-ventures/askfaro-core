@@ -211,7 +211,7 @@ impl LlamaCppEngine {
     ///
     /// Generation loads lazily, which is right for a process that may never
     /// generate, but it makes the FIRST turn pay the whole cold load: measured
-    /// 12.5s to 26s for E2B and ~60s for E4B's 5.15 GB. A host that knows a turn
+    /// 12.5s to 26s for E2B and ~37s for E4B's 5.15 GB. A host that knows a turn
     /// is coming (an app that just opened) can pay that in the background
     /// instead of in front of a waiting user.
     ///
@@ -226,6 +226,11 @@ impl LlamaCppEngine {
     /// The counterpart to `warm`. Holding E4B resident costs 5.15 GB, which is a
     /// third of a 16 GB machine, so a host that has been idle for a while wants
     /// that back. Returns whether anything was actually released.
+    ///
+    /// Cheap to reverse, which is what makes releasing reasonable: a re-`warm`
+    /// measured **~3-5s** against the 37s cold load, because the weights are
+    /// mmapped and the OS page cache survives the unload. Do not assume the cold
+    /// number applies to a reload.
     pub fn unload(&mut self) -> bool {
         let was = self.loaded.is_some();
         // `chat` is derived from the model's template, so it must go too or a
@@ -466,6 +471,9 @@ impl GenerationEngine for LlamaCppEngine {
         let mut raw = String::new();
         let mut output_tokens = 0usize;
         let mut truncated = true;
+        // The rendered text of the token that ended the turn, so it can be
+        // trimmed off the answer after parsing.
+        let mut stop_piece: Option<String> = None;
         let mut draft_proposed = 0usize;
         let mut draft_accepted = 0usize;
 
@@ -478,15 +486,20 @@ impl GenerationEngine for LlamaCppEngine {
             sampler.accept(next);
             // The end-of-turn token stays in the text: the parser's grammar
             // matches a complete turn. See failure mode 3 in the module docs.
-            raw.push_str(
-                &loaded
-                    .model
-                    .token_to_str(next, Special::Tokenize)
-                    .map_err(|e| GenError::Generate(e.to_string()))?,
-            );
+            let piece = loaded
+                .model
+                .token_to_str(next, Special::Tokenize)
+                .map_err(|e| GenError::Generate(e.to_string()))?;
+            raw.push_str(&piece);
             output_tokens += 1;
             if loaded.model.is_eog_token(next) {
                 truncated = false;
+                // Remember how this turn ended, so the marker can come off the
+                // answer later. Gemma 4 declares NO template stop strings, so
+                // `additional_stops` is empty and the end is a TOKEN; its
+                // rendered text is still model-supplied, which is what makes
+                // this safe to strip without hardcoding `<turn|>`.
+                stop_piece = Some(piece);
                 break;
             }
 
@@ -567,16 +580,19 @@ impl GenerationEngine for LlamaCppEngine {
                     // they must run the same EOG and cap checks as any other.
                     for d in drafts.iter().take(accepted) {
                         sampler.accept(*d);
-                        raw.push_str(
-                            &loaded
-                                .model
-                                .token_to_str(*d, Special::Tokenize)
-                                .map_err(|e| GenError::Generate(e.to_string()))?,
-                        );
+                        let piece = loaded
+                            .model
+                            .token_to_str(*d, Special::Tokenize)
+                            .map_err(|e| GenError::Generate(e.to_string()))?;
+                        raw.push_str(&piece);
                         output_tokens += 1;
                         cached.push(*d);
                         if loaded.model.is_eog_token(*d) {
                             truncated = false;
+                            // A turn can end inside an ACCEPTED draft, so the
+                            // marker has to be captured here too, not only on
+                            // the directly sampled path above.
+                            stop_piece = Some(piece);
                             n_cur = pos_of_next + 1 + accepted as i32;
                             break 'gen;
                         }
@@ -626,7 +642,37 @@ impl GenerationEngine for LlamaCppEngine {
             })
             .collect();
 
-        let text = parsed.content.trim().to_string();
+        // Trim the template's own stop markers off the answer.
+        //
+        // Stopping on end-of-turn TOKENS leaves the marker in the decoded text,
+        // and upstream's parser deliberately keeps it in `content` because the
+        // grammar matches a complete turn INCLUDING it. So Gemma 4 answers
+        // "Today is July 31, 2026.<turn|>" and the marker reaches the user.
+        //
+        // Trimmed here, AFTER the parse, so the grammar still sees the complete
+        // turn it wants; only the user-facing string is cleaned. The markers come
+        // from `additional_stops`, i.e. from the model's own template, so this
+        // holds for the next model family without a per-family constant. A
+        // hardcoded "<turn|>" would have been the same fix in appearance and a
+        // maintenance trap in fact.
+        //
+        // Not covered by the tool-calling bench, which grades tool names and
+        // arguments and never asserts on answer TEXT: all 20 cases passed with
+        // this broken.
+        let mut text = parsed.content.trim();
+        // Template-declared stops first, then the end-of-turn token's own text.
+        // Gemma 4 declares none of the former, so in practice the latter is what
+        // does the work here; both are model-supplied, which is the point.
+        for stop in applied
+            .additional_stops
+            .iter()
+            .chain(stop_piece.iter())
+        {
+            if let Some(stripped) = text.strip_suffix(stop.as_str()) {
+                text = stripped.trim_end();
+            }
+        }
+        let text = text.to_string();
         Ok(GenerateResponse {
             abstained: tool_calls.is_empty() && text.is_empty(),
             text,
@@ -640,6 +686,8 @@ impl GenerationEngine for LlamaCppEngine {
                 prompt_tokens: tokens.len() as u32,
                 output_tokens: output_tokens as u32,
                 truncated,
+                draft_proposed: draft_proposed as u32,
+                draft_accepted: draft_accepted as u32,
             },
         })
     }

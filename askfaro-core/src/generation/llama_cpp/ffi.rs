@@ -48,6 +48,15 @@ pub struct Applied {
     #[allow(dead_code)]
     #[serde(default)]
     pub supports_thinking: bool,
+    /// Stop strings the TEMPLATE declares, e.g. Gemma 4's `<turn|>`.
+    ///
+    /// Stopping on end-of-turn TOKENS is not enough: the marker is still sitting
+    /// at the end of the decoded text, and upstream's parser leaves it in
+    /// `content` because the grammar wants a complete turn including it. These
+    /// are what the text has to be trimmed with, and they come from the model
+    /// rather than from a constant we would have to maintain per family.
+    #[serde(default)]
+    pub additional_stops: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

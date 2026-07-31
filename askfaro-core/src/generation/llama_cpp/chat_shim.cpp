@@ -112,6 +112,12 @@ char * scope_chat_apply(scope_chat_ctx * ctx,
         out["thinking_start"]    = ctx->last.thinking_start_tag;
         out["thinking_end"]      = ctx->last.thinking_end_tag;
         out["format"]            = common_chat_format_name(ctx->last.format);
+        // The template's OWN stop strings, not just how many. A caller that
+        // stops on end-of-turn tokens alone still has the marker sitting in the
+        // decoded text (Gemma 4 leaves a literal `<turn|>` at the end of
+        // `content`), and the only non-hardcoded way to remove it is to use the
+        // strings the template declares here.
+        out["additional_stops"]  = ctx->last.additional_stops;
         out["n_stops"]           = ctx->last.additional_stops.size();
         return dup_cstr(out.dump());
     } catch (const std::exception & e) {

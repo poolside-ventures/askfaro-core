@@ -121,6 +121,18 @@ required-features = ["llama-cpp"]
 name = "llama_bench"
 required-features = ["llama-cpp"]
 
+# Reproduces the end-of-turn marker leaking into `content`, with and without the
+# speculative drafter. Same gate: it builds an engine.
+[[example]]
+name = "turn_marker"
+required-features = ["llama-cpp"]
+
+# Measures what a reload costs after `unload`, which is what makes the desktop's
+# idle-unload policy affordable. Same gate.
+[[example]]
+name = "warm_cycle"
+required-features = ["llama-cpp"]
+
 [build-dependencies]
 # Compiles the chat shim for the `llama-cpp` feature (see build.rs).
 cc = { version = "1", optional = true }

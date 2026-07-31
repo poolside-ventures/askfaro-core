@@ -143,6 +143,25 @@ pub struct Timings {
     /// True when generation stopped at a cap rather than at end-of-turn, so a
     /// truncated answer is never mistaken for a brief one.
     pub truncated: bool,
+    /// Draft tokens proposed by a speculative drafter, and how many the target
+    /// model accepted. Both 0 when speculation is off.
+    ///
+    /// Reported rather than merely logged because acceptance is the number that
+    /// says whether speculation is EARNING its place: it decides the speedup,
+    /// and it is also the only way to tell "the drafter is working" from "the
+    /// drafter silently fell back to plain decode", which is the failure mode
+    /// this whole path specialises in. A host that surfaces timings should
+    /// surface these in the same place, or the question can only be answered
+    /// from a terminal.
+    #[serde(default, skip_serializing_if = "crate::generation::is_zero_u32")]
+    pub draft_proposed: u32,
+    #[serde(default, skip_serializing_if = "crate::generation::is_zero_u32")]
+    pub draft_accepted: u32,
+}
+
+/// Serde helper: omit speculative counters when speculation is off.
+pub(crate) fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Timings {
