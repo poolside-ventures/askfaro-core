@@ -52,6 +52,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 
 use crate::generation::{
     Availability, GenError, GenerateRequest, GenerateResponse, GenerationEngine, Timings, ToolCall,
@@ -67,6 +68,18 @@ const MAX_OUTPUT_TOKENS: usize = 2048;
 pub struct LlamaCppConfig {
     /// Path to the GGUF weights.
     pub model_path: PathBuf,
+    /// Optional MTP drafter for speculative decoding.
+    ///
+    /// Worth **+30% decode** on E4B (29.8 to 38.8 tok/s) for 77 MB, and lossless:
+    /// verified tokens are exactly what greedy would have produced, which was
+    /// confirmed byte-for-byte across all 20 bench cases. `None` runs the plain
+    /// decode loop.
+    pub draft_path: Option<PathBuf>,
+    /// Draft tokens to propose per step. **3 is a measured optimum, not a
+    /// default to tune away from**: acceptance falls as the window grows and
+    /// rejected drafts still cost a verify pass, so 5 lands at 33.3 tok/s and 8
+    /// at 24.3, the latter BELOW not speculating at all (34.0).
+    pub draft_n_max: i32,
     /// Total context window in tokens. A property of the MODEL, so the caller
     /// supplies it from its model profile; this crate does not decide it.
     pub n_ctx: u32,
@@ -80,6 +93,8 @@ impl Default for LlamaCppConfig {
     fn default() -> Self {
         Self {
             model_path: PathBuf::new(),
+            draft_path: None,
+            draft_n_max: 3,
             n_ctx: 16384,
             n_gpu_layers: 1000,
             enable_thinking: true,
@@ -112,6 +127,30 @@ pub struct LlamaCppEngine {
 /// quit. An earlier version leaked the model to dodge the self-reference and hit
 /// exactly that.
 struct Loaded {
+    /// The decoder: either a plain context, or an MTP speculative wrapper that
+    /// OWNS the target context (and the drafter's).
+    ///
+    /// One enum rather than two `Option`s so "both set" and "neither set" are
+    /// unrepresentable; the speculative path takes the context by value, so they
+    /// genuinely cannot coexist.
+    dec: Decoder,
+    /// The tokens currently in the KV cache, so the next turn decodes only what
+    /// diverges from them.
+    cached: Vec<llama_cpp_2::token::LlamaToken>,
+    /// Boxed for a stable address the drafter's context borrows. Dropped after
+    /// `dec`, which holds that context.
+    #[allow(dead_code)]
+    draft_model: Option<Box<LlamaModel>>,
+    /// Boxed for a stable address that the context can borrow. Dropped after `dec`.
+    #[allow(dead_code)]
+    model: Box<LlamaModel>,
+    /// Dropped last; llama.cpp requires it to outlive the models.
+    #[allow(dead_code)]
+    backend: Box<LlamaBackend>,
+}
+
+/// Plain decode, or MTP speculative decode.
+enum Decoder {
     /// Lives across turns, and so does its KV cache.
     ///
     /// Rebuilding it per turn is what the first version did, and it cost **16.8s
@@ -120,19 +159,21 @@ struct Loaded {
     /// re-reads all of it. Phase 0 measured prefix reuse at 165x, so discarding
     /// the cache is the most expensive mistake available here.
     ///
-    /// The `'static` is a lifetime extension over `model` below, sound because
-    /// `model` is boxed (a stable address, never moved) and this field is dropped
-    /// first.
-    ctx: LlamaContext<'static>,
-    /// The tokens currently in the KV cache, so the next turn decodes only what
-    /// diverges from them.
-    cached: Vec<llama_cpp_2::token::LlamaToken>,
-    /// Boxed for a stable address that `ctx` can borrow. Dropped after `ctx`.
-    #[allow(dead_code)]
-    model: Box<LlamaModel>,
-    /// Dropped last; llama.cpp requires it to outlive the model.
-    #[allow(dead_code)]
-    backend: Box<LlamaBackend>,
+    /// The `'static` is a lifetime extension over `model`, sound because `model`
+    /// is boxed (a stable address, never moved) and this is dropped first.
+    Plain(LlamaContext<'static>),
+    /// Owns the target context, so all decode goes through
+    /// `target_context_mut()`.
+    Mtp(Box<MtpSpeculative<'static>>),
+}
+
+impl Decoder {
+    fn ctx(&mut self) -> &mut LlamaContext<'static> {
+        match self {
+            Decoder::Plain(c) => c,
+            Decoder::Mtp(s) => s.target_context_mut(),
+        }
+    }
 }
 
 /// SAFETY: the engine owns raw llama.cpp handles (`LlamaContext`, and the
@@ -166,6 +207,34 @@ impl LlamaCppEngine {
         self.loaded.is_some()
     }
 
+    /// Load the weights now, returning the load time in ms (0 if already warm).
+    ///
+    /// Generation loads lazily, which is right for a process that may never
+    /// generate, but it makes the FIRST turn pay the whole cold load: measured
+    /// 12.5s to 26s for E2B and ~60s for E4B's 5.15 GB. A host that knows a turn
+    /// is coming (an app that just opened) can pay that in the background
+    /// instead of in front of a waiting user.
+    ///
+    /// Idempotent, so a host may call it on every foreground without checking.
+    pub fn warm(&mut self) -> Result<u64, GenError> {
+        self.ensure_loaded()
+    }
+
+    /// Drop the weights, freeing their memory; the engine stays usable and will
+    /// reload lazily on the next generate.
+    ///
+    /// The counterpart to `warm`. Holding E4B resident costs 5.15 GB, which is a
+    /// third of a 16 GB machine, so a host that has been idle for a while wants
+    /// that back. Returns whether anything was actually released.
+    pub fn unload(&mut self) -> bool {
+        let was = self.loaded.is_some();
+        // `chat` is derived from the model's template, so it must go too or a
+        // reload would keep a template belonging to weights that are gone.
+        self.loaded = None;
+        self.chat = None;
+        was
+    }
+
     /// Cheap probe: does the configured GGUF exist? Deliberately does NOT load.
     pub fn availability_for(model_path: &Path) -> Availability {
         if model_path.as_os_str().is_empty() {
@@ -178,6 +247,40 @@ impl LlamaCppEngine {
             ));
         }
         Availability::Available
+    }
+
+    /// Load the MTP drafter and give it its own context.
+    ///
+    /// Returns the drafter's context plus the boxed model that context borrows;
+    /// the caller must keep the model alive for at least as long as the context,
+    /// which `Loaded`'s field order enforces.
+    /// The drafter's context must be BOUND to the target's, not built standalone.
+    ///
+    /// Gemma 4's MTP head is not an independent model that happens to be small;
+    /// it reads the target's backbone hidden states, so llama.cpp refuses a
+    /// plain context for it: "Gemma4Assistant requires ctx_other to be set".
+    /// That is why this takes the target context and uses
+    /// `new_context_with_ctx_other`, and why the target must exist first.
+    fn load_drafter(
+        backend: &LlamaBackend,
+        backend_ref: &'static LlamaBackend,
+        ctx_params: LlamaContextParams,
+        path: &Path,
+        target: &LlamaContext<'_>,
+    ) -> Result<(LlamaContext<'static>, Box<LlamaModel>), GenError> {
+        // The drafter is tiny (77 MB); offload it fully, same as the target.
+        let params = LlamaModelParams::default().with_n_gpu_layers(1000);
+        let dm = Box::new(
+            LlamaModel::load_from_file(backend, path, &params)
+                .map_err(|e| GenError::Generate(format!("load drafter {}: {e}", path.display())))?,
+        );
+        // SAFETY: identical to the target model above -- boxed, so its address is
+        // stable, and `Loaded` drops the context before the model.
+        let dm_ref: &'static LlamaModel = unsafe { &*(&*dm as *const LlamaModel) };
+        let ctx = dm_ref
+            .new_context_with_ctx_other(backend_ref, ctx_params, target)
+            .map_err(|e| GenError::Generate(e.to_string()))?;
+        Ok((ctx, dm))
     }
 
     fn ensure_loaded(&mut self) -> Result<u64, GenError> {
@@ -215,12 +318,54 @@ impl LlamaCppEngine {
         let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
         let backend_ref: &'static LlamaBackend = unsafe { &*(&*backend as *const LlamaBackend) };
         let ctx = model_ref
-            .new_context(backend_ref, ctx_params)
+            .new_context(backend_ref, ctx_params.clone())
             .map_err(|e| GenError::Generate(e.to_string()))?;
 
+        // The drafter, when one is configured. Failing to load it is NOT fatal:
+        // speculation is a pure speed optimisation and a turn without it is
+        // correct, just slower. Degrading to plain decode beats refusing to
+        // answer because an 77 MB accessory is missing or mismatched.
+        let (dec, draft_model) = match &self.cfg.draft_path {
+            Some(p) if p.exists() => {
+                match Self::load_drafter(&*backend, backend_ref, ctx_params, p, &ctx) {
+                    Ok((spec_ctx, dm)) => match MtpSpeculative::new(
+                        ctx,
+                        spec_ctx,
+                        MtpSpeculativeParams {
+                            n_max: self.cfg.draft_n_max,
+                            ..Default::default()
+                        },
+                    ) {
+                        Ok(s) => (Decoder::Mtp(Box::new(s)), Some(dm)),
+                        Err(e) => {
+                            // `MtpSpeculative::new` consumed both contexts, so
+                            // there is nothing to fall back WITH; rebuild one.
+                            eprintln!("llama_cpp: MTP init failed ({e}); plain decode");
+                            let c = model_ref
+                                .new_context(backend_ref, LlamaContextParams::default()
+                                    .with_n_ctx(std::num::NonZeroU32::new(self.cfg.n_ctx))
+                                    .with_n_batch(self.cfg.n_ctx))
+                                .map_err(|e| GenError::Generate(e.to_string()))?;
+                            (Decoder::Plain(c), None)
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("llama_cpp: drafter load failed ({e}); plain decode");
+                        (Decoder::Plain(ctx), None)
+                    }
+                }
+            }
+            Some(p) => {
+                eprintln!("llama_cpp: drafter not found at {}; plain decode", p.display());
+                (Decoder::Plain(ctx), None)
+            }
+            None => (Decoder::Plain(ctx), None),
+        };
+
         self.loaded = Some(Loaded {
-            ctx,
+            dec,
             cached: Vec::new(),
+            draft_model,
             model,
             backend,
         });
@@ -278,11 +423,19 @@ impl GenerationEngine for LlamaCppEngine {
         let reuse = common.min(tokens.len().saturating_sub(1));
         if reuse < loaded.cached.len() {
             loaded
-                .ctx
+                .dec
+                .ctx()
                 .kv_cache_seq_rm(0, Some(reuse as u32), None)
                 .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
         }
         let fresh = &tokens[reuse..];
+
+        // The speculative path needs the whole prompt announced up front, before
+        // any decode, so the drafter's own context is primed from the same text.
+        if let Decoder::Mtp(spec) = &mut loaded.dec {
+            spec.begin(&tokens)
+                .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
+        }
 
         let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
         let last = fresh.len() - 1;
@@ -293,8 +446,15 @@ impl GenerationEngine for LlamaCppEngine {
         }
 
         let t_prefill = Instant::now();
-        loaded.ctx.decode(&mut batch)
+        loaded
+            .dec
+            .ctx()
+            .decode(&mut batch)
             .map_err(|e| GenError::Generate(e.to_string()))?;
+        if let Decoder::Mtp(spec) = &mut loaded.dec {
+            spec.process(&batch)
+                .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+        }
         let prefill_ms = t_prefill.elapsed().as_millis() as u64;
 
         // --- decode ---------------------------------------------------------
@@ -306,36 +466,145 @@ impl GenerationEngine for LlamaCppEngine {
         let mut raw = String::new();
         let mut output_tokens = 0usize;
         let mut truncated = true;
+        let mut draft_proposed = 0usize;
+        let mut draft_accepted = 0usize;
 
         let t_decode = Instant::now();
-        while output_tokens < MAX_OUTPUT_TOKENS {
-            let token = sampler.sample(&loaded.ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
+        // `next` is the token that has been decided but not yet written into the
+        // KV cache. Both loops below share this invariant.
+        let mut next = sampler.sample(loaded.dec.ctx(), batch.n_tokens() - 1);
+
+        'gen: while output_tokens < MAX_OUTPUT_TOKENS {
+            sampler.accept(next);
             // The end-of-turn token stays in the text: the parser's grammar
             // matches a complete turn. See failure mode 3 in the module docs.
             raw.push_str(
                 &loaded
                     .model
-                    .token_to_str(token, Special::Tokenize)
+                    .token_to_str(next, Special::Tokenize)
                     .map_err(|e| GenError::Generate(e.to_string()))?,
             );
             output_tokens += 1;
-            if loaded.model.is_eog_token(token) {
+            if loaded.model.is_eog_token(next) {
                 truncated = false;
                 break;
             }
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .map_err(|e| GenError::Generate(e.to_string()))?;
-            n_cur += 1;
-            cached.push(token);
-            loaded.ctx
-                .decode(&mut batch)
-                .map_err(|e| GenError::Generate(e.to_string()))?;
+
+            match &mut loaded.dec {
+                // --- plain: one token in, one token out ---------------------
+                Decoder::Plain(ctx) => {
+                    batch.clear();
+                    batch
+                        .add(next, n_cur, &[0], true)
+                        .map_err(|e| GenError::Generate(e.to_string()))?;
+                    cached.push(next);
+                    n_cur += 1;
+                    ctx.decode(&mut batch)
+                        .map_err(|e| GenError::Generate(e.to_string()))?;
+                    next = sampler.sample(ctx, batch.n_tokens() - 1);
+                }
+                // --- speculative: propose k, verify all k in ONE pass --------
+                //
+                // This is why speculation pays at all: verifying k proposals
+                // costs about the same as generating one token, because decode
+                // is bound by streaming the weights, not by the arithmetic. The
+                // sampled result is IDENTICAL to plain greedy decode by
+                // construction, since every draft is only kept when it matches
+                // what the target model would itself have produced.
+                Decoder::Mtp(spec) => {
+                    let drafts = spec
+                        .draft(n_cur, next, &cached)
+                        .map_err(|e| GenError::Generate(format!("mtp draft: {e}")))?;
+                    draft_proposed += drafts.len();
+
+                    // `next` at n_cur, then each proposal after it. Every
+                    // position needs logits, because each one is a verification
+                    // point rather than just context.
+                    batch.clear();
+                    batch
+                        .add(next, n_cur, &[0], true)
+                        .map_err(|e| GenError::Generate(e.to_string()))?;
+                    for (i, d) in drafts.iter().enumerate() {
+                        batch
+                            .add(*d, n_cur + 1 + i as i32, &[0], true)
+                            .map_err(|e| GenError::Generate(e.to_string()))?;
+                    }
+                    cached.push(next);
+                    let pos_of_next = n_cur;
+
+                    spec.target_context_mut()
+                        .decode(&mut batch)
+                        .map_err(|e| GenError::Generate(e.to_string()))?;
+                    spec.process(&batch)
+                        .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+
+                    // Logits at batch index j predict the token AFTER the token
+                    // at index j. So index 0 (which holds `next`) is checked
+                    // against the first proposal, and so on down the chain.
+                    let mut accepted = 0usize;
+                    let mut correction = None;
+                    for (i, d) in drafts.iter().enumerate() {
+                        let t = sampler.sample(spec.target_context_mut(), i as i32);
+                        if t == *d {
+                            accepted += 1;
+                        } else {
+                            correction = Some(t);
+                            break;
+                        }
+                    }
+                    // All k matched, so index k yields a free extra token: the
+                    // verify pass already computed it.
+                    let follow = match correction {
+                        Some(t) => t,
+                        None => sampler.sample(spec.target_context_mut(), drafts.len() as i32),
+                    };
+                    draft_accepted += accepted;
+
+                    spec.accept(accepted as u16)
+                        .map_err(|e| GenError::Generate(format!("mtp accept: {e}")))?;
+
+                    // Emit what was accepted. These are committed tokens, so
+                    // they must run the same EOG and cap checks as any other.
+                    for d in drafts.iter().take(accepted) {
+                        sampler.accept(*d);
+                        raw.push_str(
+                            &loaded
+                                .model
+                                .token_to_str(*d, Special::Tokenize)
+                                .map_err(|e| GenError::Generate(e.to_string()))?,
+                        );
+                        output_tokens += 1;
+                        cached.push(*d);
+                        if loaded.model.is_eog_token(*d) {
+                            truncated = false;
+                            n_cur = pos_of_next + 1 + accepted as i32;
+                            break 'gen;
+                        }
+                        if output_tokens >= MAX_OUTPUT_TOKENS {
+                            n_cur = pos_of_next + 1 + accepted as i32;
+                            break 'gen;
+                        }
+                    }
+
+                    // Rejected proposals are still sitting in the KV cache, so
+                    // drop them: keeping them would corrupt every later position.
+                    // A no-op when everything was accepted.
+                    n_cur = pos_of_next + 1 + accepted as i32;
+                    spec.target_context_mut()
+                        .kv_cache_seq_rm(0, Some(n_cur as u32), None)
+                        .map_err(|e| GenError::Generate(format!("kv rollback: {e}")))?;
+                    next = follow;
+                }
+            }
         }
         loaded.cached = cached;
         let decode_ms = t_decode.elapsed().as_millis() as u64;
+        if draft_proposed > 0 {
+            eprintln!(
+                "llama_cpp: mtp accepted {draft_accepted}/{draft_proposed} drafted tokens ({:.0}%)",
+                draft_accepted as f64 / draft_proposed as f64 * 100.0
+            );
+        }
 
         // --- parse ----------------------------------------------------------
         let parsed = self

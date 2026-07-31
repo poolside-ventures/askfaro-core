@@ -88,8 +88,15 @@ fn main() {
         .collect();
     eprintln!("tools {} | cases {}", tools.len(), cases.as_array().map(|a| a.len()).unwrap_or(0));
 
+    // Optional third arg: the MTP drafter. With it, decode goes through the
+    // speculative path, which must produce IDENTICAL output to without it.
+    let draft = args.next();
+    if let Some(d) = &draft {
+        eprintln!("drafter: {d}");
+    }
     let mut engine = LlamaCppEngine::new(LlamaCppConfig {
         model_path: model_path.into(),
+        draft_path: draft.map(Into::into),
         ..Default::default()
     });
 
