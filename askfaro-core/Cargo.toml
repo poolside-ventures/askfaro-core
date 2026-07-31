@@ -132,6 +132,12 @@ required-features = ["llama-cpp"]
 [[example]]
 name = "warm_cycle"
 required-features = ["llama-cpp"]
+# Regression test for slot isolation: two workloads on one engine must keep
+# separate KV caches. Needs an engine, so same gate.
+[[example]]
+name = "slot_isolation"
+required-features = ["llama-cpp"]
+
 
 [build-dependencies]
 # Compiles the chat shim for the `llama-cpp` feature (see build.rs).

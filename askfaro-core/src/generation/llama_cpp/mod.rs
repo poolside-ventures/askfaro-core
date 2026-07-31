@@ -87,6 +87,13 @@ pub struct LlamaCppConfig {
     pub n_gpu_layers: u32,
     /// Whether the model may emit a reasoning channel.
     pub enable_thinking: bool,
+    /// How many KV cache slots the context supports.
+    ///
+    /// Must cover the highest `GenerateRequest::slot` a host will use. A context
+    /// built with the default of ONE sequence rejects slot 1 outright, and the
+    /// symptom is not a clear error about sequences: llama.cpp reports "failed
+    /// to initialize batch" and then `n_tokens == 0`.
+    pub n_slots: u32,
 }
 
 impl Default for LlamaCppConfig {
@@ -98,6 +105,8 @@ impl Default for LlamaCppConfig {
             n_ctx: 16384,
             n_gpu_layers: 1000,
             enable_thinking: true,
+            // Two: the agent loop, plus background one-shots.
+            n_slots: 2,
         }
     }
 }
@@ -320,9 +329,22 @@ impl LlamaCppEngine {
         // defaults far below a real prompt: the Gemma 4 template renders the tool
         // schemas into tens of thousands of characters, which asserts out at
         // `n_tokens_all <= cparams.n_batch`. Size it to the window.
+        // `n_ctx` is the TOTAL across sequences: llama.cpp gives each sequence
+        // `n_ctx / n_seq_max`. So asking for two slots at face value would have
+        // silently HALVED the caller's window, from the profile's 16,384 to
+        // 8,192, and the first symptom would be a mid-conversation
+        // `NoKvCacheSlot` rather than anything naming the window.
+        //
+        // `n_ctx` here is a property of the MODEL, so it is honoured per slot and
+        // the total is scaled instead. The cost is KV memory, which scales with
+        // the number of slots; that is the real price of running two workloads
+        // on one engine, and it is worth naming rather than discovering.
+        let slots = self.cfg.n_slots.max(1);
+        let total_ctx = self.cfg.n_ctx.saturating_mul(slots);
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(self.cfg.n_ctx))
-            .with_n_batch(self.cfg.n_ctx);
+            .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
+            .with_n_batch(self.cfg.n_ctx)
+            .with_n_seq_max(slots);
         // SAFETY: `model` and `backend` are boxed, so their addresses are stable
         // and outlive `ctx`; `Loaded` declares `ctx` first so it is dropped first.
         let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
@@ -353,8 +375,9 @@ impl LlamaCppEngine {
                             eprintln!("llama_cpp: MTP init failed ({e}); plain decode");
                             let c = model_ref
                                 .new_context(backend_ref, LlamaContextParams::default()
-                                    .with_n_ctx(std::num::NonZeroU32::new(self.cfg.n_ctx))
-                                    .with_n_batch(self.cfg.n_ctx))
+                                    .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
+                                    .with_n_batch(self.cfg.n_ctx)
+                                    .with_n_seq_max(slots))
                                 .map_err(|e| GenError::Generate(e.to_string()))?;
                             (Decoder::Plain(c), None)
                         }

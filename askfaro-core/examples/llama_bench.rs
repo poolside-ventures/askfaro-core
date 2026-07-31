@@ -98,6 +98,7 @@ fn main() {
     // Optional third arg: the MTP drafter. With it, decode goes through the
     // speculative path, which must produce IDENTICAL output to without it.
     let draft = args.next();
+    let draft_configured = draft.is_some();
     if let Some(d) = &draft {
         eprintln!("drafter: {d}");
     }
@@ -106,6 +107,14 @@ fn main() {
         draft_path: draft.map(Into::into),
         ..Default::default()
     });
+
+    // Collected for the ASSERTIONS at the end. A bench that only prints numbers
+    // cannot fail, and every on-device bug this year has been a component
+    // degrading to a working-looking fallback: the numbers were all there, in a
+    // log nobody diffs.
+    let mut warm_prefills: Vec<u64> = Vec::new();
+    let mut leaked_marker: Vec<String> = Vec::new();
+    let mut drafted_total: u32 = 0;
 
     let case_list = cases.as_array().expect("cases is an array");
     for (i, c) in case_list.iter().enumerate() {
@@ -138,6 +147,16 @@ fn main() {
             }
         };
 
+        // The first case pays the cold load; everything after it should be
+        // reusing the prefix, which is what these assertions defend.
+        if i > 0 {
+            warm_prefills.push(out.timings.prefill_ms);
+        }
+        if out.text.contains("<turn|>") || out.text.contains("<|turn>") {
+            leaked_marker.push(id.to_string());
+        }
+        drafted_total += out.timings.draft_proposed;
+
         // One line per case; the grader wants tool name + decoded args.
         let call = out.tool_calls.first();
         println!(
@@ -158,4 +177,60 @@ fn main() {
         );
     }
     eprintln!("\ndone");
+
+    // --- assertions ------------------------------------------------------
+    //
+    // These exist because every failure this year was silent. The engine kept
+    // answering, the bench kept printing plausible numbers, and the defect
+    // surfaced days later as "the app feels slow" or a stray token in a reply.
+    // A threshold that fails is worth more than a number that is merely true.
+    let mut failures: Vec<String> = Vec::new();
+
+    // 1. Prefix reuse. The single most expensive regression available here: a
+    //    volatile prompt head, or a second workload sharing the cache, takes
+    //    warm prefill from ~230ms to ~27,000ms and nothing else changes.
+    warm_prefills.sort_unstable();
+    let p50 = warm_prefills.get(warm_prefills.len() / 2).copied().unwrap_or(0);
+    const WARM_PREFILL_BUDGET_MS: u64 = 1_500;
+    if p50 > WARM_PREFILL_BUDGET_MS {
+        failures.push(format!(
+            "warm prefill p50 {p50}ms exceeds {WARM_PREFILL_BUDGET_MS}ms: the KV prefix is not \
+             being reused. Something volatile is at the HEAD of the prompt, or another \
+             workload shares this cache slot."
+        ));
+    }
+
+    // 2. Template markers must never reach `content`. Upstream's parser leaves
+    //    the end-of-turn token in on purpose; trimming it is the caller's job,
+    //    and when that broke, all 20 cases still passed because nothing here
+    //    asserted on answer TEXT.
+    if !leaked_marker.is_empty() {
+        failures.push(format!(
+            "end-of-turn marker leaked into content on {} case(s): {}",
+            leaked_marker.len(),
+            leaked_marker.join(", ")
+        ));
+    }
+
+    // 3. A configured drafter must actually draft. Speculation fails OPEN: the
+    //    drafter loads, contributes nothing, and the run completes at exactly
+    //    the unspeculated rate. Twice in one day, once from a missing
+    //    `--spec-type` and once from a context built without `ctx_other`.
+    if draft_configured && drafted_total == 0 {
+        failures.push(
+            "a drafter was configured but proposed ZERO tokens: speculation silently \
+             degraded to plain decode."
+                .to_string(),
+        );
+    }
+
+    if failures.is_empty() {
+        eprintln!("assertions passed (warm prefill p50 {p50}ms, drafted {drafted_total} tokens)");
+    } else {
+        eprintln!("\nFAILED:");
+        for f in &failures {
+            eprintln!("  - {f}");
+        }
+        std::process::exit(1);
+    }
 }
