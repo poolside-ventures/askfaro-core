@@ -138,6 +138,13 @@ required-features = ["llama-cpp"]
 name = "slot_isolation"
 required-features = ["llama-cpp"]
 
+# Regression test for the persisted KV prefix's invalidation. A stale restore
+# answers fluently and wrongly rather than erroring, so it needs a check that
+# reads the answer, not the timings. Same gate.
+[[example]]
+name = "prefix_invalidation"
+required-features = ["llama-cpp"]
+
 
 [build-dependencies]
 # Compiles the chat shim for the `llama-cpp` feature (see build.rs).

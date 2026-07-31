@@ -55,7 +55,8 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 
 use crate::generation::{
-    Availability, GenError, GenerateRequest, GenerateResponse, GenerationEngine, Timings, ToolCall,
+    Availability, GenError, GenerateRequest, GenerateResponse, GenerationEngine, Msg, Timings,
+    ToolCall,
 };
 
 /// Hard cap on generated tokens per turn, so a runaway model cannot hang a UI.
@@ -94,6 +95,28 @@ pub struct LlamaCppConfig {
     /// symptom is not a clear error about sequences: llama.cpp reports "failed
     /// to initialize batch" and then `n_tokens == 0`.
     pub n_slots: u32,
+    /// Directory to persist slot 0's KV prefix in, or `None` to never persist.
+    ///
+    /// Prefix reuse already makes the SECOND turn of a session cheap; this makes
+    /// the FIRST one cheap too, by writing the computed prefix to disk once and
+    /// restoring it on every later load. The measured cost it removes is the
+    /// whole cold prefill: ~27s at ~280 tok/s over a ~7,700-token prompt, paid
+    /// on the first turn of every launch.
+    ///
+    /// Costs disk proportional to the cached prefix. The size is logged and
+    /// reported through [`PrefixReport::bytes`], because it is the one price of
+    /// this that nothing else would surface.
+    pub prefix_cache_dir: Option<PathBuf>,
+    /// Host-supplied identity folded into the persisted prefix's file name.
+    ///
+    /// A saved state is valid ONLY for the exact weights it was computed with,
+    /// and llama.cpp validates SHAPE, not identity: two GGUFs of the same
+    /// architecture at different quantizations deserialize into each other
+    /// without complaint and answer plausibly rather than erroring. This crate
+    /// keys on what it can see (path, file size, context params); a host that
+    /// knows more, the sha256 it verified at download time or a build id, puts
+    /// it here and the file name changes with it.
+    pub state_key: String,
 }
 
 impl Default for LlamaCppConfig {
@@ -107,8 +130,46 @@ impl Default for LlamaCppConfig {
             enable_thinking: true,
             // Two: the agent loop, plus background one-shots.
             n_slots: 2,
+            // Off unless a host names a directory: persisting state is a policy
+            // decision (where it lives, when it is cleared) and this crate has
+            // no business inventing a cache location.
+            prefix_cache_dir: None,
+            state_key: String::new(),
         }
     }
+}
+
+/// What [`LlamaCppEngine::ensure_prefix`] found or did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrefixReport {
+    /// Tokens in the persisted prefix.
+    pub tokens: u32,
+    /// Size of the state file on disk. The whole cost of this feature.
+    pub bytes: u64,
+    /// True when this call recomputed and rewrote the file.
+    pub rebuilt: bool,
+    /// Wall clock spent rebuilding; 0 when the existing file was already good.
+    pub ms: u64,
+    /// Where it lives, so a host can report or delete it.
+    pub path: String,
+}
+
+/// Where slot 0's prefix stands relative to the file on disk.
+///
+/// Three states rather than a bool because "restored but not yet checked
+/// against a real prompt" is genuinely different from "known good": a restore
+/// is only trustworthy once some prompt has been shown to start with it, and
+/// that check cannot happen until a turn arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixState {
+    /// No `prefix_cache_dir`, so none of this runs.
+    Disabled,
+    /// Enabled, but nothing was restored: no file yet, or it failed to load.
+    Missing,
+    /// `n` tokens came off disk into sequence 0 and have not been validated.
+    Restored(usize),
+    /// Built or validated this session; nothing further to do.
+    Live,
 }
 
 /// On-device generation backed by an in-process llama.cpp.
@@ -151,6 +212,8 @@ struct Loaded {
     /// background one-shots (~340) evicted each other on every call. Slots map
     /// to llama.cpp sequence ids.
     cached: std::collections::HashMap<u32, Vec<llama_cpp_2::token::LlamaToken>>,
+    /// Whether slot 0's cache came off disk, and whether that has been checked.
+    prefix: PrefixState,
     /// Boxed for a stable address the drafter's context borrows. Dropped after
     /// `dec`, which holds that context.
     #[allow(dead_code)]
@@ -395,15 +458,392 @@ impl LlamaCppEngine {
             None => (Decoder::Plain(ctx), None),
         };
 
+        // A persisted prefix, if one was written by an earlier session. This is
+        // the whole point of the feature: a fresh context normally starts empty
+        // and the first turn pays the full prefill.
+        //
+        // Restoring is deliberately best-effort. Every way this can go wrong,
+        // absent file, older llama.cpp state format, a shape that does not match
+        // this context, comes back as a clean `Err` from llama.cpp (it catches
+        // its own deserializer's exceptions and removes the half-written
+        // sequence), and the correct response to all of them is the same: carry
+        // on cold. A cold start is slow, not wrong.
+        let mut dec = dec;
+        let mut cached = std::collections::HashMap::new();
+        let mut prefix = PrefixState::Disabled;
+        if let Some(path) = Self::prefix_path_for(&self.cfg) {
+            prefix = PrefixState::Missing;
+            if path.exists() {
+                let t_restore = Instant::now();
+                match dec
+                    .ctx()
+                    .state_seq_load_file(&path, 0, self.cfg.n_ctx as usize)
+                {
+                    Ok((toks, bytes)) => {
+                        eprintln!(
+                            "llama_cpp: restored a {}-token KV prefix from {} ({:.1} MB) in {}ms",
+                            toks.len(),
+                            path.display(),
+                            bytes as f64 / 1e6,
+                            t_restore.elapsed().as_millis(),
+                        );
+                        prefix = PrefixState::Restored(toks.len());
+                        cached.insert(0, toks);
+                    }
+                    Err(e) => eprintln!(
+                        "llama_cpp: could not restore the KV prefix from {} ({e}); \
+                         this launch pays a cold prefill and will rewrite it",
+                        path.display()
+                    ),
+                }
+            }
+        }
+
         self.loaded = Some(Loaded {
             dec,
-            cached: std::collections::HashMap::new(),
+            cached,
+            prefix,
             draft_model,
             model,
             backend,
         });
         self.chat = Some(chat);
         Ok(t.elapsed().as_millis() as u64)
+    }
+
+    /// Where this configuration's persisted prefix lives, if enabled.
+    fn prefix_path_for(cfg: &LlamaCppConfig) -> Option<PathBuf> {
+        let dir = cfg.prefix_cache_dir.as_ref()?;
+        Some(dir.join(format!("prefix-{}.kv", Self::prefix_key_for(cfg))))
+    }
+
+    /// The invalidation key, as a file name.
+    ///
+    /// **A stale restore is not an error, it is wrong output.** llama.cpp's
+    /// deserializer validates the state's SHAPE (layer count, per-layer k/v
+    /// sizes, quantization type) and nothing about which weights produced it, so
+    /// a state file from a different fine-tune of the same architecture loads
+    /// happily and answers plausible nonsense. Everything the state depends on
+    /// therefore goes in the name, and a file whose name does not match is never
+    /// opened rather than being opened and checked.
+    ///
+    /// The prompt itself is deliberately NOT in here, because it cannot be:
+    /// tokenizing a prefix needs the model loaded, and the name has to be known
+    /// before that. The prompt is checked directly instead: `state_seq_load_file`
+    /// hands back the exact tokens the state was saved with, and the first turn
+    /// asserts the real prompt starts with them (see `settle_prefix`), which is
+    /// strictly stronger than comparing hashes.
+    fn prefix_key_for(cfg: &LlamaCppConfig) -> String {
+        use sha2::{Digest, Sha256};
+        let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let mut h = Sha256::new();
+        h.update(b"askfaro-kv-prefix-v1\0");
+        h.update(cfg.state_key.as_bytes());
+        h.update(b"\0");
+        h.update(cfg.model_path.as_os_str().as_encoded_bytes());
+        h.update(len(&cfg.model_path).to_le_bytes());
+        match &cfg.draft_path {
+            // The drafter shares the target's KV memory (`is_mem_shared`, which
+            // is why Gemma 4's MTP head needs `ctx_other`), so attaching one
+            // changes what is in the cache. Not a cosmetic part of the key.
+            Some(p) => {
+                h.update(p.as_os_str().as_encoded_bytes());
+                h.update(len(p).to_le_bytes());
+            }
+            None => h.update(b"no-drafter"),
+        }
+        h.update(cfg.n_ctx.to_le_bytes());
+        h.update(cfg.n_slots.to_le_bytes());
+        h.update(cfg.n_gpu_layers.to_le_bytes());
+        h.update([u8::from(cfg.enable_thinking)]);
+        hex::encode(&h.finalize()[..8])
+    }
+
+    /// Tokenize what the template renders for `req` plus one probe user turn.
+    fn render_tokens(
+        &mut self,
+        req: &GenerateRequest,
+        probe: &str,
+    ) -> Result<Vec<llama_cpp_2::token::LlamaToken>, GenError> {
+        let mut r = req.clone();
+        r.messages.clear();
+        r.messages.push(Msg {
+            role: "user".into(),
+            content: probe.into(),
+        });
+        let enable_thinking = self.cfg.enable_thinking;
+        let applied = self
+            .chat
+            .as_mut()
+            .expect("chat is set with loaded")
+            .apply(&r, enable_thinking)
+            .map_err(|e| GenError::Generate(format!("chat template: {e}")))?;
+        let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
+        self.loaded
+            .as_ref()
+            .expect("loaded")
+            .model
+            .str_to_token(&prompt, AddBos::Always)
+            .map_err(|e| GenError::Generate(e.to_string()))
+    }
+
+    /// The largest token prefix that every conversation using `req`'s system
+    /// block and tool set must begin with.
+    ///
+    /// Found by DIFFING two renders that differ only in the user's first
+    /// character, rather than by rendering the system block alone and assuming
+    /// it is a prefix of the whole. That assumption is exactly the kind that
+    /// holds for one model family and breaks silently for the next: several
+    /// chat templates fold the system message INTO the first user turn, so a
+    /// system-only render is not a prefix of anything. Two probes make the
+    /// boundary an observation instead.
+    fn stable_prefix(
+        &mut self,
+        req: &GenerateRequest,
+    ) -> Result<Vec<llama_cpp_2::token::LlamaToken>, GenError> {
+        let a = self.render_tokens(req, "a")?;
+        let b = self.render_tokens(req, "b")?;
+        let n = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+        if n == 0 {
+            return Err(GenError::Generate(
+                "two renders of the same system block share no tokens; the template is not \
+                 deterministic and no prefix can be cached"
+                    .into(),
+            ));
+        }
+        Ok(a[..n].to_vec())
+    }
+
+    /// Compute, prefill and persist the prefix for `req`, replacing whatever is
+    /// on disk.
+    ///
+    /// `tokens`, when given, is a real prompt this prefix must be a prefix OF.
+    /// Checked before anything is written, because a prefix the live prompt does
+    /// not start with is worse than none: it would be restored next launch, fail
+    /// the match, and force a full re-prefill on top of the restore.
+    fn build_prefix(
+        &mut self,
+        req: &GenerateRequest,
+        tokens: Option<&[llama_cpp_2::token::LlamaToken]>,
+        path: &Path,
+    ) -> Result<PrefixReport, GenError> {
+        let t = Instant::now();
+        let prefix = self.stable_prefix(req)?;
+        if prefix.len() >= self.cfg.n_ctx as usize {
+            return Err(GenError::ContextWindowExceeded);
+        }
+        if let Some(tokens) = tokens {
+            if !tokens.starts_with(&prefix) {
+                eprintln!(
+                    "llama_cpp: the {}-token prefix computed from this request is NOT a prefix of \
+                     the {}-token prompt it came from, so nothing was persisted. The template \
+                     renders the first user turn differently depending on what follows it.",
+                    prefix.len(),
+                    tokens.len(),
+                );
+                // Sequence 0 still holds whatever was restored, and this is the
+                // one path that reaches the normal reuse scan with a cache it
+                // could not vouch for. Cleared, so that scan finds nothing and
+                // prefills from scratch, rather than trimming a restored state
+                // back to a common point the sliding-window layers cannot cover.
+                let loaded = self.loaded.as_mut().expect("loaded");
+                loaded
+                    .dec
+                    .ctx()
+                    .kv_cache_seq_rm(0, None, None)
+                    .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+                loaded.cached.remove(&0);
+                // Live, not Missing: retrying this every turn would recompute a
+                // prefix already known not to fit, once per message, forever.
+                loaded.prefix = PrefixState::Live;
+                return Ok(PrefixReport {
+                    path: path.display().to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        let loaded = self.loaded.as_mut().expect("loaded");
+        // Sequence 0 must contain the prefix and NOTHING else: the state file
+        // records every cell in the sequence, and the token list beside it is
+        // only metadata. Saving a longer sequence under a shorter token list is
+        // how a restore comes back with cells nothing accounts for.
+        loaded
+            .dec
+            .ctx()
+            .kv_cache_seq_rm(0, None, None)
+            .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+        loaded.cached.remove(&0);
+
+        let mut batch = LlamaBatch::new(prefix.len().max(512), 1);
+        let last = prefix.len() - 1;
+        for (i, tok) in prefix.iter().enumerate() {
+            batch
+                .add(*tok, i as i32, &[0], i == last)
+                .map_err(|e| GenError::Generate(e.to_string()))?;
+        }
+        // Mirrors a real turn's prefill exactly, drafter bookkeeping included.
+        // Gemma 4's MTP head shares the target's KV memory rather than keeping
+        // its own, which is what makes persisting the target's sequence enough
+        // for speculation to work on the restored turn as well.
+        if let Decoder::Mtp(spec) = &mut loaded.dec {
+            spec.begin(&prefix)
+                .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
+        }
+        loaded
+            .dec
+            .ctx()
+            .decode(&mut batch)
+            .map_err(|e| GenError::Generate(e.to_string()))?;
+        if let Decoder::Mtp(spec) = &mut loaded.dec {
+            spec.process(&batch)
+                .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| GenError::Generate(format!("prefix cache dir: {e}")))?;
+        }
+        // Written to a temp name and renamed, so a process killed mid-write
+        // leaves the previous good file rather than a truncated one that reads
+        // as present.
+        let tmp = path.with_extension("kv.tmp");
+        let bytes = loaded
+            .dec
+            .ctx()
+            .state_seq_save_file(&tmp, 0, &prefix)
+            .map_err(|e| GenError::Generate(format!("kv state save: {e}")))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| GenError::Generate(format!("prefix cache rename: {e}")))?;
+        loaded.cached.insert(0, prefix.clone());
+        loaded.prefix = PrefixState::Live;
+
+        // Anything under a different key is dead by construction: only one
+        // configuration is live per install, and a model upgrade would otherwise
+        // leave its predecessor's state behind forever.
+        Self::sweep_stale_prefixes(path);
+
+        let ms = t.elapsed().as_millis() as u64;
+        eprintln!(
+            "llama_cpp: persisted a {}-token KV prefix to {} ({:.1} MB) in {ms}ms",
+            prefix.len(),
+            path.display(),
+            bytes as f64 / 1e6,
+        );
+        Ok(PrefixReport {
+            tokens: prefix.len() as u32,
+            bytes: bytes as u64,
+            rebuilt: true,
+            ms,
+            path: path.display().to_string(),
+        })
+    }
+
+    /// Delete every `prefix-*.kv` beside `keep` that is not `keep`.
+    fn sweep_stale_prefixes(keep: &Path) {
+        let Some(dir) = keep.parent() else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p == keep {
+                continue;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("prefix-") && (name.ends_with(".kv") || name.ends_with(".kv.tmp")) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// Decide what to do with slot 0's prefix before a turn is prefilled.
+    ///
+    /// Returns the milliseconds spent, which belong to prefill: a turn that had
+    /// to build the prefix did the same work a turn without one would have done,
+    /// only in a form the next launch can reuse.
+    fn settle_prefix(
+        &mut self,
+        req: &GenerateRequest,
+        tokens: &[llama_cpp_2::token::LlamaToken],
+    ) -> Result<u64, GenError> {
+        let Some(path) = Self::prefix_path_for(&self.cfg) else {
+            return Ok(0);
+        };
+        let state = self.loaded.as_ref().expect("loaded").prefix;
+        match state {
+            PrefixState::Disabled | PrefixState::Live => Ok(0),
+            PrefixState::Missing => Ok(self.build_prefix(req, Some(tokens), &path)?.ms),
+            PrefixState::Restored(n) => {
+                let matches = {
+                    let loaded = self.loaded.as_ref().expect("loaded");
+                    let prior = loaded.cached.get(&0).map_or(&[][..], Vec::as_slice);
+                    prior.len() == n && tokens.len() > n && tokens[..n] == prior[..n]
+                };
+                if matches {
+                    self.loaded.as_mut().expect("loaded").prefix = PrefixState::Live;
+                    return Ok(0);
+                }
+                // The prompt moved under the saved state: a changed system
+                // block, a changed tool set, a different model profile.
+                //
+                // Dropped WHOLE and rebuilt, never trimmed back to the common
+                // point, which is the one thing the ordinary turn-to-turn path
+                // does here and must not do with a restored state. Gemma 4
+                // attends over a sliding window, so the SWA half of the cache
+                // holds only the positions immediately before where the save
+                // ended. Trimming to an earlier point leaves those layers
+                // attending over cells that were never restored, and the result
+                // of that is plausible text, not an error.
+                eprintln!(
+                    "llama_cpp: the persisted prefix no longer matches this prompt ({n} tokens \
+                     restored); discarding it and rebuilding"
+                );
+                Ok(self.build_prefix(req, Some(tokens), &path)?.ms)
+            }
+        }
+    }
+
+    /// Make sure the persisted prefix for `req` exists and is current.
+    ///
+    /// The engine does this by itself on the first turn, which is where it costs
+    /// nothing: that turn was going to prefill the whole prompt anyway, so
+    /// splitting the prefill in two and saving the first half is free. This is
+    /// for a host that would rather pay it somewhere the user is already
+    /// waiting, straight after the weights download say, than on whichever
+    /// message happens to come first.
+    ///
+    /// `req` supplies the system block and the tool set; its `messages` are
+    /// ignored, because a prefix by definition ends before the conversation.
+    pub fn ensure_prefix(&mut self, req: &GenerateRequest) -> Result<PrefixReport, GenError> {
+        let Some(path) = Self::prefix_path_for(&self.cfg) else {
+            return Err(GenError::Invalid(
+                "no prefix_cache_dir configured, so there is nowhere to persist a prefix".into(),
+            ));
+        };
+        self.ensure_loaded()?;
+        let prefix = self.stable_prefix(req)?;
+        let current = {
+            let loaded = self.loaded.as_ref().expect("loaded");
+            path.exists()
+                && loaded
+                    .cached
+                    .get(&0)
+                    .is_some_and(|c| c.starts_with(&prefix))
+        };
+        if current {
+            let loaded = self.loaded.as_mut().expect("loaded");
+            loaded.prefix = PrefixState::Live;
+            return Ok(PrefixReport {
+                tokens: prefix.len() as u32,
+                bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                rebuilt: false,
+                ms: 0,
+                path: path.display().to_string(),
+            });
+        }
+        self.build_prefix(req, None, &path)
     }
 }
 
@@ -418,7 +858,6 @@ impl GenerationEngine for LlamaCppEngine {
         let load_ms = self.ensure_loaded()?;
         let enable_thinking = self.cfg.enable_thinking;
         let n_ctx = self.cfg.n_ctx;
-        let loaded = self.loaded.as_mut().expect("just loaded");
 
         // --- render the prompt through the model's own template -------------
         let applied = self
@@ -431,13 +870,32 @@ impl GenerationEngine for LlamaCppEngine {
         // prompt + generation_prompt. See failure mode 2 in the module docs.
         let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
 
-        let tokens = loaded
+        let tokens = self
+            .loaded
+            .as_ref()
+            .expect("just loaded")
             .model
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| GenError::Generate(e.to_string()))?;
         if tokens.len() >= n_ctx as usize {
             return Err(GenError::ContextWindowExceeded);
         }
+
+        // --- persisted prefix -------------------------------------------------
+        // Ahead of the reuse scan below, because it decides what the scan will
+        // find: it either validates a prefix restored from disk, or builds and
+        // saves one out of THIS prompt. Building costs nothing extra, because the
+        // tokens it prefills are tokens this turn was about to prefill anyway,
+        // just split so the stable half can be written down.
+        //
+        // Slot 0 only. Other slots carry a host's background one-shots, which
+        // are short, varied and have no prefix worth a file.
+        let prefix_ms = if req.slot == 0 {
+            self.settle_prefix(&req, &tokens)?
+        } else {
+            0
+        };
+        let loaded = self.loaded.as_mut().expect("just loaded");
 
         // --- prefix reuse -----------------------------------------------------
         // A thread replays an identical prefix every turn (system prompt, tool
@@ -498,7 +956,10 @@ impl GenerationEngine for LlamaCppEngine {
                     .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
             }
         }
-        let prefill_ms = t_prefill.elapsed().as_millis() as u64;
+        // Building the prefix IS prefill, so it is reported as prefill. Hiding it
+        // would make the turn that pays for the file look free and every later
+        // turn look unchanged, which is the opposite of what the number is for.
+        let prefill_ms = t_prefill.elapsed().as_millis() as u64 + prefix_ms;
 
         // --- decode ---------------------------------------------------------
         let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);

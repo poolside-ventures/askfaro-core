@@ -13,6 +13,13 @@
 //! ```
 //!
 //! Prints progress on stderr and JSONL on stdout, so the caller can pipe cleanly.
+//!
+//! It also gates the **persisted KV prefix**: the prefix is built, the engine is
+//! unloaded and reloaded so the KV cache can only have come off disk, and then
+//! the FIRST case is held to the same prefill budget as every later one. A
+//! restore that quietly does nothing is invisible in every other number here.
+//! The state file lands in `$TMPDIR/faro-bench-prefix/`; delete that directory
+//! to force a rebuild.
 
 use askfaro_core::generation::{
     GenerateRequest, GenerationEngine, LlamaCppConfig, LlamaCppEngine, Msg, ToolSchema,
@@ -102,11 +109,54 @@ fn main() {
     if let Some(d) = &draft {
         eprintln!("drafter: {d}");
     }
+    // The persisted KV prefix, on by default so the standard invocation
+    // exercises it. In a temp directory rather than beside the weights, which is
+    // where the APP puts it: the bench is usually pointed straight at Ollama's
+    // blob store and has no business writing into someone else's model cache.
+    let model_path: std::path::PathBuf = model_path.into();
+    let prefix_dir = std::env::temp_dir().join("faro-bench-prefix");
     let mut engine = LlamaCppEngine::new(LlamaCppConfig {
-        model_path: model_path.into(),
+        model_path: model_path.clone(),
         draft_path: draft.map(Into::into),
+        prefix_cache_dir: Some(prefix_dir.clone()),
+        state_key: "llama_bench".into(),
         ..Default::default()
     });
+
+    // --- persist the prefix, then prove it survives a new context ---------
+    //
+    // Two phases on purpose. Building it in memory and then measuring prefill
+    // would only re-measure the prefill that just happened; the claim under test
+    // is that a KV cache written to disk restores into a context that never saw
+    // the prompt. So the engine is UNLOADED and brought back, which is what a
+    // relaunch does, and only then are the cases run.
+    let prefix_req = GenerateRequest {
+        system: system.clone(),
+        tools: tools.clone(),
+        ..Default::default()
+    };
+    match engine.ensure_prefix(&prefix_req) {
+        Ok(r) => eprintln!(
+            "prefix: {} tokens, {:.1} MB on disk, rebuilt={} ({}ms)\n  {}",
+            r.tokens,
+            r.bytes as f64 / 1e6,
+            r.rebuilt,
+            r.ms,
+            r.path
+        ),
+        Err(e) => {
+            eprintln!("FAILED: could not build the persisted prefix: {e}");
+            std::process::exit(1);
+        }
+    }
+    engine.unload();
+    match engine.warm() {
+        Ok(ms) => eprintln!("reloaded in {ms}ms; the KV prefix below comes off disk"),
+        Err(e) => {
+            eprintln!("FAILED: reload after unload: {e}");
+            std::process::exit(1);
+        }
+    }
 
     // Collected for the ASSERTIONS at the end. A bench that only prints numbers
     // cannot fail, and every on-device bug this year has been a component
@@ -115,6 +165,7 @@ fn main() {
     let mut warm_prefills: Vec<u64> = Vec::new();
     let mut leaked_marker: Vec<String> = Vec::new();
     let mut drafted_total: u32 = 0;
+    let mut first_prefill: u64 = 0;
 
     let case_list = cases.as_array().expect("cases is an array");
     for (i, c) in case_list.iter().enumerate() {
@@ -147,10 +198,13 @@ fn main() {
             }
         };
 
-        // The first case pays the cold load; everything after it should be
-        // reusing the prefix, which is what these assertions defend.
-        if i > 0 {
-            warm_prefills.push(out.timings.prefill_ms);
+        // EVERY case, the first one included. It used to be excluded because it
+        // paid the cold prefill; with a persisted prefix there is no cold turn,
+        // so case 0 is now the case that proves the restore worked and is the
+        // one assertion 3 below is about.
+        warm_prefills.push(out.timings.prefill_ms);
+        if i == 0 {
+            first_prefill = out.timings.prefill_ms;
         }
         if out.text.contains("<turn|>") || out.text.contains("<|turn>") {
             leaked_marker.push(id.to_string());
@@ -212,7 +266,19 @@ fn main() {
         ));
     }
 
-    // 3. A configured drafter must actually draft. Speculation fails OPEN: the
+    // 3. The FIRST turn after a reload must be warm too. This is the persisted
+    //    prefix's entire claim, and it fails in the direction that looks fine:
+    //    a restore that silently does nothing leaves every number below correct
+    //    and only the cold turn, the one a user meets on every launch, slow.
+    if first_prefill > WARM_PREFILL_BUDGET_MS {
+        failures.push(format!(
+            "first-turn prefill {first_prefill}ms exceeds {WARM_PREFILL_BUDGET_MS}ms after a \
+             reload: the persisted KV prefix was not restored, or was restored and did not \
+             match the prompt. Check the `llama_cpp: restored`/`persisted` lines above."
+        ));
+    }
+
+    // 4. A configured drafter must actually draft. Speculation fails OPEN: the
     //    drafter loads, contributes nothing, and the run completes at exactly
     //    the unspeculated rate. Twice in one day, once from a missing
     //    `--spec-type` and once from a context built without `ctx_other`.
@@ -225,7 +291,10 @@ fn main() {
     }
 
     if failures.is_empty() {
-        eprintln!("assertions passed (warm prefill p50 {p50}ms, drafted {drafted_total} tokens)");
+        eprintln!(
+            "assertions passed (prefill p50 {p50}ms, first turn {first_prefill}ms, \
+             drafted {drafted_total} tokens)"
+        );
     } else {
         eprintln!("\nFAILED:");
         for f in &failures {
