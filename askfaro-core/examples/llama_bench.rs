@@ -127,6 +127,7 @@ fn main() {
                 ),
             }],
             tools: tools.clone(),
+        slot: 0,
         };
 
         let out = match engine.generate(req) {

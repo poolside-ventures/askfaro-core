@@ -134,9 +134,14 @@ struct Loaded {
     /// unrepresentable; the speculative path takes the context by value, so they
     /// genuinely cannot coexist.
     dec: Decoder,
-    /// The tokens currently in the KV cache, so the next turn decodes only what
-    /// diverges from them.
-    cached: Vec<llama_cpp_2::token::LlamaToken>,
+    /// The tokens currently in each KV cache SLOT, so the next turn on that slot
+    /// decodes only what diverges from them.
+    ///
+    /// Per slot, because one cache shared by two workloads is two workloads that
+    /// are always cold: the desktop's agent loop (~6,000 tokens) and its
+    /// background one-shots (~340) evicted each other on every call. Slots map
+    /// to llama.cpp sequence ids.
+    cached: std::collections::HashMap<u32, Vec<llama_cpp_2::token::LlamaToken>>,
     /// Boxed for a stable address the drafter's context borrows. Dropped after
     /// `dec`, which holds that context.
     #[allow(dead_code)]
@@ -369,7 +374,7 @@ impl LlamaCppEngine {
 
         self.loaded = Some(Loaded {
             dec,
-            cached: Vec::new(),
+            cached: std::collections::HashMap::new(),
             draft_model,
             model,
             backend,
@@ -419,34 +424,42 @@ impl GenerationEngine for LlamaCppEngine {
         // `reuse` is capped one below the common length: llama.cpp needs at least
         // one token to decode in order to produce logits to sample from, so
         // reusing the ENTIRE prompt would leave nothing to run.
-        let common = loaded
-            .cached
+        // Slot 0 speculates; any other slot is a plain decode on its own
+        // sequence. `MtpSpeculative` binds to sequence 0, and a background
+        // one-shot has nothing to gain from a drafter in any case.
+        let slot = req.slot;
+        let speculative = slot == 0 && matches!(loaded.dec, Decoder::Mtp(_));
+        let prior = loaded.cached.entry(slot).or_default();
+        let common = prior
             .iter()
             .zip(tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
         let reuse = common.min(tokens.len().saturating_sub(1));
-        if reuse < loaded.cached.len() {
+        let prior_len = prior.len();
+        if reuse < prior_len {
             loaded
                 .dec
                 .ctx()
-                .kv_cache_seq_rm(0, Some(reuse as u32), None)
+                .kv_cache_seq_rm(slot as i32, Some(reuse as u32), None)
                 .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
         }
         let fresh = &tokens[reuse..];
 
         // The speculative path needs the whole prompt announced up front, before
         // any decode, so the drafter's own context is primed from the same text.
-        if let Decoder::Mtp(spec) = &mut loaded.dec {
-            spec.begin(&tokens)
-                .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
+        if speculative {
+            if let Decoder::Mtp(spec) = &mut loaded.dec {
+                spec.begin(&tokens)
+                    .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
+            }
         }
 
         let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
         let last = fresh.len() - 1;
         for (i, t) in fresh.iter().enumerate() {
             batch
-                .add(*t, (reuse + i) as i32, &[0], i == last)
+                .add(*t, (reuse + i) as i32, &[slot as i32], i == last)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
         }
 
@@ -456,9 +469,11 @@ impl GenerationEngine for LlamaCppEngine {
             .ctx()
             .decode(&mut batch)
             .map_err(|e| GenError::Generate(e.to_string()))?;
-        if let Decoder::Mtp(spec) = &mut loaded.dec {
-            spec.process(&batch)
-                .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+        if speculative {
+            if let Decoder::Mtp(spec) = &mut loaded.dec {
+                spec.process(&batch)
+                    .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+            }
         }
         let prefill_ms = t_prefill.elapsed().as_millis() as u64;
 
@@ -503,12 +518,17 @@ impl GenerationEngine for LlamaCppEngine {
                 break;
             }
 
-            match &mut loaded.dec {
+            // Dispatched on `speculative`, not on the decoder type. A non-zero
+            // slot must take the plain path EVEN when a drafter is loaded,
+            // because MtpSpeculative binds to sequence 0 and would otherwise
+            // write another slot's cache.
+            match (speculative, &mut loaded.dec) {
                 // --- plain: one token in, one token out ---------------------
-                Decoder::Plain(ctx) => {
+                (false, dec) => {
+                    let ctx = dec.ctx();
                     batch.clear();
                     batch
-                        .add(next, n_cur, &[0], true)
+                        .add(next, n_cur, &[slot as i32], true)
                         .map_err(|e| GenError::Generate(e.to_string()))?;
                     cached.push(next);
                     n_cur += 1;
@@ -524,7 +544,7 @@ impl GenerationEngine for LlamaCppEngine {
                 // sampled result is IDENTICAL to plain greedy decode by
                 // construction, since every draft is only kept when it matches
                 // what the target model would itself have produced.
-                Decoder::Mtp(spec) => {
+                (true, Decoder::Mtp(spec)) => {
                     let drafts = spec
                         .draft(n_cur, next, &cached)
                         .map_err(|e| GenError::Generate(format!("mtp draft: {e}")))?;
@@ -611,9 +631,11 @@ impl GenerationEngine for LlamaCppEngine {
                         .map_err(|e| GenError::Generate(format!("kv rollback: {e}")))?;
                     next = follow;
                 }
+                // `speculative` is only true when the decoder IS Mtp.
+                (true, Decoder::Plain(_)) => unreachable!("speculative implies a drafter"),
             }
         }
-        loaded.cached = cached;
+        loaded.cached.insert(slot, cached);
         let decode_ms = t_decode.elapsed().as_millis() as u64;
         if draft_proposed > 0 {
             eprintln!(

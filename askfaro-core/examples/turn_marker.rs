@@ -45,6 +45,7 @@ fn run(engine: &mut LlamaCppEngine, label: &str, tools: Vec<ToolSchema>) {
             .into(),
         messages: vec![Msg { role: "user".into(), content: PROMPT.into() }],
         tools,
+        slot: 0,
     };
     match engine.generate(req) {
         Ok(out) => {

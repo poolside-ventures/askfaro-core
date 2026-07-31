@@ -27,6 +27,7 @@
 //!         description: "Update a task".into(),
 //!         parameters: json!({"type": "object", "properties": {"task_id": {"type": "string"}}}),
 //!     }],
+//!     ..Default::default()
 //! };
 //! assert_eq!(req.tools.len(), 1);
 //! ```
@@ -85,6 +86,22 @@ pub struct GenerateRequest {
     pub messages: Vec<Msg>,
     /// The tool subset the model may call this turn (may be empty).
     pub tools: Vec<ToolSchema>,
+    /// Which KV cache slot this request belongs to. Defaults to 0.
+    ///
+    /// A host that runs more than one KIND of request against one engine needs
+    /// more than one cache. The desktop runs an agent loop with a ~6,000-token
+    /// prompt alongside background one-shots of ~340 tokens (reply-intent,
+    /// follow-up assessment), and with a single cache each evicts the other:
+    /// measured 19,281ms of prefill on a turn that should have reused almost all
+    /// of it, and 3,441ms for the 344-token one-shot that displaced it. Two
+    /// workloads, one cache, both always cold.
+    ///
+    /// Slots map to llama.cpp sequences, so their caches are independent and
+    /// each keeps its own prefix. Note slot 0 is the only one that speculates:
+    /// `MtpSpeculative` binds to sequence 0, and a background one-shot has
+    /// nothing to gain from a drafter anyway.
+    #[serde(default)]
+    pub slot: u32,
 }
 
 /// A single tool invocation the model emitted.
@@ -240,6 +257,7 @@ mod tests {
                 description: "d".into(),
                 parameters: json!({"type": "object"}),
             }],
+            ..Default::default()
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: GenerateRequest = serde_json::from_str(&s).unwrap();

@@ -51,6 +51,7 @@ fn main() {
                 }
             }),
         }],
+        ..Default::default()
     };
 
     let res = engine.generate(req).expect("generate failed");
