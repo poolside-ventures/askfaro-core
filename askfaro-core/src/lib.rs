@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! askfaro-core = { git = "https://github.com/poolside-ventures/askfaro-core", \
-//!                  default-features = false, features = ["stt", "apple-fm", "progressive"] }
+//!                  default-features = false, features = ["stt", "llama-cpp", "progressive"] }
 //! ```
 //!
 //! ## Capabilities (each a feature → a module)
@@ -17,7 +17,7 @@
 //! - [`search`] — embedded hybrid retrieval (FTS5 lexical + bag-of-words semantic,
 //!   RRF). The `embeddinggemma` feature adds the on-device vector embedder.
 //! - [`generation`] — provider-agnostic text generation + tool-calling. The
-//!   `apple-fm` feature adds the Apple Foundation Models provider (macOS/iOS 26+).
+//!   `llama-cpp` feature adds the in-process llama.cpp provider (GGUF weights).
 //! - [`progressive`] — catalog selector: relevance ranking ([`search`]) plus
 //!   progressive, budget-bounded expansion of a pcx manifest. No LLM call.
 //! - [`free_tools`] — deterministic, zero-cost tools that run in-process and
@@ -68,6 +68,10 @@ pub mod free_tools {
     pub use crate::free::envelope::SkillResult;
     /// Names of the free tools available in this build.
     pub use crate::free::free_tools::available;
+    /// The calling contract per capability: operations and required fields, as
+    /// a line an agent can read. A model cannot see a Rust signature; without
+    /// this it guesses a JSON shape and mostly guesses wrong.
+    pub use crate::free::free_tools::describe;
     /// Execute a free tool by name with JSON `params`, returning a [`SkillResult`].
     pub use crate::free::free_tools::execute;
     /// Binding-friendly entry point: JSON params string in, envelope JSON out, no

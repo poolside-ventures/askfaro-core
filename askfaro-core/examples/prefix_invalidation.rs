@@ -45,10 +45,7 @@ fn ask(engine: &mut LlamaCppEngine, system: &str) -> (String, u64) {
     let out = engine
         .generate(GenerateRequest {
             system: system.into(),
-            messages: vec![Msg {
-                role: "user".into(),
-                content: "What is the passphrase? Reply with just the passphrase.".into(),
-            }],
+            messages: vec![Msg::user("What is the passphrase? Reply with just the passphrase.")],
             ..Default::default()
         })
         .expect("generate");

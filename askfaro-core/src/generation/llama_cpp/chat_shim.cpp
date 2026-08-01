@@ -82,6 +82,30 @@ char * scope_chat_apply(scope_chat_ctx * ctx,
             common_chat_msg msg;
             msg.role    = m.at("role").get<std::string>();
             msg.content = m.value("content", std::string());
+            // The tool fields. Setting only role and content is what made the
+            // agent loop's second step useless: common_chat_msg carries
+            // tool_calls / tool_name / tool_call_id, the template's tool
+            // branches read exactly those, and leaving them empty means those
+            // branches never fire no matter what the caller puts in `content`.
+            // A host then has nowhere to express "the assistant called X" but
+            // the text, and the model imitates whatever prose it is shown.
+            msg.tool_name    = m.value("tool_name", std::string());
+            msg.tool_call_id = m.value("tool_call_id", std::string());
+            if (m.contains("tool_calls")) {
+                for (const auto & tc : m.at("tool_calls")) {
+                    common_chat_tool_call call;
+                    call.name = tc.at("name").get<std::string>();
+                    // Upstream types `arguments` as a STRING of JSON, not an
+                    // object. Accept either and normalise, so a caller sending
+                    // the natural `{"task_id": "t_11"}` does not get it
+                    // double-encoded into "{\"task_id\":\"t_11\"}" and read by
+                    // the model as a quoted blob.
+                    const auto & a = tc.at("arguments");
+                    call.arguments = a.is_string() ? a.get<std::string>() : a.dump();
+                    call.id = tc.value("id", std::string());
+                    msg.tool_calls.push_back(call);
+                }
+            }
             inputs.messages.push_back(msg);
         }
 
@@ -160,6 +184,30 @@ char * scope_chat_parse(scope_chat_ctx * ctx, const char * text) {
         out["content"]           = msg.content;
         out["reasoning_content"] = msg.reasoning_content;
         out["tool_calls"]        = calls;
+        return dup_cstr(out.dump());
+    } catch (const std::exception & e) {
+        return dup_cstr(json{{"error", e.what()}}.dump());
+    }
+}
+
+/// What this template can actually DO, as reported by the jinja layer.
+///
+/// The fields that matter to a tool-calling host are `supports_tools`,
+/// `supports_tool_calls` and `supports_object_arguments`. Upstream has computed
+/// all of them since the template was parsed and we never asked, which is how a
+/// host can send perfectly-formed tool calls into a template that ignores them
+/// and get no error, no warning, and a fluent wrong answer. Exposed so the Rust
+/// side can say so out loud once, at load, instead of leaving it to a benchmark
+/// months later.
+char * scope_chat_caps(scope_chat_ctx * ctx) {
+    if (!ctx) {
+        return nullptr;
+    }
+    try {
+        json out;
+        for (const auto & [name, value] : common_chat_templates_get_caps(ctx->tmpls.get())) {
+            out[name] = value;
+        }
         return dup_cstr(out.dump());
     } catch (const std::exception & e) {
         return dup_cstr(json{{"error", e.what()}}.dump());

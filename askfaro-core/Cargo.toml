@@ -12,8 +12,6 @@
 #   - search        rusqlite (bundled FTS5 SQLite) + md5 bag-of-words embedder
 #   - embeddinggemma  ort + tokenizers (the EmbeddingGemma vector embedder)
 #   - stt           parakeet-rs (ONNX Runtime) for speech-to-text
-#   - apple-fm      swift-rs + a vendored Swift bridge (Apple Foundation Models),
-#                   compiled only on macOS/iOS in build.rs
 #
 # Public, MIT, askfaro-branded. Self-contained (explicit package fields) so it
 # copies verbatim into the public poolside-ventures/askfaro-core repo.
@@ -48,15 +46,10 @@ free-tools = [
 stt = ["model", "dep:parakeet-rs"]
 # The EmbeddingGemma-300M ONNX embedder for `search` (heavy: ort + tokenizers).
 embeddinggemma = ["search", "dep:ort", "dep:tokenizers"]
-# Apple Foundation Models generation provider (macOS/iOS 26+; compiled in build.rs).
-apple-fm = ["generation", "dep:swift-rs"]
 # In-process llama.cpp generation provider (GGUF weights, Metal/CUDA/Vulkan/CPU).
 #
-# A SIBLING of `apple-fm`, never a parent or child of it. The two have disjoint
-# dependency trees -- a Linux consumer enabling this must not pull swift-rs and a
-# Swift bridge, and an Apple-FM-only consumer must not pull a llama.cpp GPU
-# build. Both are non-default for the same reason: a consumer who only wants
-# `search` must never inherit an inference runtime.
+# Non-default on purpose: a consumer who only wants `search` must never inherit
+# an inference runtime.
 llama-cpp = ["generation", "model", "dep:llama-cpp-2", "dep:cc"]
 
 [dependencies]
@@ -98,9 +91,6 @@ parakeet-rs = { version = "0.3.6", optional = true }
 # --- embeddinggemma feature ---
 ort = { version = "=2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.21", optional = true }
-
-# --- apple-fm feature (runtime FFI marshalling types) ---
-swift-rs = { version = "1.0.7", optional = true }
 
 # --- llama-cpp feature ---
 # Rust bindings to llama.cpp. GPU backends are selected by the CONSUMER via
@@ -145,13 +135,42 @@ required-features = ["llama-cpp"]
 name = "prefix_invalidation"
 required-features = ["llama-cpp"]
 
+# The MULTI-STEP bench: tool call, synthetic result fed back, continue. Every
+# other number about this engine describes the first call of a loop the product
+# runs eight steps of. Same gate.
+[[example]]
+name = "multistep_bench"
+required-features = ["llama-cpp"]
+
+# Does the persisted prefix survive REPLAYED history and tool results, turn after
+# turn, rather than only consecutive fresh questions? Assertion-style. Same gate.
+[[example]]
+name = "conversation_prefix"
+required-features = ["llama-cpp"]
+
+# Prints a template's declared capabilities. Run it before wiring up a new model
+# family: `supports_tool_calls = false` means a replayed tool call is dropped,
+# which is a silently broken agent loop rather than an error. Same gate.
+[[example]]
+name = "caps_probe"
+required-features = ["llama-cpp"]
+
+# Does a free tool ACCEPT the intent the model actually sends it? Every other
+# check grades which tool was NAMED and never executes one. Needs free-tools.
+[[example]]
+name = "free_tool_intents"
+required-features = ["free-tools"]
+
+# Prints the free-tool calling contract as JSON so a host generator can embed it
+# in a tool description. Needs free-tools.
+[[example]]
+name = "free_tool_contract"
+required-features = ["free-tools"]
+
 
 [build-dependencies]
 # Compiles the chat shim for the `llama-cpp` feature (see build.rs).
 cc = { version = "1", optional = true }
-# Drives SwiftPM to compile + link the vendored Apple FM bridge. Same optional
-# dependency name as the runtime dep, so the `apple-fm` feature activates both.
-swift-rs = { version = "1.0.7", features = ["build"], optional = true }
 
 [dev-dependencies]
 hound = "3"

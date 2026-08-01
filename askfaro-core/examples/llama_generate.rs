@@ -35,10 +35,7 @@ fn main() {
     // right, so naming the tool alone does not count as success.
     let req = GenerateRequest {
         system: "You are Scopy, a fast on-device assistant. Call a tool when one applies.".into(),
-        messages: vec![Msg {
-            role: "user".into(),
-            content: "Show me all my high priority tasks that are still in progress.".into(),
-        }],
+        messages: vec![Msg::user("Show me all my high priority tasks that are still in progress.")],
         tools: vec![ToolSchema {
             name: "scopy_task_list".into(),
             description: "List tasks in the workspace, filtered by status, priority or search text."

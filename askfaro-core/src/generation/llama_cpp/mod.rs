@@ -185,6 +185,13 @@ pub struct LlamaCppEngine {
     /// the model (it is built from the template STRING), so it does not
     /// participate in the drop-order constraint above.
     chat: Option<ffi::Chat>,
+    /// What the loaded template says it supports. Read once at load, because it
+    /// is a property of the template and re-asking per turn would be pure cost.
+    /// `None` until the weights land, and empty when upstream does not report.
+    caps: Option<std::collections::BTreeMap<String, bool>>,
+    /// Capability complaints already printed, so each is said once per engine
+    /// rather than once per turn.
+    warned: std::collections::HashSet<String>,
 }
 
 /// The loaded engine.
@@ -276,12 +283,25 @@ impl LlamaCppEngine {
     /// Cheap to construct; loads nothing. Check
     /// [`availability`](GenerationEngine::availability) first.
     pub fn new(cfg: LlamaCppConfig) -> Self {
-        Self { cfg, loaded: None, chat: None }
+        Self { cfg, loaded: None, chat: None, caps: None, warned: Default::default() }
     }
 
     /// True once the weights are resident.
     pub fn is_warm(&self) -> bool {
         self.loaded.is_some()
+    }
+
+    /// What the loaded template declares it supports, as the jinja layer names
+    /// it: `supports_tools`, `supports_tool_calls`, `supports_object_arguments`,
+    /// `supports_system_role`, and so on.
+    ///
+    /// Empty before the weights load, and empty if upstream does not report
+    /// them. The engine already warns on a mismatch by itself (see
+    /// `warn_unsupported`); this is for a host that wants to check BEFORE
+    /// building a transcript it cannot send, or to show it in a diagnostics
+    /// view.
+    pub fn template_caps(&self) -> std::collections::BTreeMap<String, bool> {
+        self.caps.clone().unwrap_or_default()
     }
 
     /// Load the weights now, returning the load time in ms (0 if already warm).
@@ -314,6 +334,9 @@ impl LlamaCppEngine {
         // reload would keep a template belonging to weights that are gone.
         self.loaded = None;
         self.chat = None;
+        // Derived from the template, so it goes with it. Keeping stale caps
+        // across a reload would describe weights that are gone.
+        self.caps = None;
         was
     }
 
@@ -385,7 +408,7 @@ impl LlamaCppEngine {
             .map_err(|e| GenError::Generate(format!("model has no chat template: {e}")))?
             .to_string()
             .map_err(|e| GenError::Generate(format!("chat template is not utf-8: {e}")))?;
-        let chat = ffi::Chat::new(&template)
+        let mut chat = ffi::Chat::new(&template)
             .map_err(|e| GenError::Generate(format!("chat shim init: {e}")))?;
 
         // n_batch caps how many tokens one decode() call may carry, and it
@@ -507,6 +530,9 @@ impl LlamaCppEngine {
             model,
             backend,
         });
+        // Read once, here, while the template is fresh. `warn_unsupported`
+        // consults it per turn and must never pay FFI for the privilege.
+        self.caps = Some(chat.caps());
         self.chat = Some(chat);
         Ok(t.elapsed().as_millis() as u64)
     }
@@ -567,10 +593,7 @@ impl LlamaCppEngine {
     ) -> Result<Vec<llama_cpp_2::token::LlamaToken>, GenError> {
         let mut r = req.clone();
         r.messages.clear();
-        r.messages.push(Msg {
-            role: "user".into(),
-            content: probe.into(),
-        });
+        r.messages.push(Msg::user(probe));
         let enable_thinking = self.cfg.enable_thinking;
         let applied = self
             .chat
@@ -817,6 +840,75 @@ impl LlamaCppEngine {
         }
     }
 
+    /// Say, once, when a request asks the template for something it cannot do.
+    ///
+    /// **Every failure this guards against is fluent, not fatal.** The template
+    /// renders whatever it understands and drops the rest, so the model gets a
+    /// transcript missing the part the host cared about and answers from what
+    /// survived. Scope shipped exactly that for months: tool calls written into
+    /// message text, never rendered as tool calls, and a model that imitated the
+    /// prose it was shown and invented the data. Nothing errored, and the only
+    /// evidence was in the answers.
+    ///
+    /// Warnings rather than errors on purpose. A template that reports
+    /// `supports_tool_calls = false` may still produce something usable, and a
+    /// host mid-conversation is not helped by a hard failure it cannot act on.
+    /// The point is that the next person who hits this reads one line at startup
+    /// instead of rediscovering it from a benchmark.
+    ///
+    /// Deduplicated per engine: this runs on every turn, and a warning printed
+    /// once per turn is a warning nobody reads.
+    fn warn_unsupported(&mut self, req: &GenerateRequest) {
+        let caps = match &self.caps {
+            Some(c) => c,
+            None => return,
+        };
+        // A missing key means this upstream does not report that capability.
+        // Absence is not denial, so an unknown capability never warns.
+        let supported = |k: &str| caps.get(k).copied().unwrap_or(true);
+
+        let mut say: Vec<String> = Vec::new();
+        if !req.tools.is_empty() && !supported("supports_tools") {
+            say.push(format!(
+                "{} tool schema(s) were sent, but this template declares supports_tools=false: \
+                 they will not appear in the prompt and the model cannot call them",
+                req.tools.len()
+            ));
+        }
+        if req.messages.iter().any(|m| !m.tool_calls.is_empty())
+            && !supported("supports_tool_calls")
+        {
+            say.push(
+                "the transcript replays assistant tool CALLS, but this template declares \
+                 supports_tool_calls=false: they will be dropped from the prompt, so the model \
+                 sees a conversation in which it never called anything"
+                    .into(),
+            );
+        }
+        // TWO checks, not four, and deliberately. The first draft also warned on
+        // `supports_parallel_tool_calls` and on `supports_object_arguments`, and
+        // the second one fired on Gemma 4 the very first time it ran, on the
+        // path the bench scores 100%. It was wrong: upstream calls
+        // `workaround::func_args_not_string` when a template supports object
+        // arguments and converts our JSON string itself (`chat.cpp`, around the
+        // `original_caps().supports_object_arguments` branch). The parallel-calls
+        // case was never verified either way.
+        //
+        // A warning that fires on a working path is worse than no warning: it
+        // teaches the reader that these lines are noise, which is precisely how
+        // the failure this whole mechanism exists to catch stayed invisible.
+        // Only warn about what has been checked. Adding a third means verifying
+        // it against upstream first, the same way these two were.
+
+        for s in say {
+            // `warned` is the dedup set, so each distinct complaint is said once
+            // per engine rather than once per turn.
+            if self.warned.insert(s.clone()) {
+                eprintln!("llama_cpp: {s}");
+            }
+        }
+    }
+
     /// Make sure the persisted prefix for `req` exists and is current.
     ///
     /// The engine does this by itself on the first turn, which is where it costs
@@ -882,6 +974,14 @@ impl GenerationEngine for LlamaCppEngine {
             .expect("chat is set with loaded")
             .apply(&req, enable_thinking)
             .map_err(|e| GenError::Generate(format!("chat template: {e}")))?;
+
+        // Does this template do what the request is asking of it? Warned once per
+        // engine, before the prompt is tokenized, because the failure is silent
+        // in both directions: a template that ignores `tool_calls` renders a
+        // transcript with the tool use missing, and the model answers fluently
+        // from what is left. That cost a full multi-step agent loop for months
+        // and was found by benchmark rather than by anything saying so.
+        self.warn_unsupported(&req);
 
         // prompt + generation_prompt. See failure mode 2 in the module docs.
         let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
@@ -1161,6 +1261,10 @@ impl GenerationEngine for LlamaCppEngine {
                 // wants the object. A non-object here is a malformed call, so
                 // it becomes Null rather than being silently dropped.
                 arguments: serde_json::from_str(&c.arguments).unwrap_or(serde_json::Value::Null),
+                // Carried so the host can put it on the matching tool result.
+                // Dropping it here would make `Msg::tool_call_id` unfillable
+                // from a real turn, which is the only way it is ever filled.
+                id: c.id,
             })
             .collect();
 

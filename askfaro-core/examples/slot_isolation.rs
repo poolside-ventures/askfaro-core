@@ -47,7 +47,7 @@ fn ask(engine: &mut LlamaCppEngine, system: &str, user: &str, slot: u32) -> (u64
     let out = engine
         .generate(GenerateRequest {
             system: system.into(),
-            messages: vec![Msg { role: "user".into(), content: user.into() }],
+            messages: vec![Msg::user(user)],
             tools: vec![tool()],
             slot,
             ..Default::default()

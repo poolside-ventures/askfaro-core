@@ -25,6 +25,7 @@ extern "C" {
         enable_thinking: bool,
     ) -> *mut c_char;
     fn scope_chat_parse(ctx: *mut ScopeChatCtx, text: *const c_char) -> *mut c_char;
+    fn scope_chat_caps(ctx: *mut ScopeChatCtx) -> *mut c_char;
     fn scope_chat_free(p: *mut c_char);
     fn scope_chat_ctx_free(ctx: *mut ScopeChatCtx);
 }
@@ -64,6 +65,10 @@ pub struct ParsedToolCall {
     pub name: String,
     /// JSON text, as upstream hands it over.
     pub arguments: String,
+    /// The template's id for this call, when it emits one. Needed to pair the
+    /// result back to the call on the next turn.
+    #[serde(default)]
+    pub id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +133,36 @@ impl Chat {
             messages.push(serde_json::json!({"role": "system", "content": req.system}));
         }
         for m in &req.messages {
-            messages.push(serde_json::json!({"role": m.role, "content": m.content}));
+            // The tool fields go across whenever they are set. Sending only role
+            // and content is what left the template's tool branches dark, so a
+            // replayed agent loop reached the model as prose about tool calls
+            // rather than as tool calls.
+            let mut j = serde_json::json!({"role": m.role, "content": m.content});
+            let o = j.as_object_mut().expect("just built an object");
+            if !m.tool_calls.is_empty() {
+                o.insert(
+                    "tool_calls".into(),
+                    serde_json::Value::Array(
+                        m.tool_calls
+                            .iter()
+                            .map(|c| {
+                                serde_json::json!({
+                                    "name": c.name,
+                                    "arguments": c.arguments,
+                                    "id": c.id,
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            if !m.tool_name.is_empty() {
+                o.insert("tool_name".into(), m.tool_name.clone().into());
+            }
+            if !m.tool_call_id.is_empty() {
+                o.insert("tool_call_id".into(), m.tool_call_id.clone().into());
+            }
+            messages.push(j);
         }
         let tools: Vec<_> = req
             .tools
@@ -146,6 +180,22 @@ impl Chat {
         let t = CString::new(serde_json::Value::Array(tools).to_string()).map_err(|e| e.to_string())?;
         let raw = unsafe { scope_chat_apply(self.ctx, m.as_ptr(), t.as_ptr(), enable_thinking) };
         decode(&take_string(raw)?)
+    }
+
+    /// What the template supports, keyed as the jinja layer names it
+    /// (`supports_tools`, `supports_tool_calls`, `supports_object_arguments`,
+    /// `supports_system_role`, ...).
+    ///
+    /// Cheap and constant for a given template, so a caller reads it once at
+    /// load. An empty map means the shim could not report them, which is not an
+    /// error: an older upstream may not expose caps at all, and refusing to
+    /// generate over a missing diagnostic would be worse than the diagnostic.
+    pub fn caps(&mut self) -> std::collections::BTreeMap<String, bool> {
+        let raw = unsafe { scope_chat_caps(self.ctx) };
+        match take_string(raw) {
+            Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
     }
 
     pub fn parse(&mut self, text: &str) -> Result<Parsed, String> {

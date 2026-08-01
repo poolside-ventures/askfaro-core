@@ -43,7 +43,7 @@ fn run(engine: &mut LlamaCppEngine, label: &str, tools: Vec<ToolSchema>) {
         system: "You are Scopy, a fast on-device assistant.\n\n\
                  scopy_context: {\"now\":\"2026-07-31 16:00\",\"timezone\":\"UTC\"}"
             .into(),
-        messages: vec![Msg { role: "user".into(), content: PROMPT.into() }],
+        messages: vec![Msg::user(PROMPT)],
         tools,
         slot: 0,
     };

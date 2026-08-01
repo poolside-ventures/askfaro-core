@@ -7,9 +7,14 @@
 //!
 //! The default build is model-free — just serde + thiserror, no platform deps —
 //! so it cross-compiles unchanged and a host can depend on the types without
-//! pulling a model runtime. The Apple Foundation Models provider lives behind the
-//! `apple-fm` feature and compiles only under
-//! `cfg(all(target_os = "macos", feature = "apple-fm"))` (see [`apple_fm`]).
+//! pulling a model runtime. Concrete engines are opt-in behind features; today
+//! that means `llama-cpp`.
+//!
+//! An Apple Foundation Models provider lived here until 2026-08-01. Its 4,096-
+//! token window could not hold a real tool registry, and its Swift bridge
+//! flattened every message to `"role: content"`, so it could not replay a tool
+//! call even in principle. It was removed rather than kept as a second engine
+//! that no consumer could actually run.
 //!
 //! Tool *selection* is deliberately out of scope: the caller passes only the
 //! already-chosen tool subset in [`GenerateRequest::tools`]. The companion
@@ -21,7 +26,7 @@
 //!
 //! let req = GenerateRequest {
 //!     system: "You are a helpful assistant.".into(),
-//!     messages: vec![Msg { role: "user".into(), content: "Mark task t_8f3a done".into() }],
+//!     messages: vec![Msg::user("Mark task t_8f3a done")],
 //!     tools: vec![ToolSchema {
 //!         name: "scope_task".into(),
 //!         description: "Update a task".into(),
@@ -35,16 +40,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[cfg(all(target_os = "macos", feature = "apple-fm"))]
-pub mod apple_fm;
-
-#[cfg(all(target_os = "macos", feature = "apple-fm"))]
-pub use apple_fm::AppleFmEngine;
-
-/// In-process llama.cpp. Not OS-gated, unlike `apple_fm`: the same code runs on
-/// every platform and the accelerator is chosen by the consumer's `llama-cpp-2`
-/// features. That is the whole reason it was preferred over an Apple-only
-/// runtime.
+/// In-process llama.cpp. Not OS-gated: the same code runs on every platform and
+/// the accelerator is chosen by the consumer's `llama-cpp-2` features. That is
+/// the whole reason it was preferred over an Apple-only runtime, and why it is
+/// the one that survived.
 #[cfg(feature = "llama-cpp")]
 pub mod llama_cpp;
 
@@ -59,15 +58,81 @@ pub use llama_cpp::{LlamaCppConfig, LlamaCppEngine, PrefixReport};
 
 /// One conversation turn. `role` is the OpenAI role (`"system"`, `"user"`,
 /// `"assistant"`, `"tool"`); the engine maps it to the provider's transcript.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **A tool call is structured, not prose.** For a year this struct was `role`
+/// plus `content`, which meant a host replaying an agent loop had nowhere to put
+/// "the assistant called `scopy_task` with these arguments" except inside the
+/// text. Scope's desktop wrote `[called scopy_task({...})]` and
+/// `[scopy_task result: {...}]` as ordinary message text, and the model, shown
+/// bracket prose where its template has real `<|tool_call>` and
+/// `<|tool_response>` tokens, wrote bracket prose back: it invented
+/// `[tool_response]` blocks full of fabricated records and echoed our own
+/// `[called ...]` syntax to the user as their answer. Measured at 0% correct
+/// continuation calls across the whole multi-step bench.
+///
+/// The fields below are what a chat template's tool branches read. They are
+/// optional so a plain user/assistant transcript is unchanged, but a host
+/// replaying tool use MUST fill them, or the template's tool arms never fire and
+/// the failure is silent and fluent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Msg {
     pub role: String,
     pub content: String,
+    /// On an `assistant` turn: the calls it made. Rendered by the template as
+    /// real tool-call markup rather than described in `content`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// On a `tool` turn: which tool produced this result.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_name: String,
+    /// On a `tool` turn: the id of the call it answers, matching
+    /// [`ToolCall::id`]. Templates that pair calls with results by id need it;
+    /// ones that pair positionally ignore it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_call_id: String,
+}
+
+impl Msg {
+    /// A plain user turn.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: content.into(), ..Default::default() }
+    }
+
+    /// A plain assistant turn (text only, no calls).
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: "assistant".into(), content: content.into(), ..Default::default() }
+    }
+
+    /// An assistant turn that CALLED tools. `content` is whatever text came with
+    /// them, usually empty.
+    pub fn assistant_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+            tool_calls,
+            ..Default::default()
+        }
+    }
+
+    /// A tool result. `content` is the tool's output as the model should read it;
+    /// pass the payload itself, not a description of it.
+    pub fn tool_result(
+        tool_name: impl Into<String>,
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_name: tool_name.into(),
+            tool_call_id: tool_call_id.into(),
+            ..Default::default()
+        }
+    }
 }
 
 /// An OpenAI function-tool definition. `parameters` is a JSON Schema object — the
-/// provider builds its own per-call schema from it (Apple FM uses a
-/// `DynamicGenerationSchema`).
+/// provider renders it into the model's own chat template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSchema {
     pub name: String,
@@ -110,6 +175,14 @@ pub struct ToolCall {
     pub name: String,
     /// Decoded arguments object.
     pub arguments: Value,
+    /// The template's own id for this call, when it emitted one.
+    ///
+    /// Carried so a host can put it back on the matching [`Msg::tool_result`]:
+    /// templates that pair a result to its call by id have nothing to pair with
+    /// otherwise, and a turn with two calls in flight is exactly where that
+    /// stops being cosmetic. Empty for families that pair positionally.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 /// The model's response. A turn is either tool calls (`tool_calls` non-empty),
@@ -248,10 +321,7 @@ mod tests {
     fn request_roundtrips_through_json() {
         let req = GenerateRequest {
             system: "sys".into(),
-            messages: vec![Msg {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
+            messages: vec![Msg::user("hi")],
             tools: vec![ToolSchema {
                 name: "t".into(),
                 description: "d".into(),
@@ -277,7 +347,41 @@ mod tests {
         let tc = ToolCall {
             name: "scope_task".into(),
             arguments: json!({"task_id": "t_8f3a", "status": "completed"}),
+            id: "call_0".into(),
         };
         assert_eq!(tc.arguments["task_id"], "t_8f3a");
+    }
+
+    /// The transcript a replayed agent loop produces must carry the CALL, not a
+    /// sentence about it. This is the shape that was wrong for a year: tool use
+    /// went into `content` as prose, the template's tool branches never fired,
+    /// and the model imitated the prose instead of reading the result.
+    #[test]
+    fn a_replayed_tool_turn_carries_structure_not_prose() {
+        let call = ToolCall {
+            name: "scope_task".into(),
+            arguments: json!({"task_id": "t_11"}),
+            id: "call_0".into(),
+        };
+        let assistant = Msg::assistant_calls("", vec![call.clone()]);
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(assistant.tool_calls, vec![call]);
+        // The call must NOT have been described in the text.
+        assert!(assistant.content.is_empty());
+
+        let result = Msg::tool_result("scope_task", "call_0", r#"{"ok":true}"#);
+        assert_eq!(result.role, "tool");
+        assert_eq!(result.tool_name, "scope_task");
+        assert_eq!(result.tool_call_id, "call_0");
+        // The payload itself, so the model reads data rather than a report of it.
+        assert_eq!(result.content, r#"{"ok":true}"#);
+    }
+
+    /// A plain conversation must serialize exactly as before, or every existing
+    /// persisted prefix is invalidated by a field nothing uses.
+    #[test]
+    fn a_toolless_message_serializes_unchanged() {
+        let json = serde_json::to_string(&Msg::user("hi")).unwrap();
+        assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
     }
 }

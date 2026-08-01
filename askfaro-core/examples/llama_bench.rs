@@ -179,13 +179,10 @@ fn main() {
         // cannot see the most expensive prompt bug there is.
         let req = GenerateRequest {
             system: system.clone(),
-            messages: vec![Msg {
-                role: "user".into(),
-                content: format!(
-                    "scopy_context: {{\"now\":\"2026-07-30 08:{:02}\",\"timezone\":\"UTC\"}}\n\n{prompt}",
-                    i % 60,
-                ),
-            }],
+            messages: vec![Msg::user(format!(
+                "scopy_context: {{\"now\":\"2026-07-30 08:{:02}\",\"timezone\":\"UTC\"}}\n\n{prompt}",
+                i % 60,
+            ))],
             tools: tools.clone(),
         slot: 0,
         };
@@ -221,6 +218,11 @@ fn main() {
                 "args": call.map(|c| c.arguments.clone()).unwrap_or(Value::Null),
                 "text": out.text,
                 "reasoningChars": out.reasoning.len(),
+                // The reasoning ITSELF, not just its length. On a thinking model
+                // the choice between two near-synonymous tools is argued out here
+                // and nowhere else; a length tells you the argument happened and
+                // withholds what it said.
+                "reasoning": out.reasoning,
                 "ms": out.model_ms,
                 "promptTokens": out.timings.prompt_tokens,
                 "outputTokens": out.timings.output_tokens,
@@ -231,6 +233,14 @@ fn main() {
         );
     }
     eprintln!("\ndone");
+
+    // Release the engine BEFORE the assertions. `std::process::exit` does not run
+    // destructors, so exiting with the engine still alive leaves ggml-metal's
+    // atexit check to find unreleased resource sets and abort: the process dies
+    // with SIGABRT (134) instead of the intended 1, and a caller reading the exit
+    // code learns "crashed" where the truth is "an assertion failed". The same
+    // drop-order rule the engine documents internally, applied to the harness.
+    drop(engine);
 
     // --- assertions ------------------------------------------------------
     //
