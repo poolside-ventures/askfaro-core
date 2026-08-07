@@ -1024,7 +1024,7 @@ impl GenerationEngine for LlamaCppEngine {
 impl LlamaCppEngine {
     fn generate_impl(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
         let load_ms = self.ensure_loaded()?;
-        let enable_thinking = self.cfg.enable_thinking;
+        let enable_thinking = req.enable_thinking.unwrap_or(self.cfg.enable_thinking);
         let n_ctx = self.cfg.n_ctx;
 
         // --- render the prompt through the model's own template -------------

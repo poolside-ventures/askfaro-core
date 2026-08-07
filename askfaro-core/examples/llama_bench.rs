@@ -184,7 +184,8 @@ fn main() {
                 i % 60,
             ))],
             tools: tools.clone(),
-        slot: 0,
+            slot: 0,
+            ..Default::default()
         };
 
         let out = match engine.generate(req) {

@@ -88,6 +88,7 @@ fn run(engine: &mut LlamaCppEngine, system: &str, messages: &[Msg]) -> Turn {
             messages: messages.to_vec(),
             tools: tools(),
             slot: 0,
+            ..Default::default()
         })
         .expect("generate");
     Turn {

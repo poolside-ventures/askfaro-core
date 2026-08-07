@@ -167,6 +167,16 @@ pub struct GenerateRequest {
     /// nothing to gain from a drafter anyway.
     #[serde(default)]
     pub slot: u32,
+    /// Override the engine's `enable_thinking` for THIS request; `None` uses
+    /// the engine's configuration.
+    ///
+    /// This is what lets one engine serve two workloads instead of two
+    /// engines holding the same weights: the desktop's chat runs with
+    /// thinking on while its memory extraction runs with thinking off (the
+    /// proven extraction operating point), and thinking is a property of the
+    /// rendered prompt, not of the loaded weights.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 /// A single tool invocation the model emitted.

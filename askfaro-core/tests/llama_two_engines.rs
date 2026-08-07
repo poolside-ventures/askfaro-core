@@ -101,6 +101,7 @@ fn engine_recovers_after_a_failed_generate() {
             }],
             tools: vec![],
             slot: 1,
+            ..Default::default()
         })
         .expect_err("slot 1 on a one-slot context must fail");
     assert!(

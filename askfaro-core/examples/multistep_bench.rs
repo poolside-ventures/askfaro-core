@@ -299,6 +299,7 @@ fn main() {
                 messages: messages.clone(),
                 tools: tools.clone(),
                 slot: 0,
+                ..Default::default()
             }) {
                 Ok(o) => o,
                 Err(e) => {
