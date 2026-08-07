@@ -121,6 +121,16 @@ pub struct LlamaCppConfig {
     /// Total context window in tokens. A property of the MODEL, so the caller
     /// supplies it from its model profile; this crate does not decide it.
     pub n_ctx: u32,
+    /// Physical micro-batch: how many tokens one Metal kernel dispatch carries
+    /// during prefill. `None` keeps llama.cpp's default (512).
+    ///
+    /// This is the prefill throughput knob (`n_batch` above it is only the
+    /// LOGICAL cap on tokens per `decode()` call). Community numbers on Apple
+    /// Silicon put 2048-vs-512 at 2-3x prompt eval; the price is compute
+    /// buffer memory, which scales with it. NEVER pass `Some(0)`: llama.cpp
+    /// treats 0 as "use n_batch", which with our window-sized n_batch would
+    /// size the compute buffer for a 16K-token dispatch.
+    pub n_ubatch: Option<u32>,
     /// Layers to offload to the GPU. A large value means "all it will take".
     pub n_gpu_layers: u32,
     /// Whether the model may emit a reasoning channel.
@@ -163,6 +173,7 @@ impl Default for LlamaCppConfig {
             draft_path: None,
             draft_n_max: 3,
             n_ctx: 16384,
+            n_ubatch: None,
             n_gpu_layers: 1000,
             enable_thinking: true,
             // Two: the agent loop, plus background one-shots.
@@ -462,10 +473,13 @@ impl LlamaCppEngine {
         // on one engine, and it is worth naming rather than discovering.
         let slots = self.cfg.n_slots.max(1);
         let total_ctx = self.cfg.n_ctx.saturating_mul(slots);
-        let ctx_params = LlamaContextParams::default()
+        let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
             .with_n_batch(self.cfg.n_ctx)
             .with_n_seq_max(slots);
+        if let Some(ub) = self.cfg.n_ubatch.filter(|&ub| ub > 0) {
+            ctx_params = ctx_params.with_n_ubatch(ub);
+        }
         // SAFETY: `model` is boxed, so its address is stable and outlives `ctx`;
         // `Loaded` declares `ctx` first so it is dropped first. The backend is
         // genuinely `'static` (shared_backend), no extension needed.
@@ -494,11 +508,15 @@ impl LlamaCppEngine {
                             // `MtpSpeculative::new` consumed both contexts, so
                             // there is nothing to fall back WITH; rebuild one.
                             eprintln!("llama_cpp: MTP init failed ({e}); plain decode");
+                            let mut p = LlamaContextParams::default()
+                                .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
+                                .with_n_batch(self.cfg.n_ctx)
+                                .with_n_seq_max(slots);
+                            if let Some(ub) = self.cfg.n_ubatch.filter(|&ub| ub > 0) {
+                                p = p.with_n_ubatch(ub);
+                            }
                             let c = model_ref
-                                .new_context(backend, LlamaContextParams::default()
-                                    .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
-                                    .with_n_batch(self.cfg.n_ctx)
-                                    .with_n_seq_max(slots))
+                                .new_context(backend, p)
                                 .map_err(|e| GenError::Generate(e.to_string()))?;
                             (Decoder::Plain(c), None)
                         }
@@ -989,6 +1007,57 @@ impl LlamaCppEngine {
     }
 }
 
+/// Sample at `idx`, holding the token to `grmr` when a grammar is active.
+///
+/// Upstream's rejection-sampling pattern (common/sampling.cpp with
+/// `grammar_first == false`): sample from the plain chain, test THAT ONE
+/// token against the grammar with a 1-element apply, and only when it is
+/// rejected pay the full-vocab grammar mask and take the best surviving
+/// token. Under greedy decode the argmax is grammar-legal on almost every
+/// step, so the constrained path costs one cheap check per token instead of
+/// a 262K-piece grammar evaluation per token.
+///
+/// The grammar advances ONLY here, exactly once per committed token.
+/// `LlamaSampler::sample` auto-accepts into the CHAIN it is called on, but
+/// `grmr` lives outside the chain, so the double-accept corruption the
+/// decode loop's invariant documents cannot recur through this path.
+fn sample_with_grammar(
+    ctx: &mut LlamaContext<'static>,
+    chain: &mut LlamaSampler,
+    grmr: Option<&mut LlamaSampler>,
+    idx: i32,
+) -> llama_cpp_2::token::LlamaToken {
+    let token = chain.sample(ctx, idx);
+    let Some(grmr) = grmr else {
+        return token;
+    };
+    // The cheap test: does the grammar admit this exact token? Logit 0.0 in,
+    // -INF out means rejected.
+    let mut probe = llama_cpp_2::token::data_array::LlamaTokenDataArray::from_iter(
+        [llama_cpp_2::token::data::LlamaTokenData::new(token, 0.0, 0.0)],
+        false,
+    );
+    probe.apply_sampler(grmr);
+    let admitted = probe
+        .data
+        .first()
+        .is_some_and(|d| d.logit() > f32::NEG_INFINITY);
+    if admitted {
+        grmr.accept(token);
+        return token;
+    }
+    // Rejection: the model's argmax is not grammar-legal (prose where JSON
+    // must continue, or end-of-turn before the value is complete). Pay the
+    // full mask once and take the best surviving token. The grammar always
+    // admits SOMETHING from a live state: a complete grammar admits the EOG
+    // token, an incomplete one admits at least one continuation.
+    let mut cands = ctx.token_data_array_ith(idx);
+    cands.apply_sampler(grmr);
+    let token = cands.sample_token_greedy();
+    grmr.accept(token);
+    token
+}
+
 impl GenerationEngine for LlamaCppEngine {
     /// Reports only what can be known without a model path in hand. A caller
     /// with a configured engine should prefer [`Self::availability_for`].
@@ -1003,6 +1072,13 @@ impl GenerationEngine for LlamaCppEngine {
             // in a trim-and-resend loop; the engine state is intact, so paying
             // a reload on every iteration of that loop would be pure waste.
             Err(GenError::ContextWindowExceeded) => {}
+            // Request rejection, not inference failure: every `Invalid` in
+            // `generate_impl` is returned before any decode touches the KV
+            // cache (validation runs ahead of the weight load, and the sampler
+            // is built ahead of the reuse trim), so the warm weights are still
+            // good. Unloading here would make one malformed request cost the
+            // next good one a multi-second reload.
+            Err(GenError::Invalid(_)) => {}
             // Any other failure may have left llama.cpp's state inconsistent
             // with the slot bookkeeping, and the engine cannot tell from here.
             // The desktop's memory deriver found the concrete case: a Metal
@@ -1023,6 +1099,33 @@ impl GenerationEngine for LlamaCppEngine {
 
 impl LlamaCppEngine {
     fn generate_impl(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
+        // Request validation FIRST, ahead of the weight load: a malformed
+        // request must cost an error, not a multi-gigabyte model load. The
+        // wrapper in `generate` relies on this ordering when it declines to
+        // unload on `Invalid` — every `Invalid` below is returned before any
+        // decode has touched the KV cache.
+        if req.json_schema.is_some() && !req.tools.is_empty() {
+            return Err(GenError::Invalid(
+                "json_schema and tools are mutually exclusive: upstream's response-format \
+                 grammar takes precedence over the tool-call rules (Gemma 4's PEG returns \
+                 before building them), so the tools would render into the prompt but be \
+                 unsampleable — dropped silently, which this engine refuses to do"
+                    .into(),
+            ));
+        }
+        // Upstream requires the schema to be a JSON OBJECT and silently ignores
+        // any other shape (`has_response_format = inputs.json_schema.is_object()`
+        // in every family handler), which for a constrained request means the
+        // one failure this feature exists to prevent: a reply that was asked to
+        // conform and simply is not. Rejected loudly here instead.
+        if req.json_schema.as_ref().is_some_and(|s| !s.is_object()) {
+            return Err(GenError::Invalid(
+                "json_schema must be a JSON Schema OBJECT; upstream ignores any other shape \
+                 and the reply would be silently unconstrained"
+                    .into(),
+            ));
+        }
+
         let load_ms = self.ensure_loaded()?;
         let enable_thinking = req.enable_thinking.unwrap_or(self.cfg.enable_thinking);
         let n_ctx = self.cfg.n_ctx;
@@ -1042,6 +1145,31 @@ impl LlamaCppEngine {
         // from what is left. That cost a full multi-step agent loop for months
         // and was found by benchmark rather than by anything saying so.
         self.warn_unsupported(&req);
+
+        // A json_schema request is honored by the FAMILY handler in upstream's
+        // chat layer (the same `inputs.json_schema` llama-server fills from an
+        // OpenAI `response_format`), which renders it into `applied.grammar` —
+        // for Gemma 4, "optional thought channel, then a ```json fenced body
+        // constrained to the schema", with the fences consumed by the parser.
+        // Checked here, not assumed: a family whose handler does not implement
+        // response_format returns an empty (or lazy, trigger-gated) grammar,
+        // and applying nothing would return an ordinary unconstrained reply to
+        // a caller that asked for a guarantee — the silent failure this whole
+        // engine module is written against. Still ahead of prefill, so the
+        // engine state is untouched on rejection.
+        let grammar: Option<&str> = match &req.json_schema {
+            None => None,
+            Some(_) => {
+                if applied.grammar.is_empty() || applied.grammar_lazy {
+                    return Err(GenError::Invalid(format!(
+                        "json_schema was requested but this model's chat format produced {} \
+                         response-format grammar, so the constraint cannot be enforced",
+                        if applied.grammar.is_empty() { "no" } else { "only a lazy" }
+                    )));
+                }
+                Some(applied.grammar.as_str())
+            }
+        };
 
         // prompt + generation_prompt. See failure mode 2 in the module docs.
         let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
@@ -1073,6 +1201,32 @@ impl LlamaCppEngine {
         };
         let loaded = self.loaded.as_mut().expect("just loaded");
 
+        // The chain is plain greedy even on constrained turns; the grammar
+        // lives OUTSIDE it and is enforced by `sample_with_grammar`'s
+        // rejection-sampling, which is upstream's own pattern
+        // (common/sampling.cpp, `grammar_first == false`). An in-chain
+        // grammar sampler evaluates the grammar against all 262K vocab
+        // pieces on EVERY token (the cost tracked upstream as llama.cpp
+        // issue #4218); the rejection form tests only the one sampled token
+        // and pays the full mask solely when the argmax is not
+        // grammar-legal, which under greedy decode is the rare step, not
+        // the common one. Enforcement is unchanged: a non-conforming token
+        // still cannot COMMIT, it just gets rejected after the fact instead
+        // of masked before.
+        //
+        // Built BEFORE anything below mutates this slot's cache, so a
+        // failure here leaves the engine consistent (the `Invalid` arm of
+        // `generate`'s wrapper counts on that). The grammar sampler holds
+        // the C-side vocab pointer, not a Rust borrow, so `loaded` stays
+        // freely mutable.
+        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        let mut grmr = match grammar {
+            Some(g) => Some(LlamaSampler::grammar(&loaded.model, g, "root").map_err(|e| {
+                GenError::Invalid(format!("json_schema produced an unusable grammar: {e}"))
+            })?),
+            None => None,
+        };
+
         // --- prefix reuse -----------------------------------------------------
         // A thread replays an identical prefix every turn (system prompt, tool
         // schemas, history), so only the divergent tail needs decoding. Trim the
@@ -1084,8 +1238,20 @@ impl LlamaCppEngine {
         // Slot 0 speculates; any other slot is a plain decode on its own
         // sequence. `MtpSpeculative` binds to sequence 0, and a background
         // one-shot has nothing to gain from a drafter in any case.
+        //
+        // A grammar-constrained turn never speculates, even on slot 0. The
+        // grammar sampler is STATEFUL, and the speculative path's contract
+        // with it is untested: the verify loop's early exits leave sampled-
+        // but-uncommitted tokens accepted into the grammar, and the drafter
+        // proposes without seeing the grammar at all, so acceptance on
+        // constrained output is unmeasured. Constrained turns are background
+        // extraction (short JSON on a non-latency-critical path), so the
+        // plain loop's correctness is worth more than an unproven speedup.
+        // Skipping a turn is safe for the drafter: `spec.begin` re-announces
+        // the whole prompt on every speculative turn.
         let slot = req.slot;
-        let speculative = slot == 0 && matches!(loaded.dec, Decoder::Mtp(_));
+        let speculative =
+            slot == 0 && matches!(loaded.dec, Decoder::Mtp(_)) && grammar.is_none();
         let prior = loaded.cached.entry(slot).or_default();
         let common = prior
             .iter()
@@ -1138,7 +1304,6 @@ impl LlamaCppEngine {
         let prefill_ms = t_prefill.elapsed().as_millis() as u64 + prefix_ms;
 
         // --- decode ---------------------------------------------------------
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
         let mut n_cur = tokens.len() as i32;
         // What the cache holds once this turn's prompt is in. Generated tokens are
         // appended below so the next turn's common-prefix scan sees them too.
@@ -1155,10 +1320,23 @@ impl LlamaCppEngine {
         let t_decode = Instant::now();
         // `next` is the token that has been decided but not yet written into the
         // KV cache. Both loops below share this invariant.
-        let mut next = sampler.sample(loaded.dec.ctx(), batch.n_tokens() - 1);
+        let mut next =
+            sample_with_grammar(loaded.dec.ctx(), &mut sampler, grmr.as_mut(), batch.n_tokens() - 1);
 
+        // NO explicit `sampler.accept` anywhere in this loop, and that is a
+        // correctness invariant, not an omission: `llama_sampler_sample`
+        // already accepts the token it returns into the chain (upstream
+        // llama-sampler.cpp, end of `llama_sampler_sample`), so every token
+        // this loop commits has been accepted exactly once at the moment it
+        // was sampled. An explicit accept on top is a DOUBLE accept — a no-op
+        // for stateless greedy, which is how it sat here harmlessly, but state
+        // corruption for the grammar sampler: the second accept of a
+        // value-completing token walks the grammar past its end, llama-cpp-2's
+        // `accept` swallows the C++ exception that reports it (`let _ =
+        // try_accept(...)`), and the NEXT sample aborts the process on
+        // `GGML_ASSERT(!stacks.empty())`. Found by the json_schema test the
+        // first time it ran.
         'gen: while output_tokens < MAX_OUTPUT_TOKENS {
-            sampler.accept(next);
             // The end-of-turn token stays in the text: the parser's grammar
             // matches a complete turn. See failure mode 3 in the module docs.
             let piece = loaded
@@ -1194,7 +1372,7 @@ impl LlamaCppEngine {
                     n_cur += 1;
                     ctx.decode(&mut batch)
                         .map_err(|e| GenError::Generate(e.to_string()))?;
-                    next = sampler.sample(ctx, batch.n_tokens() - 1);
+                    next = sample_with_grammar(ctx, &mut sampler, grmr.as_mut(), batch.n_tokens() - 1);
                 }
                 // --- speculative: propose k, verify all k in ONE pass --------
                 //
@@ -1258,8 +1436,11 @@ impl LlamaCppEngine {
 
                     // Emit what was accepted. These are committed tokens, so
                     // they must run the same EOG and cap checks as any other.
+                    // A committed draft needs no sampler.accept either: it is
+                    // only committed when the verify sample returned the same
+                    // token, and THAT sample already accepted it (see the
+                    // loop-level invariant above).
                     for d in drafts.iter().take(accepted) {
-                        sampler.accept(*d);
                         let piece = loaded
                             .model
                             .token_to_str(*d, Special::Tokenize)
@@ -1477,6 +1658,61 @@ mod tests {
         assert_eq!(p.parent().unwrap(), Path::new("/cache"));
         assert!(p.file_name().unwrap().to_string_lossy().starts_with("prefix-"));
         assert_eq!(p.extension().unwrap(), "kv");
+    }
+
+    /// Upstream treats a non-object `json_schema` as "no response format" and
+    /// renders an ordinary unconstrained turn (`has_response_format =
+    /// inputs.json_schema.is_object()` in every family handler). For a caller
+    /// that asked for a guarantee, silence is the failure — the engine must
+    /// reject the request instead, before the weights load.
+    #[test]
+    fn a_non_object_schema_is_rejected_not_silently_ignored() {
+        use crate::generation::GenerationEngine;
+        let mut e = LlamaCppEngine::new(LlamaCppConfig {
+            model_path: PathBuf::from("/nonexistent/never-loaded.gguf"),
+            ..Default::default()
+        });
+        let err = e
+            .generate(GenerateRequest {
+                system: "s".into(),
+                messages: vec![Msg::user("hi")],
+                json_schema: Some(serde_json::json!(["not", "an", "object"])),
+                ..Default::default()
+            })
+            .expect_err("a non-object schema must be rejected");
+        assert!(
+            matches!(err, GenError::Invalid(_)),
+            "expected Invalid (validation before load), got: {err}"
+        );
+    }
+
+    /// A request that is malformed on its face must be rejected before the
+    /// weights load: `Invalid`, not a load error from the bogus path — and per
+    /// the wrapper's contract, without unloading anything.
+    #[test]
+    fn json_schema_with_tools_is_rejected_before_any_load() {
+        use crate::generation::{GenerationEngine, ToolSchema};
+        let mut e = LlamaCppEngine::new(LlamaCppConfig {
+            model_path: PathBuf::from("/nonexistent/never-loaded.gguf"),
+            ..Default::default()
+        });
+        let err = e
+            .generate(GenerateRequest {
+                system: "s".into(),
+                messages: vec![Msg::user("hi")],
+                tools: vec![ToolSchema {
+                    name: "t".into(),
+                    description: "d".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }],
+                json_schema: Some(serde_json::json!({"type": "object"})),
+                ..Default::default()
+            })
+            .expect_err("tools + json_schema must be rejected");
+        assert!(
+            matches!(err, GenError::Invalid(_)),
+            "expected Invalid (validation before load), got: {err}"
+        );
     }
 
     /// `sweep_stale_prefixes` deletes superseded state files, and it runs in a

@@ -177,6 +177,31 @@ pub struct GenerateRequest {
     /// rendered prompt, not of the loaded weights.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Constrain the reply to JSON matching this JSON Schema (an OBJECT, per
+    /// upstream), enforced at the SAMPLER: tokens outside the grammar are
+    /// masked, so a non-conforming reply is unrepresentable rather than merely
+    /// discouraged.
+    ///
+    /// This exists because asking is not enforcing. The desktop's memory shim
+    /// honored OpenAI `response_format` by pasting the schema into the system
+    /// prompt, and some Honcho deriver units still answered in prose — and with
+    /// greedy decode the argmax continuation is prose EVERY time, so retries
+    /// changed nothing and the unit burned in the queue forever. A hosted
+    /// backend's `response_format` works because the server constrains decoding;
+    /// for a local engine, this field is that server-side enforcement.
+    ///
+    /// The whole mechanism is upstream's: the schema rides
+    /// `common_chat_templates_inputs.json_schema` — the same field llama-server
+    /// fills from an OpenAI `response_format` — and the model FAMILY's chat
+    /// handler shapes the grammar. Gemma 4's permits an optional thinking
+    /// channel before the constrained body and strips its ```json fences at
+    /// parse, so `enable_thinking` composes freely with this. Mutually
+    /// exclusive with `tools`: upstream's response-format grammar takes
+    /// precedence over the call rules, which would leave the sent tools
+    /// rendered but unsampleable — rejected as [`GenError::Invalid`] rather
+    /// than dropped silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<Value>,
 }
 
 /// A single tool invocation the model emitted.
@@ -342,6 +367,25 @@ mod tests {
         let s = serde_json::to_string(&req).unwrap();
         let back: GenerateRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(req, back);
+    }
+
+    /// `json_schema` must roundtrip when set and vanish from the wire when not:
+    /// requests are exchanged with hosts that predate the field, and an
+    /// ever-present `"json_schema": null` would be a schema change for them.
+    #[test]
+    fn json_schema_roundtrips_and_is_absent_when_unset() {
+        let req = GenerateRequest {
+            system: "sys".into(),
+            messages: vec![Msg::user("hi")],
+            json_schema: Some(json!({"type": "object", "required": ["name"]})),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let back: GenerateRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, back);
+
+        let plain = serde_json::to_string(&GenerateRequest::default()).unwrap();
+        assert!(!plain.contains("json_schema"), "unset field must not serialize: {plain}");
     }
 
     #[test]

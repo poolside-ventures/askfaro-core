@@ -22,6 +22,7 @@ extern "C" {
         ctx: *mut ScopeChatCtx,
         messages_json: *const c_char,
         tools_json: *const c_char,
+        json_schema: *const c_char,
         enable_thinking: bool,
     ) -> *mut c_char;
     fn scope_chat_parse(ctx: *mut ScopeChatCtx, text: *const c_char) -> *mut c_char;
@@ -38,13 +39,23 @@ pub struct Applied {
     /// on `llama_cpp` for what happens when only the first is sent.
     #[serde(default)]
     pub generation_prompt: String,
-    /// Auto-generated from the tool schemas. Carried but not applied yet: the
-    /// first measurement showed Gemma emitting a valid call unconstrained, so
-    /// constraining decoding would be paying for a problem we have not observed.
-    /// Kept because it is free here and is the fix if that ever changes.
-    #[allow(dead_code)]
+    /// Upstream's grammar for this turn, from the model family's own chat
+    /// handler. Two producers, one field:
+    ///
+    /// - a `json_schema` request compiles into it (response-format grammar,
+    ///   eager) — the engine APPLIES it, that is the whole constrained-output
+    ///   feature;
+    /// - tool schemas alone also generate one (call grammar, usually lazy) —
+    ///   deliberately NOT applied: the first measurement showed Gemma emitting
+    ///   a valid call unconstrained, so constraining would be paying for a
+    ///   problem we have not observed.
     #[serde(default)]
     pub grammar: String,
+    /// True when `grammar` is trigger-gated (tool-call style) rather than
+    /// meant to constrain from the first sampled token. A response-format
+    /// grammar is eager; the engine refuses to treat a lazy grammar as one.
+    #[serde(default)]
+    pub grammar_lazy: bool,
     /// Whether the model's own template declares a reasoning channel.
     #[allow(dead_code)]
     #[serde(default)]
@@ -178,7 +189,14 @@ impl Chat {
 
         let m = CString::new(serde_json::Value::Array(messages).to_string()).map_err(|e| e.to_string())?;
         let t = CString::new(serde_json::Value::Array(tools).to_string()).map_err(|e| e.to_string())?;
-        let raw = unsafe { scope_chat_apply(self.ctx, m.as_ptr(), t.as_ptr(), enable_thinking) };
+        // Empty string means "no response format"; the shim maps it to an
+        // unset `inputs.json_schema`.
+        let s = CString::new(
+            req.json_schema.as_ref().map(|v| v.to_string()).unwrap_or_default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let raw =
+            unsafe { scope_chat_apply(self.ctx, m.as_ptr(), t.as_ptr(), s.as_ptr(), enable_thinking) };
         decode(&take_string(raw)?)
     }
 

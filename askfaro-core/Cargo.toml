@@ -155,6 +155,12 @@ required-features = ["llama-cpp"]
 name = "caps_probe"
 required-features = ["llama-cpp"]
 
+# Sweeps n_ubatch values against a prompt corpus to measure prefill throughput.
+# Builds an engine, so same gate.
+[[example]]
+name = "ubatch_sweep"
+required-features = ["llama-cpp"]
+
 # Does a free tool ACCEPT the intent the model actually sends it? Every other
 # check grades which tool was NAMED and never executes one. Needs free-tools.
 [[example]]

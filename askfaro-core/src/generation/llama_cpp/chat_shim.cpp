@@ -58,13 +58,23 @@ scope_chat_ctx * scope_chat_init(const char * template_str) {
 ///
 /// `messages_json`: [{"role": "...", "content": "..."}]
 /// `tools_json`:    [{"name": "...", "description": "...", "parameters": {...}}]
+/// `json_schema`:   a JSON Schema object as text, or null/empty for none.
+///
+/// `json_schema` is upstream's own response-format input — the same field
+/// llama-server fills from an OpenAI `response_format` request. The FAMILY
+/// handler decides how to honor it; for Gemma 4 that is a PEG grammar of
+/// "optional thought channel, then a ```json fenced body constrained to the
+/// schema", with the fences consumed at parse so `content` comes back as bare
+/// JSON. Doing it here rather than in the caller is the difference between
+/// upstream's turn-shaped grammar and a naive "JSON from token zero" one.
 ///
 /// Returns a JSON object with the rendered prompt plus everything the caller
-/// needs to decode the reply: the auto-generated grammar for constrained tool
-/// calls, and the thinking tags derived from the template itself.
+/// needs to decode the reply: the grammar (for constrained sampling), and the
+/// thinking tags derived from the template itself.
 char * scope_chat_apply(scope_chat_ctx * ctx,
                         const char *     messages_json,
                         const char *     tools_json,
+                        const char *     json_schema,
                         bool             enable_thinking) {
     if (!ctx) {
         return nullptr;
@@ -74,6 +84,9 @@ char * scope_chat_apply(scope_chat_ctx * ctx,
         inputs.use_jinja             = true;
         inputs.add_generation_prompt = true;
         inputs.enable_thinking       = enable_thinking;
+        if (json_schema && *json_schema) {
+            inputs.json_schema = json_schema;
+        }
         // deepseek is the format that yields a separate reasoning_content rather
         // than leaving the think block inline in content.
         inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
