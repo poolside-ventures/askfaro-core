@@ -997,6 +997,32 @@ impl GenerationEngine for LlamaCppEngine {
     }
 
     fn generate(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
+        let out = self.generate_impl(req);
+        match &out {
+            // Fires before any decode touches the KV cache, and hosts retry it
+            // in a trim-and-resend loop; the engine state is intact, so paying
+            // a reload on every iteration of that loop would be pure waste.
+            Err(GenError::ContextWindowExceeded) => {}
+            // Any other failure may have left llama.cpp's state inconsistent
+            // with the slot bookkeeping, and the engine cannot tell from here.
+            // The desktop's memory deriver found the concrete case: a Metal
+            // OOM aborts the decode, llama.cpp trims the sequence, and every
+            // later call on that engine fails position validation ("failed to
+            // initialize batch"), forever. llama.cpp's own log says it:
+            // "recreate the backend to recover" — the erroring object is the
+            // per-context ggml scheduler, so dropping the context IS the
+            // recovery, and the next generate reloads clean (~3-5s warm).
+            Err(_) => {
+                self.unload();
+            }
+            Ok(_) => {}
+        }
+        out
+    }
+}
+
+impl LlamaCppEngine {
+    fn generate_impl(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
         let load_ms = self.ensure_loaded()?;
         let enable_thinking = self.cfg.enable_thinking;
         let n_ctx = self.cfg.n_ctx;

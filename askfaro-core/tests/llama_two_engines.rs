@@ -75,3 +75,40 @@ fn two_engines_coexist_in_one_process() {
     b.warm().expect("engine B must re-warm after unload while A is still warm");
     one_turn(&mut b, "engine B (re-warmed)");
 }
+
+/// A failed generate must not poison the engine. The desktop's memory deriver
+/// found the real case: a Metal OOM aborted a decode, llama.cpp trimmed the
+/// sequence, and every later call failed position validation ("failed to
+/// initialize batch") until the process restarted. The engine now unloads on
+/// generation failure so the next call reloads clean.
+#[test]
+#[ignore = "requires real GGUF weights on FARO_TEST_GGUF"]
+fn engine_recovers_after_a_failed_generate() {
+    use askfaro_core::generation::GenError;
+
+    let path = std::env::var("FARO_TEST_GGUF").expect("set FARO_TEST_GGUF to a .gguf file");
+    let mut e = LlamaCppEngine::new(cfg(&path));
+
+    // cfg() builds a one-slot context, so slot 1 cannot be decoded; llama.cpp
+    // rejects the batch and generate returns an error.
+    let err = e
+        .generate(GenerateRequest {
+            system: "Answer with a single short word.".into(),
+            messages: vec![Msg {
+                role: "user".into(),
+                content: "Say OK.".into(),
+                ..Default::default()
+            }],
+            tools: vec![],
+            slot: 1,
+        })
+        .expect_err("slot 1 on a one-slot context must fail");
+    assert!(
+        !matches!(err, GenError::ContextWindowExceeded),
+        "expected a decode-level failure, got: {err}"
+    );
+    assert!(!e.is_warm(), "a failed generate must unload the engine");
+
+    // The very next call must work — reload happens lazily inside generate.
+    one_turn(&mut e, "engine (recovered)");
+}
