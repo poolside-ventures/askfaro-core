@@ -64,6 +64,43 @@ use crate::generation::{
 /// must never be mistaken for a brief one.
 const MAX_OUTPUT_TOKENS: usize = 2048;
 
+/// The process-wide llama.cpp backend, shared by every engine.
+///
+/// llama-cpp-2 guards `LlamaBackend::init()` with a process-global flag that
+/// only resets when the returned handle drops, so two engines that each owned
+/// a backend could never be loaded at the same time: whichever called
+/// `ensure_loaded` second failed with `BackendAlreadyInitialized`. That is not
+/// a theoretical race — Scope desktop runs a chat engine and a memory
+/// extraction engine in one process, and the extraction engine could never
+/// load while the chat brain was warm (and vice versa), which silently killed
+/// on-device memory derivation.
+///
+/// One backend initialized once and never freed is the shape llama.cpp itself
+/// documents (init once per process). Never freeing it is deliberate and
+/// safe: the ggml-metal exit assert that shaped [`Loaded`]'s drop order fires
+/// when the device is torn down while contexts still hold resource sets, and
+/// a backend that is never torn down cannot trip it. The handful of bytes of
+/// ggml global state lives for the process either way.
+///
+/// Initialization failures are NOT cached: if some other code in the process
+/// holds its own `LlamaBackend` (a host that predates this function), init
+/// fails now but succeeds after that holder drops, so the next call retries.
+fn shared_backend() -> Result<&'static LlamaBackend, GenError> {
+    use std::sync::{Mutex, OnceLock};
+    static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+    static INIT: Mutex<()> = Mutex::new(());
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let _g = INIT.lock().map_err(|e| GenError::Generate(e.to_string()))?;
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let b = LlamaBackend::init()
+        .map_err(|e| GenError::Generate(format!("llama backend init: {e}")))?;
+    Ok(BACKEND.get_or_init(|| b))
+}
+
 /// Configuration for [`LlamaCppEngine`].
 #[derive(Debug, Clone)]
 pub struct LlamaCppConfig {
@@ -197,12 +234,14 @@ pub struct LlamaCppEngine {
 /// The loaded engine.
 ///
 /// **Field order is load-bearing.** Rust drops fields in declaration order, and
-/// `ctx` borrows `model`, which borrows `backend`, so they must be declared in
-/// that order to be torn down in it. Getting this wrong is not a leak, it is a
-/// SIGABRT: ggml-metal asserts at exit that its resource sets were released
-/// (`GGML_ASSERT([rsets->data count] == 0)`), which in an app reads as a crash on
-/// quit. An earlier version leaked the model to dodge the self-reference and hit
-/// exactly that.
+/// `ctx` borrows `model`, so it must be declared (and torn down) first. Getting
+/// this wrong is not a leak, it is a SIGABRT: ggml-metal asserts at exit that
+/// its resource sets were released (`GGML_ASSERT([rsets->data count] == 0)`),
+/// which in an app reads as a crash on quit. An earlier version leaked the
+/// model to dodge the self-reference and hit exactly that.
+///
+/// The backend is NOT a field: it is the process-wide [`shared_backend`],
+/// which outlives every `Loaded` by construction.
 struct Loaded {
     /// The decoder: either a plain context, or an MTP speculative wrapper that
     /// OWNS the target context (and the drafter's).
@@ -228,9 +267,6 @@ struct Loaded {
     /// Boxed for a stable address that the context can borrow. Dropped after `dec`.
     #[allow(dead_code)]
     model: Box<LlamaModel>,
-    /// Dropped last; llama.cpp requires it to outlive the models.
-    #[allow(dead_code)]
-    backend: Box<LlamaBackend>,
 }
 
 /// Plain decode, or MTP speculative decode.
@@ -367,8 +403,7 @@ impl LlamaCppEngine {
     /// That is why this takes the target context and uses
     /// `new_context_with_ctx_other`, and why the target must exist first.
     fn load_drafter(
-        backend: &LlamaBackend,
-        backend_ref: &'static LlamaBackend,
+        backend: &'static LlamaBackend,
         ctx_params: LlamaContextParams,
         path: &Path,
         target: &LlamaContext<'_>,
@@ -383,7 +418,7 @@ impl LlamaCppEngine {
         // stable, and `Loaded` drops the context before the model.
         let dm_ref: &'static LlamaModel = unsafe { &*(&*dm as *const LlamaModel) };
         let ctx = dm_ref
-            .new_context_with_ctx_other(backend_ref, ctx_params, target)
+            .new_context_with_ctx_other(backend, ctx_params, target)
             .map_err(|e| GenError::Generate(e.to_string()))?;
         Ok((ctx, dm))
     }
@@ -393,10 +428,10 @@ impl LlamaCppEngine {
             return Ok(0);
         }
         let t = Instant::now();
-        let backend = Box::new(LlamaBackend::init().map_err(|e| GenError::Generate(e.to_string()))?);
+        let backend = shared_backend()?;
         let params = LlamaModelParams::default().with_n_gpu_layers(self.cfg.n_gpu_layers);
         let model = Box::new(
-            LlamaModel::load_from_file(&*backend, &self.cfg.model_path, &params).map_err(|e| {
+            LlamaModel::load_from_file(backend, &self.cfg.model_path, &params).map_err(|e| {
                 GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display()))
             })?,
         );
@@ -431,12 +466,12 @@ impl LlamaCppEngine {
             .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
             .with_n_batch(self.cfg.n_ctx)
             .with_n_seq_max(slots);
-        // SAFETY: `model` and `backend` are boxed, so their addresses are stable
-        // and outlive `ctx`; `Loaded` declares `ctx` first so it is dropped first.
+        // SAFETY: `model` is boxed, so its address is stable and outlives `ctx`;
+        // `Loaded` declares `ctx` first so it is dropped first. The backend is
+        // genuinely `'static` (shared_backend), no extension needed.
         let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
-        let backend_ref: &'static LlamaBackend = unsafe { &*(&*backend as *const LlamaBackend) };
         let ctx = model_ref
-            .new_context(backend_ref, ctx_params.clone())
+            .new_context(backend, ctx_params.clone())
             .map_err(|e| GenError::Generate(e.to_string()))?;
 
         // The drafter, when one is configured. Failing to load it is NOT fatal:
@@ -445,7 +480,7 @@ impl LlamaCppEngine {
         // answer because an 77 MB accessory is missing or mismatched.
         let (dec, draft_model) = match &self.cfg.draft_path {
             Some(p) if p.exists() => {
-                match Self::load_drafter(&*backend, backend_ref, ctx_params, p, &ctx) {
+                match Self::load_drafter(backend, ctx_params, p, &ctx) {
                     Ok((spec_ctx, dm)) => match MtpSpeculative::new(
                         ctx,
                         spec_ctx,
@@ -460,7 +495,7 @@ impl LlamaCppEngine {
                             // there is nothing to fall back WITH; rebuild one.
                             eprintln!("llama_cpp: MTP init failed ({e}); plain decode");
                             let c = model_ref
-                                .new_context(backend_ref, LlamaContextParams::default()
+                                .new_context(backend, LlamaContextParams::default()
                                     .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
                                     .with_n_batch(self.cfg.n_ctx)
                                     .with_n_seq_max(slots))
@@ -528,7 +563,6 @@ impl LlamaCppEngine {
             prefix,
             draft_model,
             model,
-            backend,
         });
         // Read once, here, while the template is fresh. `warn_unsupported`
         // consults it per turn and must never pay FFI for the privilege.
