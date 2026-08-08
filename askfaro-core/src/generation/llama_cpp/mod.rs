@@ -121,6 +121,24 @@ pub struct LlamaCppConfig {
     /// Total context window in tokens. A property of the MODEL, so the caller
     /// supplies it from its model profile; this crate does not decide it.
     pub n_ctx: u32,
+    /// Whether sliding-window-attention layers keep a FULL-size KV cache
+    /// (`true`, the default) or only their window (`false`).
+    ///
+    /// `false` is a large memory win on an SWA-heavy model — measured on
+    /// Gemma 4 E4B at a 16K window: 896 MiB per slot full-size against
+    /// 296 MiB windowed, identical prefill throughput — but it is NOT safe to
+    /// want by default, and the reason was found by the gated SWA test, not
+    /// predicted: a windowed cache cannot REWIND. Once decode has advanced
+    /// past the window, positions behind it are evicted, so ANY divergence
+    /// from the cached tokens — including the few-token render drift between
+    /// a replayed history and the raw generated tail, i.e. ordinary turn 2 —
+    /// forces a full re-prefill (the guard in `generate_impl` makes that slow
+    /// instead of silently degraded). llama-server pays the same price and
+    /// buys it back with context checkpoints (periodic PARTIAL_ONLY state
+    /// snapshots to roll back to); until this engine grows those, `false` is
+    /// only sound for workloads that never rewind, and the default stays
+    /// `true`.
+    pub swa_full: bool,
     /// Physical micro-batch: how many tokens one Metal kernel dispatch carries
     /// during prefill. `None` keeps llama.cpp's default (512).
     ///
@@ -173,6 +191,7 @@ impl Default for LlamaCppConfig {
             draft_path: None,
             draft_n_max: 3,
             n_ctx: 16384,
+            swa_full: true,
             n_ubatch: None,
             n_gpu_layers: 1000,
             enable_thinking: true,
@@ -476,7 +495,8 @@ impl LlamaCppEngine {
         let mut ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
             .with_n_batch(self.cfg.n_ctx)
-            .with_n_seq_max(slots);
+            .with_n_seq_max(slots)
+            .with_swa_full(self.cfg.swa_full);
         if let Some(ub) = self.cfg.n_ubatch.filter(|&ub| ub > 0) {
             ctx_params = ctx_params.with_n_ubatch(ub);
         }
@@ -511,7 +531,8 @@ impl LlamaCppEngine {
                             let mut p = LlamaContextParams::default()
                                 .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
                                 .with_n_batch(self.cfg.n_ctx)
-                                .with_n_seq_max(slots);
+                                .with_n_seq_max(slots)
+                                .with_swa_full(self.cfg.swa_full);
                             if let Some(ub) = self.cfg.n_ubatch.filter(|&ub| ub > 0) {
                                 p = p.with_n_ubatch(ub);
                             }
@@ -634,6 +655,12 @@ impl LlamaCppEngine {
         h.update(cfg.n_slots.to_le_bytes());
         h.update(cfg.n_gpu_layers.to_le_bytes());
         h.update([u8::from(cfg.enable_thinking)]);
+        // The SWA cache's SIZE is part of the persisted state's layout, so a
+        // state saved windowed must never be offered to a full-size context or
+        // vice versa; llama.cpp validates shape and would likely reject the
+        // mismatch, but "likely rejected" is not the contract this key exists
+        // to provide.
+        h.update([u8::from(cfg.swa_full)]);
         hex::encode(&h.finalize()[..8])
     }
 
@@ -1258,14 +1285,49 @@ impl LlamaCppEngine {
             .zip(tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
-        let reuse = common.min(tokens.len().saturating_sub(1));
+        let mut reuse = common.min(tokens.len().saturating_sub(1));
         let prior_len = prior.len();
         if reuse < prior_len {
-            loaded
-                .dec
-                .ctx()
-                .kv_cache_seq_rm(slot as i32, Some(reuse as u32), None)
-                .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
+            // A windowed SWA cache (`swa_full: false`) cannot REWIND: positions
+            // behind the window were evicted as decode advanced, so restarting
+            // from an earlier point leaves the SWA layers attending over holes.
+            // llama.cpp does not stop this — `seq_rm` succeeds and the output
+            // is silently degraded, not an error (found the hard way: a
+            // fallback written against seq_rm FAILING never fired, because it
+            // does not fail). The guard is llama-server's, minus the n_swa the
+            // safe bindings do not expose: `pos_min` is the oldest position
+            // still present, so `pos_min <= 0` means nothing was evicted and
+            // any trim point is sound; anything else forces a full re-prefill
+            // of this slot. Conservative on purpose — with a windowed cache
+            // even a 10-token rewind needs 10 EVICTED positions back, so
+            // mid-history divergence genuinely costs the whole prompt (this is
+            // exactly why upstream built context checkpoints; those are the
+            // refinement if divergence turns out to be common). Appended turns
+            // — the overwhelmingly common case — never trim and never pay
+            // this. With `swa_full: true`, pos_min stays 0 and nothing
+            // changes.
+            let evicted = loaded.dec.ctx().kv_cache_seq_pos_min(slot as i32) > 0;
+            if evicted {
+                eprintln!(
+                    "llama_cpp: slot {slot} diverges at token {reuse} but the SWA window has \
+                     moved past it; re-prefilling all {} tokens (slow, not wrong)",
+                    tokens.len(),
+                );
+                reuse = 0;
+            }
+            if reuse == 0 {
+                loaded
+                    .dec
+                    .ctx()
+                    .kv_cache_seq_rm(slot as i32, None, None)
+                    .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+            } else {
+                loaded
+                    .dec
+                    .ctx()
+                    .kv_cache_seq_rm(slot as i32, Some(reuse as u32), None)
+                    .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
+            }
         }
         let fresh = &tokens[reuse..];
 
@@ -1574,6 +1636,8 @@ mod tests {
             n_slots: 2,
             n_gpu_layers: 1000,
             enable_thinking: true,
+            // Non-default (default is true), like every other field here.
+            swa_full: false,
             prefix_cache_dir: Some(PathBuf::from("/cache")),
             state_key: "model-sha-aaa".into(),
             ..Default::default()
@@ -1613,6 +1677,11 @@ mod tests {
         let mut c = cfg();
         c.enable_thinking = false;
         assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "enable_thinking");
+
+        // The SWA cache's size is part of the saved state's layout.
+        let mut c = cfg();
+        c.swa_full = true;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "swa_full");
 
         // The drafter shares the target's KV memory, so attaching or removing
         // one changes what is in the cache.
