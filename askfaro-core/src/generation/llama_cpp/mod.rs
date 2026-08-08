@@ -52,6 +52,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 
 use crate::generation::{
@@ -63,6 +64,44 @@ use crate::generation::{
 /// Reported through [`Timings::truncated`] when hit, because a truncated answer
 /// must never be mistaken for a brief one.
 const MAX_OUTPUT_TOKENS: usize = 2048;
+
+/// How far before the prompt's end a windowed-SWA checkpoint is taken.
+///
+/// The next turn's divergence from this turn's cache lands almost entirely in
+/// the TAIL: the region where a replayed history renders the last exchange
+/// differently than the raw generated text did (measured drift: ~15-20 tokens
+/// before the prompt end). A checkpoint taken this far back covers it, so the
+/// next turn restores and re-prefills tens of tokens instead of thousands.
+/// History further back is a template render of the same messages both times
+/// and does not drift.
+const SWA_CHECKPOINT_TAIL_MARGIN: usize = 64;
+
+/// Physical micro-batch for the DRAFTER's context. Its compute buffer scales
+/// with this (~1 MiB per token of ubatch on E4B), and the drafter needs large
+/// batches for nothing: verified by the gated MTP tests and the production
+/// bench holding their acceptance rate with this at 128 (517 -> 145 MiB).
+const DRAFT_N_UBATCH: u32 = 128;
+
+/// Checkpoints kept per slot: the current turn's and the previous one's.
+/// Each costs host RAM proportional to the SWA window's occupied cells (a few
+/// tens of MB at a 16K window on E4B), which is exactly the memory this
+/// feature exists to NOT spend on the GPU, so the ring stays small.
+const SWA_CHECKPOINTS_PER_SLOT: usize = 2;
+
+/// A windowed-SWA rollback point: the sequence's PARTIAL (SWA-cache-only)
+/// state at a known token boundary, plus the tokens it stands for.
+///
+/// The base (full-attention) cache needs no snapshot — it never evicts, so
+/// rewinding it is an ordinary trim. What is unrecoverable under
+/// `swa_full: false` is the sliding window's contents at an earlier position;
+/// this is that window, captured while it was live. The token list is the
+/// validity proof: a checkpoint may be restored only into a prompt that
+/// starts with exactly these tokens, the same continue-only contract the
+/// persisted disk prefix uses.
+struct SwaCheckpoint {
+    tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    state: SeqState,
+}
 
 /// The process-wide llama.cpp backend, shared by every engine.
 ///
@@ -122,22 +161,24 @@ pub struct LlamaCppConfig {
     /// supplies it from its model profile; this crate does not decide it.
     pub n_ctx: u32,
     /// Whether sliding-window-attention layers keep a FULL-size KV cache
-    /// (`true`, the default) or only their window (`false`).
+    /// (`true`) or only their window (`false`, the default).
     ///
-    /// `false` is a large memory win on an SWA-heavy model — measured on
-    /// Gemma 4 E4B at a 16K window: 896 MiB per slot full-size against
-    /// 296 MiB windowed, identical prefill throughput — but it is NOT safe to
-    /// want by default, and the reason was found by the gated SWA test, not
-    /// predicted: a windowed cache cannot REWIND. Once decode has advanced
-    /// past the window, positions behind it are evicted, so ANY divergence
-    /// from the cached tokens — including the few-token render drift between
-    /// a replayed history and the raw generated tail, i.e. ordinary turn 2 —
-    /// forces a full re-prefill (the guard in `generate_impl` makes that slow
-    /// instead of silently degraded). llama-server pays the same price and
-    /// buys it back with context checkpoints (periodic PARTIAL_ONLY state
-    /// snapshots to roll back to); until this engine grows those, `false` is
-    /// only sound for workloads that never rewind, and the default stays
-    /// `true`.
+    /// `false` is the memory that pays for everything else: measured on
+    /// Gemma 4 E4B at a 16K window, 896 MiB per slot full-size against
+    /// 296 MiB windowed, identical prefill throughput. What makes it safe to
+    /// DEFAULT to is the checkpoint machinery in `generate_impl`: a windowed
+    /// cache cannot rewind (positions behind the window are evicted, llama.cpp
+    /// permits the trim anyway, and the output silently degrades — and
+    /// ordinary turn 2 already rewinds, by the few-token render drift between
+    /// a replayed history and the raw generated tail), so the engine snapshots
+    /// the window near each prompt's tail (PARTIAL_ONLY state, host RAM) and
+    /// restores the newest covering snapshot when a turn rewinds. Divergence
+    /// deeper than every checkpoint degrades to a full re-prefill: slow,
+    /// never wrong, never an unload. This is llama-server's own answer
+    /// (context checkpoints) built into the engine.
+    ///
+    /// `true` buys free arbitrary rewinds at the full KV price, and turns the
+    /// checkpoint machinery off; the guard stays inert (`pos_min` never moves).
     pub swa_full: bool,
     /// Physical micro-batch: how many tokens one Metal kernel dispatch carries
     /// during prefill. `None` keeps llama.cpp's default (512).
@@ -191,7 +232,7 @@ impl Default for LlamaCppConfig {
             draft_path: None,
             draft_n_max: 3,
             n_ctx: 16384,
-            swa_full: true,
+            swa_full: false,
             n_ubatch: None,
             n_gpu_layers: 1000,
             enable_thinking: true,
@@ -290,6 +331,11 @@ struct Loaded {
     cached: std::collections::HashMap<u32, Vec<llama_cpp_2::token::LlamaToken>>,
     /// Whether slot 0's cache came off disk, and whether that has been checked.
     prefix: PrefixState,
+    /// Per-slot windowed-SWA rollback points, newest first. Empty rings when
+    /// `swa_full` is true (nothing to roll back — the full cache rewinds for
+    /// free). Dropped with the engine, which is correct: a checkpoint is only
+    /// valid against the llama.cpp state that produced it.
+    checkpoints: std::collections::HashMap<u32, std::collections::VecDeque<SwaCheckpoint>>,
     /// Boxed for a stable address the drafter's context borrows. Dropped after
     /// `dec`, which holds that context.
     #[allow(dead_code)]
@@ -444,6 +490,16 @@ impl LlamaCppEngine {
             LlamaModel::load_from_file(backend, path, &params)
                 .map_err(|e| GenError::Generate(format!("load drafter {}: {e}", path.display())))?,
         );
+        // The drafter's SCRATCH buffer, not the target's: compute-buffer size
+        // scales linearly with n_ubatch (measured 522/261/145 MiB at
+        // 512/256/128), and inheriting the target's 512 gave a 77 MB drafter a
+        // 517 MiB scratch allocation. The drafter's own work is drafting ≤
+        // draft_n_max tokens per step; the only large batches it sees are the
+        // target's prefill chunks passing through `spec.process`, which a
+        // smaller ubatch merely splits — the drafter's forward pass is so
+        // cheap that the extra dispatches are noise. n_batch stays the
+        // target's, so no batch is ever rejected as too large.
+        let ctx_params = ctx_params.with_n_ubatch(DRAFT_N_UBATCH);
         // SAFETY: identical to the target model above -- boxed, so its address is
         // stable, and `Loaded` drops the context before the model.
         let dm_ref: &'static LlamaModel = unsafe { &*(&*dm as *const LlamaModel) };
@@ -600,6 +656,7 @@ impl LlamaCppEngine {
             dec,
             cached,
             prefix,
+            checkpoints: Default::default(),
             draft_model,
             model,
         });
@@ -1308,12 +1365,47 @@ impl LlamaCppEngine {
             // changes.
             let evicted = loaded.dec.ctx().kv_cache_seq_pos_min(slot as i32) > 0;
             if evicted {
-                eprintln!(
-                    "llama_cpp: slot {slot} diverges at token {reuse} but the SWA window has \
-                     moved past it; re-prefilling all {} tokens (slow, not wrong)",
-                    tokens.len(),
-                );
-                reuse = 0;
+                // The way back: a checkpoint at or before the divergence whose
+                // tokens this prompt still starts with. Newest first, because
+                // the newest covering checkpoint minimizes the re-prefill.
+                let ckpt = loaded.checkpoints.get(&slot).and_then(|ring| {
+                    ring.iter()
+                        .find(|c| c.tokens.len() <= reuse && tokens.starts_with(&c.tokens))
+                });
+                if let Some(c) = ckpt {
+                    let n = c.tokens.len();
+                    // Rewind to the checkpoint boundary — plain and valid for
+                    // the full-size base cache; whatever it leaves in the SWA
+                    // cache does not matter, because the restore clears the
+                    // sequence there before inserting (state_read_meta begins
+                    // with seq_rm on the destination).
+                    loaded
+                        .dec
+                        .ctx()
+                        .kv_cache_seq_rm(slot as i32, Some(n as u32), None)
+                        .map_err(|e| GenError::Generate(format!("kv rewind to checkpoint: {e}")))?;
+                    loaded
+                        .dec
+                        .ctx()
+                        .state_seq_set(&c.state, slot as i32)
+                        .map_err(|e| GenError::Generate(format!("checkpoint restore: {e}")))?;
+                    eprintln!(
+                        "llama_cpp: slot {slot} diverges at token {reuse}, behind the SWA \
+                         window; restored the {n}-token checkpoint, re-prefilling {} instead \
+                         of {} tokens",
+                        tokens.len() - n,
+                        tokens.len(),
+                    );
+                    reuse = n;
+                } else {
+                    eprintln!(
+                        "llama_cpp: slot {slot} diverges at token {reuse} but the SWA window \
+                         has moved past it and no checkpoint covers it; re-prefilling all {} \
+                         tokens (slow, not wrong)",
+                        tokens.len(),
+                    );
+                    reuse = 0;
+                }
             }
             if reuse == 0 {
                 loaded
@@ -1321,7 +1413,7 @@ impl LlamaCppEngine {
                     .ctx()
                     .kv_cache_seq_rm(slot as i32, None, None)
                     .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
-            } else {
+            } else if reuse < prior_len && !evicted {
                 loaded
                     .dec
                     .ctx()
@@ -1329,8 +1421,6 @@ impl LlamaCppEngine {
                     .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
             }
         }
-        let fresh = &tokens[reuse..];
-
         // The speculative path needs the whole prompt announced up front, before
         // any decode, so the drafter's own context is primed from the same text.
         if speculative {
@@ -1340,15 +1430,84 @@ impl LlamaCppEngine {
             }
         }
 
+        let t_prefill = Instant::now();
+
+        // --- windowed-SWA checkpoint ------------------------------------------
+        // Taken DURING this turn's prefill, near the prompt's tail, because
+        // that is where the next turn's divergence lands: the replayed history
+        // re-renders the last exchange a few tokens differently than the raw
+        // generated text (measured ~15-20 tokens of drift), while everything
+        // earlier is the same template render both times. The prefill is split
+        // at the capture point; the snapshot sees a window that is complete by
+        // construction, since decode reached it contiguously. Cost: one
+        // PARTIAL_ONLY state copy to host RAM per turn, and it is what turns
+        // the rewind guard's full re-prefill into a tail re-prefill.
+        let cap_pos: Option<usize> = if !self.cfg.swa_full
+            && tokens.len() > SWA_CHECKPOINT_TAIL_MARGIN
+        {
+            let p = reuse.max(tokens.len() - SWA_CHECKPOINT_TAIL_MARGIN);
+            let dup = loaded
+                .checkpoints
+                .get(&slot)
+                .is_some_and(|r| r.iter().any(|c| c.tokens.len() == p && tokens.starts_with(&c.tokens)));
+            (!dup && p < tokens.len()).then_some(p)
+        } else {
+            None
+        };
+
+        if let Some(cap) = cap_pos {
+            // Decode up to the capture point first (no-op when the reuse
+            // boundary already IS the capture point, i.e. an appended turn
+            // whose fresh tail is shorter than the margin).
+            if cap > reuse {
+                let head = &tokens[reuse..cap];
+                let mut b = LlamaBatch::new(head.len().max(512), 1);
+                let last = head.len() - 1;
+                for (i, t) in head.iter().enumerate() {
+                    b.add(*t, (reuse + i) as i32, &[slot as i32], i == last)
+                        .map_err(|e| GenError::Generate(e.to_string()))?;
+                }
+                loaded
+                    .dec
+                    .ctx()
+                    .decode(&mut b)
+                    .map_err(|e| GenError::Generate(e.to_string()))?;
+                if speculative {
+                    if let Decoder::Mtp(spec) = &mut loaded.dec {
+                        spec.process(&b)
+                            .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+                    }
+                }
+            }
+            // Best-effort: a turn without a checkpoint is a turn that may pay
+            // a full re-prefill later, not a wrong turn.
+            match loaded
+                .dec
+                .ctx()
+                .state_seq_get(slot as i32, LlamaStateSeqFlags::PARTIAL_ONLY)
+            {
+                Ok(state) => {
+                    let ring = loaded.checkpoints.entry(slot).or_default();
+                    ring.push_front(SwaCheckpoint {
+                        tokens: tokens[..cap].to_vec(),
+                        state,
+                    });
+                    ring.truncate(SWA_CHECKPOINTS_PER_SLOT);
+                }
+                Err(e) => eprintln!("llama_cpp: checkpoint capture failed on slot {slot} ({e})"),
+            }
+        }
+
+        let tail_start = cap_pos.map_or(reuse, |c| c.max(reuse));
+        let fresh = &tokens[tail_start..];
         let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
         let last = fresh.len() - 1;
         for (i, t) in fresh.iter().enumerate() {
             batch
-                .add(*t, (reuse + i) as i32, &[slot as i32], i == last)
+                .add(*t, (tail_start + i) as i32, &[slot as i32], i == last)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
         }
 
-        let t_prefill = Instant::now();
         loaded
             .dec
             .ctx()
@@ -1636,8 +1795,8 @@ mod tests {
             n_slots: 2,
             n_gpu_layers: 1000,
             enable_thinking: true,
-            // Non-default (default is true), like every other field here.
-            swa_full: false,
+            // Non-default (default is false), like every other field here.
+            swa_full: true,
             prefix_cache_dir: Some(PathBuf::from("/cache")),
             state_key: "model-sha-aaa".into(),
             ..Default::default()
@@ -1680,7 +1839,7 @@ mod tests {
 
         // The SWA cache's size is part of the saved state's layout.
         let mut c = cfg();
-        c.swa_full = true;
+        c.swa_full = false;
         assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "swa_full");
 
         // The drafter shares the target's KV memory, so attaching or removing

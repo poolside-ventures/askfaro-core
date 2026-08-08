@@ -1,16 +1,15 @@
-//! Windowed SWA cache (`swa_full: false`, OPT-IN): the 600 MiB-per-slot
-//! memory lever, and the semantics that keep it from being the default.
+//! Windowed SWA cache (`swa_full: false`, now the DEFAULT): the 600 MiB-per-
+//! slot memory win, held together by checkpoints.
 //!
-//! A windowed cache cannot REWIND. Once decode advances past the window,
-//! positions behind it are evicted, and llama.cpp does not stop a trim that
-//! rewinds past them — `seq_rm` succeeds and the output is silently degraded.
-//! The engine's guard (`pos_min > 0` at a trim) turns that into a full
-//! re-prefill: slow, never wrong, never an unload. The first version of this
-//! test expected the guard to fire only on DEEP divergence; running it showed
-//! it fires on ordinary turn 2 as well, because a replayed history renders a
-//! few tokens differently than the raw generated tail. That finding is why
-//! `swa_full` defaults to true and why flipping it waits for checkpoint
-//! support (upstream's own answer to the same problem).
+//! A windowed cache cannot REWIND: positions behind the window are evicted,
+//! llama.cpp permits the trim anyway, and the output silently degrades. An
+//! earlier version of this suite proved that ordinary turn 2 already rewinds
+//! (replayed history renders a few tokens differently than the raw generated
+//! tail), which made windowed mode unshippable on its own: every turn paid a
+//! full re-prefill. The engine now does what llama-server does — snapshots
+//! the window near each prompt's tail and restores the newest covering
+//! snapshot on a rewind — so turn 2 is cheap again, and only divergence
+//! deeper than every checkpoint degrades to the full re-prefill.
 //!
 //! Ignored by default (needs real GGUF weights). Run with:
 //!
@@ -59,14 +58,13 @@ fn ask(e: &mut LlamaCppEngine, history: Vec<Msg>) -> GenerateResponse {
     .expect("generate")
 }
 
-/// Histories LONGER than the window: every later turn that diverges at all
-/// (and replayed turns do, by a few render tokens) must degrade to a full
-/// re-prefill — correct output, warm engine, no error. This is the guard
-/// working, and also the measured reason `swa_full: false` is not the
-/// default.
+/// Histories LONGER than the window. Turn 2's replay drift rewinds; the
+/// checkpoint taken near turn 1's tail must absorb it (cheap turn). Total
+/// divergence has no covering checkpoint and must degrade to a full
+/// re-prefill on a warm engine — and the checkpoint ring must re-arm after.
 #[test]
 #[ignore = "requires real GGUF weights on FARO_TEST_GGUF"]
-fn beyond_the_window_divergence_costs_a_full_prefill_never_an_error() {
+fn checkpoints_absorb_replay_drift_and_deep_divergence_degrades_cleanly() {
     let mut e = engine();
     let long_a = filler("alpha", 60);
 
@@ -74,18 +72,25 @@ fn beyond_the_window_divergence_costs_a_full_prefill_never_an_error() {
     let r1 = ask(&mut e, t1.clone());
     assert!(!r1.text.trim().is_empty());
 
-    // Turn 2: replayed history. Under a windowed cache the render drift at
-    // the tail forces a full re-prefill (asserted as: it completes and the
-    // answer is sane; cheapness is exactly what windowed SWA cannot offer
-    // here, and pretending otherwise is how silent quality bugs ship).
+    // Turn 2: replayed history. The tail render drifts (a rewind), and the
+    // checkpoint near turn 1's tail must make it CHEAP — this exact turn
+    // paying a full re-prefill is what kept windowed SWA unshippable before
+    // checkpoints existed.
     let mut t2 = t1.clone();
     t2.push(Msg::assistant(r1.text.clone()));
     t2.push(Msg::user("Say OK again."));
     let r2 = ask(&mut e, t2);
-    assert!(!r2.text.trim().is_empty(), "post-eviction divergence must not fail the turn");
+    assert!(!r2.text.trim().is_empty());
+    assert!(
+        r2.timings.prefill_ms < r1.timings.prefill_ms / 2,
+        "the checkpoint must absorb turn 2's replay drift \
+         (turn1 {}ms, turn2 {}ms)",
+        r1.timings.prefill_ms,
+        r2.timings.prefill_ms,
+    );
 
-    // Turn 3: total divergence, far behind the window. Full prompt, full
-    // re-prefill, engine stays warm.
+    // Turn 3: total divergence — no checkpoint can cover a different
+    // conversation. Full prompt, full re-prefill, engine stays warm.
     let long_b = filler("omega", 60);
     let r3 = ask(&mut e, vec![Msg::user(format!("{long_b}\n\nSay OK."))]);
     assert!(!r3.text.trim().is_empty());
@@ -96,7 +101,26 @@ fn beyond_the_window_divergence_costs_a_full_prefill_never_an_error() {
         r1.timings.prefill_ms,
         r3.timings.prefill_ms,
     );
-    assert!(e.is_warm(), "the guard must never unload the engine");
+    assert!(e.is_warm(), "the fallback must never unload the engine");
+
+    // Turn 4: replay of the NEW conversation. The full re-prefill above must
+    // have re-armed the ring, so this drift-rewind is cheap again.
+    let r4 = ask(
+        &mut e,
+        vec![
+            Msg::user(format!("{long_b}\n\nSay OK.")),
+            Msg::assistant(r3.text.clone()),
+            Msg::user("Once more."),
+        ],
+    );
+    assert!(!r4.text.trim().is_empty());
+    assert!(
+        r4.timings.prefill_ms < r3.timings.prefill_ms / 2,
+        "checkpoints must re-arm after a full re-prefill \
+         (turn3 {}ms, turn4 {}ms)",
+        r3.timings.prefill_ms,
+        r4.timings.prefill_ms,
+    );
 }
 
 /// Histories SHORTER than the window: nothing has been evicted (`pos_min`
