@@ -77,6 +77,14 @@ const MAX_OUTPUT_TOKENS: usize = 2048;
 /// whatever half-written thought it interrupts.
 const REASONING_BUDGET_WRAPUP: &str = "\nOkay, I have to stop thinking now and answer with what I have.\n";
 
+/// How many tokens the persisted prefix stops SHORT of the true stable
+/// point, so it ends inside the tool block rather than on the template's
+/// post-tools glue. See `stable_prefix` for why this decides whether a
+/// registry append can extend the old state or must recompute ~35s of
+/// prefill. Sized to comfortably cover the glue (~5-15 tokens on Gemma 4)
+/// across template families.
+const KV_PREFIX_GLUE_MARGIN: usize = 48;
+
 /// How far before the prompt's end a windowed-SWA checkpoint is taken.
 ///
 /// The next turn's divergence from this turn's cache lands almost entirely in
@@ -782,6 +790,17 @@ impl LlamaCppEngine {
                     .into(),
             ));
         }
+        // Held back from the true common point by a margin, so the PERSISTED
+        // prefix ends inside the stable tool block instead of on the
+        // template's post-tools glue (the user-turn opener). The glue sits
+        // exactly where the next appended tool begins, so a prefix saved
+        // through it can never be a strict prefix of the prompt after a
+        // registry APPEND, and build_prefix's restore-and-extend could never
+        // fire; measured, that turned an ~800-token update into a ~35s full
+        // recompute. The margin costs one prefill of these tokens per restore
+        // (~0.2s) and buys extendability for the commonest prompt change
+        // there is.
+        let n = n.saturating_sub(KV_PREFIX_GLUE_MARGIN).max(1);
         Ok(a[..n].to_vec())
     }
 
@@ -846,11 +865,50 @@ impl LlamaCppEngine {
             .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
         loaded.cached.remove(&0);
 
-        let mut batch = LlamaBatch::new(prefix.len().max(512), 1);
-        let last = prefix.len() - 1;
-        for (i, tok) in prefix.iter().enumerate() {
+        // Restore-and-extend: when the SUPERSEDED state file holds a strict
+        // prefix of the new prefix, restore it and prefill only the tail.
+        // This is the common shape of a prompt update: tools are APPENDED to
+        // the registry, the head (system text, existing tools) is untouched,
+        // and recomputing it from scratch costs ~35s of prefill at this
+        // model's measured ~290 tok/s ceiling for ~800 tokens of actual
+        // change. Head-of-prompt edits fail the starts_with check and pay the
+        // full rebuild they genuinely need. The restore lands in a sequence
+        // just cleared above, and extending a restored windowed-SWA state
+        // forward is an ordinary contiguous continuation; what a windowed
+        // state cannot do is REWIND, which this never does.
+        let mut start = 0usize;
+        if path.exists() {
+            match loaded.dec.ctx().state_seq_load_file(&path, 0, self.cfg.n_ctx as usize) {
+                Ok((toks, _)) if !toks.is_empty() && prefix.len() > toks.len()
+                    && prefix[..toks.len()] == toks[..] =>
+                {
+                    eprintln!(
+                        "llama_cpp: the superseded prefix ({} tokens) is a prefix of the new \
+                         one ({}); extending it instead of recomputing",
+                        toks.len(),
+                        prefix.len(),
+                    );
+                    start = toks.len();
+                }
+                Ok(_) => {
+                    // Restored but not a strict prefix: drop it whole and
+                    // rebuild from scratch. Never trim a windowed state.
+                    loaded
+                        .dec
+                        .ctx()
+                        .kv_cache_seq_rm(0, None, None)
+                        .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+                }
+                Err(_) => {}
+            }
+        }
+
+        let fresh = &prefix[start..];
+        let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
+        let last = fresh.len() - 1;
+        for (i, tok) in fresh.iter().enumerate() {
             batch
-                .add(*tok, i as i32, &[0], i == last)
+                .add(*tok, (start + i) as i32, &[0], i == last)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
         }
         // Mirrors a real turn's prefill exactly, drafter bookkeeping included.
