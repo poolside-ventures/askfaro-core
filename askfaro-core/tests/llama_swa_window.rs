@@ -123,6 +123,79 @@ fn checkpoints_absorb_replay_drift_and_deep_divergence_degrades_cleanly() {
     );
 }
 
+/// Background one-shots on a non-zero slot: every job REPLACES the whole
+/// prompt after a shared instruction head, so no tail checkpoint ever covers
+/// the next job and, before the pinned head existed, every job re-prefilled
+/// everything (the observed backlog-drain pathology: dozens of
+/// "re-prefilling all N tokens" lines, all diverging at the shared head).
+///
+/// The engine learns the head from the first observed divergence and pins a
+/// checkpoint there; from the third job on, only the job's unique content is
+/// prefilled.
+#[test]
+#[ignore = "requires real GGUF weights on FARO_TEST_GGUF"]
+fn pinned_head_absorbs_oneshot_divergence_on_background_slot() {
+    let path = std::env::var("FARO_TEST_GGUF").expect("set FARO_TEST_GGUF to a .gguf file");
+    let mut e = LlamaCppEngine::new(LlamaCppConfig {
+        model_path: path.into(),
+        draft_path: std::env::var("FARO_TEST_DRAFT_GGUF").ok().map(Into::into),
+        n_ctx: 4096,
+        n_slots: 2,
+        enable_thinking: false,
+        swa_full: false,
+        ..Default::default()
+    });
+    // A shared head long enough to slide the SWA window (so divergence past
+    // it is unrecoverable without the pin), and unique tails LONGER than the
+    // ring's tail margin: each job's ring checkpoint then sits inside the
+    // previous job's unique content, where it can never cover the next job,
+    // which is exactly the real workload's shape (100-2,800-token unique
+    // email bodies). A short tail would let the ring checkpoint land inside
+    // the shared head and mask the pinned path entirely.
+    let head = filler("shared-instructions", 60);
+    let job = |unique_tag: &str| GenerateRequest {
+        system: head.clone(),
+        messages: vec![Msg::user(format!("{}\n\nSay OK.", filler(unique_tag, 8)))],
+        enable_thinking: Some(false),
+        slot: 1,
+        ..Default::default()
+    };
+
+    // Job 1: cold, full prefill; nothing known about the head yet.
+    let r1 = e.generate(job("first-invoice")).expect("job 1");
+    assert!(!r1.text.trim().is_empty());
+
+    // Job 2: diverges at the head with no covering checkpoint, so it pays the
+    // full re-prefill, and is the divergence the head is LEARNED from.
+    let r2 = e.generate(job("second-review")).expect("job 2");
+    assert!(!r2.text.trim().is_empty());
+
+    // Job 3 on: the pinned head must absorb the divergence.
+    let r3 = e.generate(job("third-migration")).expect("job 3");
+    assert!(!r3.text.trim().is_empty());
+    assert!(
+        r3.timings.prefill_ms < r2.timings.prefill_ms / 2,
+        "the pinned head must absorb one-shot divergence from job 3 on \
+         (job2 {}ms, job3 {}ms)",
+        r2.timings.prefill_ms,
+        r3.timings.prefill_ms,
+    );
+
+    // And it keeps holding, job after job (the backlog-drain shape).
+    let r4 = e.generate(job("fourth-offsite")).expect("job 4");
+    assert!(!r4.text.trim().is_empty());
+    assert!(
+        r4.timings.prefill_ms < r2.timings.prefill_ms / 2,
+        "the pinned head must keep absorbing (job2 {}ms, job4 {}ms)",
+        r2.timings.prefill_ms,
+        r4.timings.prefill_ms,
+    );
+
+    // Slot 0's machinery must be untouched by slot 1's pin.
+    let r5 = ask(&mut e, vec![Msg::user("Say OK.".to_string())]);
+    assert!(!r5.text.trim().is_empty());
+}
+
 /// Histories SHORTER than the window: nothing has been evicted (`pos_min`
 /// still 0), so the windowed cache behaves exactly like the full one —
 /// appended turns reuse the prefix and stay cheap. This is the case that

@@ -108,6 +108,25 @@ const DRAFT_N_UBATCH: u32 = 128;
 /// feature exists to NOT spend on the GPU, so the ring stays small.
 const SWA_CHECKPOINTS_PER_SLOT: usize = 2;
 
+/// Smallest shared prompt head worth PINNING on a background slot.
+///
+/// The pinned-head machinery learns the shared instruction head as the
+/// smallest common prefix observed between consecutive prompts on the slot.
+/// Two unrelated prompts still share the template's opening tokens (a
+/// handful), and pinning those would spend a state copy to save nothing
+/// while evicting a pin that was earning its keep for the majority prompt
+/// family. Below this floor a divergence is treated as "unrelated prompt",
+/// not as new evidence about the head.
+const PINNED_HEAD_MIN_TOKENS: usize = 64;
+
+/// How long a throttled engine log stays quiet between emissions.
+///
+/// The rewind guard's per-occurrence lines are diagnostic at one occurrence
+/// and noise at backlog-drain volume (dozens of background one-shots in a
+/// row each printing "re-prefilling all N tokens"). One line per window,
+/// carrying the count of what it suppressed, keeps the signal.
+const LOG_THROTTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A windowed-SWA rollback point: the sequence's PARTIAL (SWA-cache-only)
 /// state at a known token boundary, plus the tokens it stands for.
 ///
@@ -121,6 +140,44 @@ const SWA_CHECKPOINTS_PER_SLOT: usize = 2;
 struct SwaCheckpoint {
     tokens: Vec<llama_cpp_2::token::LlamaToken>,
     state: SeqState,
+}
+
+/// First occurrence prints verbatim; repeats inside [`LOG_THROTTLE_WINDOW`]
+/// are counted instead of printed, and the next occurrence after the window
+/// prints again with the suppressed count attached.
+struct LogThrottle {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl LogThrottle {
+    const fn new() -> Self {
+        Self { last: None, suppressed: 0 }
+    }
+
+    /// `Some(n)` means print now, mentioning the `n` occurrences swallowed
+    /// since the last print; `None` means stay quiet.
+    fn permit(&mut self) -> Option<u64> {
+        match self.last {
+            Some(t) if t.elapsed() < LOG_THROTTLE_WINDOW => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.last = Some(Instant::now());
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
+/// Renders a [`LogThrottle::permit`] count for appending to a log line.
+fn suppressed_note(n: u64) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(" ({n} similar occurrences suppressed in the last minute)")
+    }
 }
 
 /// The process-wide llama.cpp backend, shared by every engine.
@@ -320,6 +377,19 @@ pub struct LlamaCppEngine {
     /// Capability complaints already printed, so each is said once per engine
     /// rather than once per turn.
     warned: std::collections::HashSet<String>,
+    /// Per-slot LEARNED length of the shared prompt head, in tokens: the
+    /// smallest common prefix observed between consecutive prompts on the
+    /// slot (ignoring sub-[`PINNED_HEAD_MIN_TOKENS`] overlaps as unrelated).
+    /// Lives on the engine, not on [`Loaded`]: the length survives an
+    /// unload/reload so the first prefill after a warm-up can re-pin
+    /// immediately instead of re-learning from a fresh divergence. Only ever
+    /// shrinks, which is safe: a pin shorter than the true head restores
+    /// less but is never wrong.
+    head_len: std::collections::HashMap<u32, usize>,
+    /// Throttles for the rewind guard's per-occurrence lines, which flood at
+    /// backlog-drain volume (one line per background job).
+    log_full_reprefill: LogThrottle,
+    log_pinned_restore: LogThrottle,
 }
 
 /// The loaded engine.
@@ -356,6 +426,21 @@ struct Loaded {
     /// free). Dropped with the engine, which is correct: a checkpoint is only
     /// valid against the llama.cpp state that produced it.
     checkpoints: std::collections::HashMap<u32, std::collections::VecDeque<SwaCheckpoint>>,
+    /// One PINNED checkpoint per non-zero slot: the slot's prompts' shared
+    /// instruction head, never evicted by the per-turn ring.
+    ///
+    /// The ring hugs each prompt's TAIL, which serves a conversation (the
+    /// next prompt extends this one) and is useless for a background slot's
+    /// one-shots: every job replaces the whole prompt, so no tail checkpoint
+    /// is ever a prefix of the next job and each job re-prefilled everything
+    /// (measured: dozens of 500-3,200-token full re-prefills in one backlog
+    /// drain, all diverging at the ~390-token shared head). What one-shots DO
+    /// share is that head, so the slot keeps exactly one checkpoint there,
+    /// the analogue of slot 0's persisted disk prefix, in host RAM because
+    /// background prompts are assembled by the host per call and have no
+    /// stable identity worth a file. Slot 0 never pins; the disk prefix
+    /// already covers it.
+    pinned_heads: std::collections::HashMap<u32, SwaCheckpoint>,
     /// Boxed for a stable address the drafter's context borrows. Dropped after
     /// `dec`, which holds that context.
     #[allow(dead_code)]
@@ -415,7 +500,16 @@ impl LlamaCppEngine {
     /// Cheap to construct; loads nothing. Check
     /// [`availability`](GenerationEngine::availability) first.
     pub fn new(cfg: LlamaCppConfig) -> Self {
-        Self { cfg, loaded: None, chat: None, caps: None, warned: Default::default() }
+        Self {
+            cfg,
+            loaded: None,
+            chat: None,
+            caps: None,
+            warned: Default::default(),
+            head_len: Default::default(),
+            log_full_reprefill: LogThrottle::new(),
+            log_pinned_restore: LogThrottle::new(),
+        }
     }
 
     /// True once the weights are resident.
@@ -677,6 +771,7 @@ impl LlamaCppEngine {
             cached,
             prefix,
             checkpoints: Default::default(),
+            pinned_heads: Default::default(),
             draft_model,
             model,
         });
@@ -1542,6 +1637,20 @@ impl LlamaCppEngine {
         let mut reuse = common.min(tokens.len().saturating_sub(1));
         let prior_len = prior.len();
         if reuse < prior_len {
+            // A real divergence between two prompts on a background slot is
+            // evidence about the slot's SHARED HEAD: everything before the
+            // divergence point was rendered identically by two independent
+            // jobs. The smallest such prefix observed is where the pinned
+            // checkpoint belongs; smaller can only under-restore, never
+            // corrupt. Overlaps below the floor are two unrelated prompts
+            // agreeing on template boilerplate, not head evidence; counting
+            // them would shrink the pin to nothing.
+            if slot != 0 && !self.cfg.swa_full && common >= PINNED_HEAD_MIN_TOKENS {
+                self.head_len
+                    .entry(slot)
+                    .and_modify(|h| *h = (*h).min(common))
+                    .or_insert(common);
+            }
             // A windowed SWA cache (`swa_full: false`) cannot REWIND: positions
             // behind the window were evicted as decode advanced, so restarting
             // from an earlier point leaves the SWA layers attending over holes.
@@ -1565,9 +1674,26 @@ impl LlamaCppEngine {
                 // The way back: a checkpoint at or before the divergence whose
                 // tokens this prompt still starts with. Newest first, because
                 // the newest covering checkpoint minimizes the re-prefill.
-                let ckpt = loaded.checkpoints.get(&slot).and_then(|ring| {
+                let ring_hit = loaded.checkpoints.get(&slot).and_then(|ring| {
                     ring.iter()
                         .find(|c| c.tokens.len() <= reuse && tokens.starts_with(&c.tokens))
+                });
+                // The ring first (its checkpoints sit deeper when they cover
+                // at all), then the slot's pinned head. Same validity
+                // contract for both: the prompt must start with exactly the
+                // checkpoint's tokens, AND the divergence must lie at or past
+                // its boundary, because the trim below keeps the base cache's cells
+                // up to `n`, which only match this prompt within the common
+                // prefix. For a background slot's one-shots the ring never
+                // covers (each job replaces the whole prompt) and the pinned
+                // head is the difference between re-prefilling the job's
+                // unique content and re-prefilling everything.
+                let pinned = ring_hit.is_none();
+                let ckpt = ring_hit.or_else(|| {
+                    loaded
+                        .pinned_heads
+                        .get(&slot)
+                        .filter(|c| c.tokens.len() <= reuse && tokens.starts_with(&c.tokens))
                 });
                 if let Some(c) = ckpt {
                     let n = c.tokens.len();
@@ -1586,13 +1712,29 @@ impl LlamaCppEngine {
                         .ctx()
                         .state_seq_set(&c.state, slot as i32)
                         .map_err(|e| GenError::Generate(format!("checkpoint restore: {e}")))?;
-                    eprintln!(
-                        "llama_cpp: slot {slot} diverges at token {reuse}, behind the SWA \
-                         window; restored the {n}-token checkpoint, re-prefilling {} instead \
-                         of {} tokens",
-                        tokens.len() - n,
-                        tokens.len(),
-                    );
+                    if pinned {
+                        // Fires once per background job during a backlog
+                        // drain, so it is throttled; the ring line below is
+                        // per user-visible turn and stays verbatim.
+                        if let Some(sup) = self.log_pinned_restore.permit() {
+                            eprintln!(
+                                "llama_cpp: slot {slot} diverges at token {reuse}, behind the \
+                                 SWA window; restored the {n}-token pinned head, re-prefilling \
+                                 {} instead of {} tokens{}",
+                                tokens.len() - n,
+                                tokens.len(),
+                                suppressed_note(sup),
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "llama_cpp: slot {slot} diverges at token {reuse}, behind the SWA \
+                             window; restored the {n}-token checkpoint, re-prefilling {} instead \
+                             of {} tokens",
+                            tokens.len() - n,
+                            tokens.len(),
+                        );
+                    }
                     reuse = n;
                 } else {
                     // Slot 0 has one more way back before paying the whole
@@ -1668,12 +1810,19 @@ impl LlamaCppEngine {
                         }
                     }
                     if restored == 0 {
-                        eprintln!(
-                            "llama_cpp: slot {slot} diverges at token {reuse} but the SWA window \
-                             has moved past it and no checkpoint covers it; re-prefilling all {} \
-                             tokens (slow, not wrong)",
-                            tokens.len(),
-                        );
+                        // Throttled: at backlog-drain volume this fired once
+                        // per job and flooded the log. The first occurrence
+                        // prints verbatim (it is the diagnostic one); repeats
+                        // collapse into a per-minute count.
+                        if let Some(sup) = self.log_full_reprefill.permit() {
+                            eprintln!(
+                                "llama_cpp: slot {slot} diverges at token {reuse} but the SWA \
+                                 window has moved past it and no checkpoint covers it; \
+                                 re-prefilling all {} tokens (slow, not wrong){}",
+                                tokens.len(),
+                                suppressed_note(sup),
+                            );
+                        }
                     }
                     reuse = restored;
                 }
@@ -1703,39 +1852,70 @@ impl LlamaCppEngine {
 
         let t_prefill = Instant::now();
 
-        // --- windowed-SWA checkpoint ------------------------------------------
-        // Taken DURING this turn's prefill, near the prompt's tail, because
-        // that is where the next turn's divergence lands: the replayed history
-        // re-renders the last exchange a few tokens differently than the raw
-        // generated text (measured ~15-20 tokens of drift), while everything
-        // earlier is the same template render both times. The prefill is split
-        // at the capture point; the snapshot sees a window that is complete by
-        // construction, since decode reached it contiguously. Cost: one
-        // PARTIAL_ONLY state copy to host RAM per turn, and it is what turns
-        // the rewind guard's full re-prefill into a tail re-prefill.
-        let cap_pos: Option<usize> = if !self.cfg.swa_full
-            && tokens.len() > SWA_CHECKPOINT_TAIL_MARGIN
-        {
-            let p = reuse.max(tokens.len() - SWA_CHECKPOINT_TAIL_MARGIN);
-            let dup = loaded
-                .checkpoints
-                .get(&slot)
-                .is_some_and(|r| r.iter().any(|c| c.tokens.len() == p && tokens.starts_with(&c.tokens)));
-            (!dup && p < tokens.len()).then_some(p)
-        } else {
-            None
-        };
+        // --- windowed-SWA checkpoints -----------------------------------------
+        // Up to two capture points, each taken DURING this turn's prefill by
+        // splitting it there, so every snapshot sees a window that is complete
+        // by construction (decode reached it contiguously). Cost: one
+        // PARTIAL_ONLY state copy to host RAM per point.
+        //
+        //  - The RING point sits near the prompt's TAIL, because that is where
+        //    a conversation's next turn diverges: the replayed history
+        //    re-renders the last exchange a few tokens differently than the
+        //    raw generated text (measured ~15-20 tokens of drift), while
+        //    everything earlier is the same template render both times. It is
+        //    what turns the rewind guard's full re-prefill into a tail
+        //    re-prefill.
+        //  - The PINNED point sits at a background slot's learned shared
+        //    HEAD, because that is where the next one-shot diverges: each job
+        //    replaces everything after the common instruction block, so no
+        //    tail checkpoint ever covers it. (Re)captured only while absent
+        //    or stale; a matching pin costs nothing per turn.
+        //
+        // The second entry of a same-position tie is dropped; positions never
+        // coincide persistently (the head is fixed, prompt lengths vary), so
+        // a skipped capture just retries next turn.
+        let mut capture: Vec<(usize, bool)> = Vec::new(); // (position, is_pinned)
+        if !self.cfg.swa_full {
+            if tokens.len() > SWA_CHECKPOINT_TAIL_MARGIN {
+                let p = reuse.max(tokens.len() - SWA_CHECKPOINT_TAIL_MARGIN);
+                let dup = loaded
+                    .checkpoints
+                    .get(&slot)
+                    .is_some_and(|r| r.iter().any(|c| c.tokens.len() == p && tokens.starts_with(&c.tokens)));
+                if !dup && p < tokens.len() {
+                    capture.push((p, false));
+                }
+            }
+            if slot != 0 {
+                if let Some(&h) = self.head_len.get(&slot) {
+                    let stale = loaded
+                        .pinned_heads
+                        .get(&slot)
+                        .is_none_or(|c| c.tokens.len() != h || !tokens.starts_with(&c.tokens));
+                    // `reuse < h`: a state at `h` can only be captured while
+                    // decode passes through it; a turn that restored AT the
+                    // head has nothing to recapture, and a turn reusing past
+                    // it will be covered by a later divergent turn's prefill.
+                    if stale && reuse < h && h < tokens.len() {
+                        capture.push((h, true));
+                    }
+                }
+            }
+        }
+        capture.sort_by_key(|&(p, _)| p);
+        capture.dedup_by_key(|e| e.0);
 
-        if let Some(cap) = cap_pos {
+        let mut prefilled = reuse;
+        for &(cap, pin) in &capture {
             // Decode up to the capture point first (no-op when the reuse
             // boundary already IS the capture point, i.e. an appended turn
             // whose fresh tail is shorter than the margin).
-            if cap > reuse {
-                let head = &tokens[reuse..cap];
+            if cap > prefilled {
+                let head = &tokens[prefilled..cap];
                 let mut b = LlamaBatch::new(head.len().max(512), 1);
                 let last = head.len() - 1;
                 for (i, t) in head.iter().enumerate() {
-                    b.add(*t, (reuse + i) as i32, &[slot as i32], i == last)
+                    b.add(*t, (prefilled + i) as i32, &[slot as i32], i == last)
                         .map_err(|e| GenError::Generate(e.to_string()))?;
                 }
                 loaded
@@ -1749,6 +1929,7 @@ impl LlamaCppEngine {
                             .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
                     }
                 }
+                prefilled = cap;
             }
             // Best-effort: a turn without a checkpoint is a turn that may pay
             // a full re-prefill later, not a wrong turn.
@@ -1758,24 +1939,31 @@ impl LlamaCppEngine {
                 .state_seq_get(slot as i32, LlamaStateSeqFlags::PARTIAL_ONLY)
             {
                 Ok(state) => {
-                    let ring = loaded.checkpoints.entry(slot).or_default();
-                    ring.push_front(SwaCheckpoint {
+                    let ckpt = SwaCheckpoint {
                         tokens: tokens[..cap].to_vec(),
                         state,
-                    });
-                    ring.truncate(SWA_CHECKPOINTS_PER_SLOT);
+                    };
+                    if pin {
+                        eprintln!(
+                            "llama_cpp: pinned the {cap}-token shared head on slot {slot}"
+                        );
+                        loaded.pinned_heads.insert(slot, ckpt);
+                    } else {
+                        let ring = loaded.checkpoints.entry(slot).or_default();
+                        ring.push_front(ckpt);
+                        ring.truncate(SWA_CHECKPOINTS_PER_SLOT);
+                    }
                 }
                 Err(e) => eprintln!("llama_cpp: checkpoint capture failed on slot {slot} ({e})"),
             }
         }
 
-        let tail_start = cap_pos.map_or(reuse, |c| c.max(reuse));
-        let fresh = &tokens[tail_start..];
+        let fresh = &tokens[prefilled..];
         let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
         let last = fresh.len() - 1;
         for (i, t) in fresh.iter().enumerate() {
             batch
-                .add(*t, (tail_start + i) as i32, &[slot as i32], i == last)
+                .add(*t, (prefilled + i) as i32, &[slot as i32], i == last)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
         }
 
