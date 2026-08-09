@@ -111,6 +111,10 @@ required-features = ["llama-cpp"]
 name = "llama_bench"
 required-features = ["llama-cpp"]
 
+[[example]]
+name = "build_prefix"
+required-features = ["llama-cpp"]
+
 # Reproduces the end-of-turn marker leaking into `content`, with and without the
 # speculative drafter. Same gate: it builds an engine.
 [[example]]

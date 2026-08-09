@@ -693,6 +693,21 @@ impl LlamaCppEngine {
         Some(dir.join(format!("prefix-{}.kv", Self::prefix_key_for(cfg))))
     }
 
+    /// Public form of [`Self::prefix_path_for`], for hosts that install a
+    /// PREBUILT prefix artifact: a state file computed elsewhere (a release
+    /// pipeline) for these exact weights and this exact prompt must land
+    /// under the engine's own key name to be found by the launch restore.
+    /// The name is machine-specific (the key hashes local paths), which is
+    /// why the artifact cannot ship pre-named and the host has to ask.
+    ///
+    /// Adopting a foreign file is safe by the same contract as any restore:
+    /// `state_seq_load_file` hands back the token list the state was saved
+    /// with, and the first real prompt must start with it or the whole thing
+    /// is discarded and rebuilt locally.
+    pub fn prefix_artifact_path(cfg: &LlamaCppConfig) -> Option<PathBuf> {
+        Self::prefix_path_for(cfg)
+    }
+
     /// The invalidation key, as a file name.
     ///
     /// **A stale restore is not an error, it is wrong output.** llama.cpp's
