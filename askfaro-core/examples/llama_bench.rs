@@ -76,7 +76,7 @@ fn main() {
     // one variable that mattered was the one the harness held still. The clock
     // now moves per case, below, so this class of regression is measurable here
     // instead of arriving as "the app feels slow" weeks later.
-    let system = format!(
+    let mut system = format!(
         "You are Scopy, a fast on-device assistant.\n\n\
          response_style: {style} {rules}\n\n{loop_guidance}\n\n{index}",
         style = prompt_consts["responseStyle"].as_str().unwrap_or(""),
@@ -84,6 +84,37 @@ fn main() {
         loop_guidance = prompt_consts["toolLoopGuidance"].as_str().unwrap_or(""),
         index = index["index"].as_str().unwrap_or(""),
     );
+
+    // Variant knobs for the thinking-length experiments, env-var driven so the
+    // standard invocation measures the shipping configuration unchanged.
+    //
+    // FARO_BENCH_REASONING_BUDGET: cap the think channel at N tokens per turn
+    //   (the engine's per-request `reasoning_budget`). Unset = unbounded.
+    // FARO_BENCH_SYSTEM_SUFFIX: appended to the system block, for prompt-side
+    //   steering variants ("think briefly" and friends). Changes the prefix, so
+    //   the persisted-prefix phase below rebuilds it: that is measured, not a
+    //   bug.
+    let reasoning_budget: Option<i32> = std::env::var("FARO_BENCH_REASONING_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(b) = reasoning_budget {
+        eprintln!("reasoning budget: {b} tokens");
+    }
+    // FARO_BENCH_CLOSE_BIAS: additive logit bias on the think-close tag's
+    // first token (the engine's per-request `reasoning_close_bias`).
+    let reasoning_close_bias: Option<f32> = std::env::var("FARO_BENCH_CLOSE_BIAS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(b) = reasoning_close_bias {
+        eprintln!("close-tag bias: {b:+}");
+    }
+    if let Ok(suffix) = std::env::var("FARO_BENCH_SYSTEM_SUFFIX") {
+        if !suffix.is_empty() {
+            eprintln!("system suffix: {suffix}");
+            system.push_str("\n\n");
+            system.push_str(&suffix);
+        }
+    }
 
     // The full registry, matching `--no-selector` on the JS bench. Selection is a
     // separate variable; mixing it in here would confound the engine comparison.
@@ -179,12 +210,19 @@ fn main() {
         // cannot see the most expensive prompt bug there is.
         let req = GenerateRequest {
             system: system.clone(),
+            // The weekday is stated, mirroring the app: the model cannot do
+            // calendar arithmetic, so `now` carries it as a fact. The internal
+            // label mirrors the app too (added after the model narrated the
+            // block back to a user who said "thanks").
             messages: vec![Msg::user(format!(
-                "scopy_context: {{\"now\":\"2026-07-30 08:{:02}\",\"timezone\":\"UTC\"}}\n\n{prompt}",
+                "[internal app context; the user did not write this and cannot see it. Use it silently; never mention or acknowledge it.]\n\n\
+                 scopy_context: {{\"now\":\"2026-07-30 08:{:02} (Thu)\",\"timezone\":\"UTC\"}}\n\n{prompt}",
                 i % 60,
             ))],
             tools: tools.clone(),
             slot: 0,
+            reasoning_budget,
+            reasoning_close_bias,
             ..Default::default()
         };
 

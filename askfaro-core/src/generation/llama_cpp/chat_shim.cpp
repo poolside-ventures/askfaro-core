@@ -14,12 +14,14 @@
 // constructor taking common_chat_params, so holding it here is the cheap path.
 
 #include "chat.h"
+#include "reasoning-budget.h"
 
 #include <nlohmann/json.hpp>
 
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using json = nlohmann::ordered_json;
 
@@ -230,5 +232,43 @@ char * scope_chat_caps(scope_chat_ctx * ctx) {
 void scope_chat_free(char * p) { std::free(p); }
 
 void scope_chat_ctx_free(scope_chat_ctx * ctx) { delete ctx; }
+
+/// Upstream's reasoning-budget sampler (common/reasoning-budget.cpp), the same
+/// state machine llama-server runs behind `--reasoning-budget`. Token sequences
+/// are tokenized by the CALLER (Rust has the model; this file only has the
+/// template), which is why these take token arrays rather than tag strings.
+///
+/// `vocab` is passed as nullptr: the Rust bindings do not expose the vocab
+/// pointer, and its only role in the sampler is the WAITING_UTF8 grace state
+/// (finish a multi-byte character before forcing). Without it the force lands
+/// exactly at the budget, which can split a codepoint mid-character in the
+/// DISCARDED reasoning text; the engine converts committed tokens one at a
+/// time regardless, so this adds no failure mode that engine does not already
+/// have.
+struct llama_sampler * scope_rbudget_init(const int32_t * start,  size_t n_start,
+                                          const int32_t * end,    size_t n_end,
+                                          const int32_t * forced, size_t n_forced,
+                                          int32_t         budget) {
+    try {
+        const std::vector<llama_token> start_tokens(start, start + n_start);
+        const std::vector<llama_token> end_tokens(end, end + n_end);
+        const std::vector<llama_token> forced_tokens(forced, forced + n_forced);
+        return common_reasoning_budget_init(nullptr, start_tokens, end_tokens, forced_tokens, budget);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void scope_rbudget_accept(struct llama_sampler * s, int32_t token) {
+    llama_sampler_accept(s, token);
+}
+
+/// Values follow `common_reasoning_budget_state`: 0 IDLE, 1 COUNTING,
+/// 2 FORCING, 3 WAITING_UTF8, 4 DONE.
+int32_t scope_rbudget_state(const struct llama_sampler * s) {
+    return static_cast<int32_t>(common_reasoning_budget_get_state(s));
+}
+
+void scope_rbudget_free(struct llama_sampler * s) { llama_sampler_free(s); }
 
 } // extern "C"

@@ -65,6 +65,18 @@ use crate::generation::{
 /// must never be mistaken for a brief one.
 const MAX_OUTPUT_TOKENS: usize = 2048;
 
+/// What the reasoning-budget sampler forces into the think channel ahead of
+/// the close tag when the budget runs out.
+///
+/// NOT decoration. llama.cpp's own budget PR measured Qwen 3.5 9B at 89%
+/// with a wrap-up message against 79% with a bare forced close, and the s1
+/// budget-forcing paper found the same: the model answers from partial
+/// reasoning gracefully only when the trace ENDS like a decision instead of
+/// ending mid-sentence. First person and present tense because it is spliced
+/// into the model's own voice; the leading newline separates it from
+/// whatever half-written thought it interrupts.
+const REASONING_BUDGET_WRAPUP: &str = "\nOkay, I have to stop thinking now and answer with what I have.\n";
+
 /// How far before the prompt's end a windowed-SWA checkpoint is taken.
 ///
 /// The next turn's divergence from this turn's cache lands almost entirely in
@@ -1283,6 +1295,84 @@ impl LlamaCppEngine {
         } else {
             0
         };
+
+        // --- reasoning budget -------------------------------------------------
+        // Upstream's reasoning-budget sampler (common/reasoning-budget.cpp, the
+        // machinery behind llama-server's `--reasoning-budget`), built per
+        // request. It watches the committed token stream for the template's own
+        // think-open tag, counts the thinking tokens, and at the budget forces
+        // a wrap-up message plus the think-CLOSE tag token-by-token; the answer
+        // that follows is generated normally and never truncated. This is the
+        // "shape the thinking, never truncate the answer" knob: MAX_OUTPUT_TOKENS
+        // above is a runaway backstop, not a latency control.
+        //
+        // Grammar-constrained turns are excluded on purpose: their operating
+        // point is thinking-off extraction, and upstream itself sequences the
+        // budget sampler against LAZY grammars only, which this engine does not
+        // run (its json_schema grammar is eager). Tags come from the template
+        // via the chat shim, so a model family without a declared think channel
+        // degrades to "no budget" rather than to guessed tags.
+        let mut rbudget: Option<ffi::ReasoningBudget> = None;
+        if let Some(budget) = req.reasoning_budget.filter(|b| *b >= 0) {
+            if grammar.is_none()
+                && enable_thinking
+                && !applied.thinking_start.is_empty()
+                && !applied.thinking_end.is_empty()
+            {
+                let model = &self.loaded.as_ref().expect("just loaded").model;
+                let tok = |s: &str| -> Result<Vec<i32>, GenError> {
+                    Ok(model
+                        .str_to_token(s, AddBos::Never)
+                        .map_err(|e| GenError::Generate(format!("tokenize think tag: {e}")))?
+                        .into_iter()
+                        .map(|t| t.0)
+                        .collect())
+                };
+                let start = tok(&applied.thinking_start)?;
+                let end = tok(&applied.thinking_end)?;
+                let forced = tok(&format!("{REASONING_BUDGET_WRAPUP}{}", applied.thinking_end))?;
+                match ffi::ReasoningBudget::new(&start, &end, forced, budget) {
+                    Some(mut rb) => {
+                        // Mirror upstream's prefill step: a continuation render
+                        // can OPEN the think block inside the generation prompt,
+                        // and the matcher must see it or the budget never arms.
+                        // The leading-space skip is upstream's too: some
+                        // tokenizers prepend a space token the text never had.
+                        for (i, t) in model
+                            .str_to_token(&applied.generation_prompt, AddBos::Never)
+                            .map_err(|e| GenError::Generate(e.to_string()))?
+                            .into_iter()
+                            .enumerate()
+                        {
+                            if i == 0 {
+                                let piece = model
+                                    .token_to_str(t, Special::Tokenize)
+                                    .unwrap_or_default();
+                                let gp_ws =
+                                    applied.generation_prompt.starts_with(char::is_whitespace);
+                                if piece.starts_with(char::is_whitespace) && !gp_ws {
+                                    continue;
+                                }
+                            }
+                            rb.accept(t.0);
+                        }
+                        rbudget = Some(rb);
+                    }
+                    // A budget that cannot build must not fail the turn: the
+                    // reply without it is correct, just longer.
+                    None => eprintln!(
+                        "llama_cpp: reasoning budget requested but the sampler failed to build; \
+                         thinking is unbounded this turn"
+                    ),
+                }
+            }
+        }
+        // The drafter must never straddle the budget boundary: it proposes
+        // without seeing the budget, so a window that crossed it would commit
+        // thinking tokens the mask had already cut off. One extra step of
+        // margin over the window size covers `next` itself.
+        let draft_window = self.cfg.draft_n_max.max(0) + 2;
+
         let loaded = self.loaded.as_mut().expect("just loaded");
 
         // The chain is plain greedy even on constrained turns; the grammar
@@ -1303,7 +1393,41 @@ impl LlamaCppEngine {
         // `generate`'s wrapper counts on that). The grammar sampler holds
         // the C-side vocab pointer, not a Rust borrow, so `loaded` stays
         // freely mutable.
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        // The close-tag bias, the median half of the thinking-length pair (the
+        // reasoning budget above is the tail half; the field docs on
+        // `GenerateRequest` carry the measurements). Under greedy decode a
+        // positive bias means "close the think channel wherever its logit gets
+        // within `bias` of the argmax", which ends easy derivations early and
+        // does nothing mid-derivation. It rides the sampler CHAIN, so it also
+        // steers the speculative verify pass; the drafter proposes without it
+        // and simply loses the draft at the flip point (measured: acceptance
+        // held at 70% with budget + bias active).
+        //
+        // Same guards as the budget, same reasons: no thinking channel means
+        // nothing to bias, and a grammar-constrained turn is the extraction
+        // operating point this feature must not touch. Biasing only the FIRST
+        // token of the close tag is deliberate: it is the decision token, and
+        // once it commits, the rest of the tag follows from the model itself.
+        let close_bias = req
+            .reasoning_close_bias
+            .filter(|b| b.is_finite() && *b != 0.0 && enable_thinking && grammar.is_none())
+            .and_then(|bias| {
+                let close = loaded
+                    .model
+                    .str_to_token(&applied.thinking_end, AddBos::Never)
+                    .ok()?;
+                Some((close.first().copied()?, bias))
+            });
+        let mut sampler = match close_bias {
+            Some((first, bias)) => LlamaSampler::chain_simple([
+                LlamaSampler::logit_bias(
+                    loaded.model.n_vocab(),
+                    &[llama_cpp_2::token::logit_bias::LlamaLogitBias::new(first, bias)],
+                ),
+                LlamaSampler::greedy(),
+            ]),
+            None => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+        };
         let mut grmr = match grammar {
             Some(g) => Some(LlamaSampler::grammar(&loaded.model, g, "root").map_err(|e| {
                 GenError::Invalid(format!("json_schema produced an unusable grammar: {e}"))
@@ -1398,13 +1522,87 @@ impl LlamaCppEngine {
                     );
                     reuse = n;
                 } else {
-                    eprintln!(
-                        "llama_cpp: slot {slot} diverges at token {reuse} but the SWA window \
-                         has moved past it and no checkpoint covers it; re-prefilling all {} \
-                         tokens (slow, not wrong)",
-                        tokens.len(),
-                    );
-                    reuse = 0;
+                    // Slot 0 has one more way back before paying the whole
+                    // prompt: the persisted prefix file. At a conversation
+                    // boundary the new prompt keeps the system+tools prefix
+                    // and replaces everything after it, so the divergence
+                    // lands just past the prefix: behind the SWA window, past
+                    // every checkpoint (those hug the PREVIOUS conversation's
+                    // tail and are not prefixes of the new prompt), and
+                    // squarely covered by the file. The multistep bench paid
+                    // ~32s of full prefill at every case boundary for exactly
+                    // this gap.
+                    //
+                    // Restored WHOLE into the sequence and never trimmed to an
+                    // earlier point, same as the launch-time restore, and
+                    // validated the way `settle_prefix` validates: this prompt
+                    // must strictly extend the file's own token list. Any
+                    // failure or mismatch drops the sequence whole and falls
+                    // back to the full re-prefill this branch was already
+                    // resigned to.
+                    let mut restored = 0usize;
+                    if slot == 0 {
+                        if let Some(path) = Self::prefix_path_for(&self.cfg) {
+                            if path.exists() {
+                                loaded
+                                    .dec
+                                    .ctx()
+                                    .kv_cache_seq_rm(0, None, None)
+                                    .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+                                let t_restore = Instant::now();
+                                match loaded
+                                    .dec
+                                    .ctx()
+                                    .state_seq_load_file(&path, 0, self.cfg.n_ctx as usize)
+                                {
+                                    Ok((toks, _)) => {
+                                        let n = toks.len();
+                                        if n > 0 && tokens.len() > n && tokens[..n] == toks[..] {
+                                            eprintln!(
+                                                "llama_cpp: slot 0 diverges at token {reuse}, \
+                                                 behind the SWA window with no covering \
+                                                 checkpoint; restored the {n}-token persisted \
+                                                 prefix from {} in {}ms, re-prefilling {} \
+                                                 instead of {} tokens",
+                                                path.display(),
+                                                t_restore.elapsed().as_millis(),
+                                                tokens.len() - n,
+                                                tokens.len(),
+                                            );
+                                            restored = n;
+                                        } else {
+                                            loaded
+                                                .dec
+                                                .ctx()
+                                                .kv_cache_seq_rm(0, None, None)
+                                                .map_err(|e| {
+                                                    GenError::Generate(format!("kv clear: {e}"))
+                                                })?;
+                                            eprintln!(
+                                                "llama_cpp: the persisted prefix ({n} tokens on \
+                                                 disk) is not a prefix of this prompt; discarded \
+                                                 it whole",
+                                            );
+                                        }
+                                    }
+                                    Err(e) => eprintln!(
+                                        "llama_cpp: could not restore the persisted prefix from \
+                                         {} ({e}); continuing without it",
+                                        path.display(),
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    if restored == 0 {
+                        eprintln!(
+                            "llama_cpp: slot {slot} diverges at token {reuse} but the SWA window \
+                             has moved past it and no checkpoint covers it; re-prefilling all {} \
+                             tokens (slow, not wrong)",
+                            tokens.len(),
+                        );
+                    }
+                    reuse = restored;
                 }
             }
             if reuse == 0 {
@@ -1539,10 +1737,28 @@ impl LlamaCppEngine {
         let mut draft_accepted = 0usize;
 
         let t_decode = Instant::now();
+        // While the budget sampler is FORCING, the next token is dictated, not
+        // sampled: upstream expresses that by masking every other logit and
+        // this loop, being greedy, takes the dictated token directly. The
+        // logits at the position still exist (the decode ran), so behavior is
+        // identical to upstream's mask + argmax.
+        let forced_next = |rb: &Option<ffi::ReasoningBudget>| -> Option<llama_cpp_2::token::LlamaToken> {
+            rb.as_ref()
+                .filter(|rb| rb.forcing())
+                .and_then(|rb| rb.next_forced())
+                .map(llama_cpp_2::token::LlamaToken)
+        };
         // `next` is the token that has been decided but not yet written into the
         // KV cache. Both loops below share this invariant.
-        let mut next =
-            sample_with_grammar(loaded.dec.ctx(), &mut sampler, grmr.as_mut(), batch.n_tokens() - 1);
+        let mut next = match forced_next(&rbudget) {
+            Some(t) => t,
+            None => sample_with_grammar(
+                loaded.dec.ctx(),
+                &mut sampler,
+                grmr.as_mut(),
+                batch.n_tokens() - 1,
+            ),
+        };
 
         // NO explicit `sampler.accept` anywhere in this loop, and that is a
         // correctness invariant, not an omission: `llama_sampler_sample`
@@ -1566,6 +1782,13 @@ impl LlamaCppEngine {
                 .map_err(|e| GenError::Generate(e.to_string()))?;
             raw.push_str(&piece);
             output_tokens += 1;
+            // Every committed token feeds the budget's state machine, exactly
+            // once, in emission order: upstream's `common_sampler_accept`
+            // contract. The drafts committed in the speculative arm below do
+            // their own accepts; `next` is accepted only here.
+            if let Some(rb) = rbudget.as_mut() {
+                rb.accept(next.0);
+            }
             if loaded.model.is_eog_token(next) {
                 truncated = false;
                 // Remember how this turn ended, so the marker can come off the
@@ -1581,7 +1804,20 @@ impl LlamaCppEngine {
             // slot must take the plain path EVEN when a drafter is loaded,
             // because MtpSpeculative binds to sequence 0 and would otherwise
             // write another slot's cache.
-            match (speculative, &mut loaded.dec) {
+            //
+            // A speculative turn degrades to single-token steps while the
+            // budget sampler is forcing (the drafter cannot propose a dictated
+            // sequence) and just before exhaustion (a window must not straddle
+            // the boundary, or it would commit thinking tokens the mask had
+            // already cut off). The degradation is a handful of tokens per
+            // turn; the drafter is kept in sync through them below, so
+            // speculation resumes for the ANSWER: the part still worth
+            // accelerating.
+            let spec_now = speculative
+                && rbudget
+                    .as_ref()
+                    .map_or(true, |rb| !rb.forcing() && !rb.near_exhaustion(draft_window));
+            match (spec_now, &mut loaded.dec) {
                 // --- plain: one token in, one token out ---------------------
                 (false, dec) => {
                     let ctx = dec.ctx();
@@ -1593,7 +1829,25 @@ impl LlamaCppEngine {
                     n_cur += 1;
                     ctx.decode(&mut batch)
                         .map_err(|e| GenError::Generate(e.to_string()))?;
-                    next = sample_with_grammar(ctx, &mut sampler, grmr.as_mut(), batch.n_tokens() - 1);
+                    // A speculative TURN passing through here (budget forcing
+                    // or near exhaustion) must keep feeding the drafter: MTP
+                    // reads the target's hidden states, and a gap would
+                    // degrade every window after forcing ends.
+                    if speculative {
+                        if let Decoder::Mtp(spec) = dec {
+                            spec.process(&batch)
+                                .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+                        }
+                    }
+                    next = match forced_next(&rbudget) {
+                        Some(t) => t,
+                        None => sample_with_grammar(
+                            dec.ctx(),
+                            &mut sampler,
+                            grmr.as_mut(),
+                            batch.n_tokens() - 1,
+                        ),
+                    };
                 }
                 // --- speculative: propose k, verify all k in ONE pass --------
                 //
@@ -1652,15 +1906,22 @@ impl LlamaCppEngine {
                     };
                     draft_accepted += accepted;
 
-                    spec.accept(accepted as u16)
-                        .map_err(|e| GenError::Generate(format!("mtp accept: {e}")))?;
-
                     // Emit what was accepted. These are committed tokens, so
                     // they must run the same EOG and cap checks as any other.
                     // A committed draft needs no sampler.accept either: it is
                     // only committed when the verify sample returned the same
                     // token, and THAT sample already accepted it (see the
                     // loop-level invariant above).
+                    //
+                    // `committed` can stop short of `accepted`: the budget
+                    // sampler transitions per COMMITTED token, and once it
+                    // starts forcing, the drafts after that point are thinking
+                    // tokens upstream's mask would have cut off: they are
+                    // treated exactly like rejected proposals. The pre-window
+                    // `near_exhaustion` guard makes this rare (a mid-window
+                    // activation with a tiny budget), not impossible.
+                    let mut committed = 0usize;
+                    let mut budget_cut = false;
                     for d in drafts.iter().take(accepted) {
                         let piece = loaded
                             .model
@@ -1669,29 +1930,51 @@ impl LlamaCppEngine {
                         raw.push_str(&piece);
                         output_tokens += 1;
                         cached.push(*d);
+                        committed += 1;
+                        if let Some(rb) = rbudget.as_mut() {
+                            rb.accept(d.0);
+                        }
                         if loaded.model.is_eog_token(*d) {
                             truncated = false;
                             // A turn can end inside an ACCEPTED draft, so the
                             // marker has to be captured here too, not only on
                             // the directly sampled path above.
                             stop_piece = Some(piece);
-                            n_cur = pos_of_next + 1 + accepted as i32;
                             break 'gen;
                         }
                         if output_tokens >= MAX_OUTPUT_TOKENS {
-                            n_cur = pos_of_next + 1 + accepted as i32;
                             break 'gen;
+                        }
+                        if rbudget.as_ref().is_some_and(|rb| rb.forcing()) {
+                            budget_cut = true;
+                            break;
                         }
                     }
 
                     // Rejected proposals are still sitting in the KV cache, so
                     // drop them: keeping them would corrupt every later position.
-                    // A no-op when everything was accepted.
-                    n_cur = pos_of_next + 1 + accepted as i32;
+                    // A no-op when everything was accepted. A budget cut rolls
+                    // back the same way: the surviving drafts were never
+                    // committed, so the cache must not carry them.
+                    n_cur = pos_of_next + 1 + committed as i32;
                     spec.target_context_mut()
                         .kv_cache_seq_rm(0, Some(n_cur as u32), None)
                         .map_err(|e| GenError::Generate(format!("kv rollback: {e}")))?;
-                    next = follow;
+                    // Told the COMMITTED count, after the commit loop, so a
+                    // budget cut reports the same boundary the KV rollback
+                    // just enforced. The `break 'gen` paths above skip this
+                    // call entirely, which is safe: `begin` on the next turn
+                    // resets the wrapper's pending-draft latch.
+                    spec.accept(committed as u16)
+                        .map_err(|e| GenError::Generate(format!("mtp accept: {e}")))?;
+                    next = if budget_cut {
+                        // The forced close begins at the cut, dictated rather
+                        // than sampled; `follow` belonged to the discarded
+                        // continuation.
+                        forced_next(&rbudget).unwrap_or(follow)
+                    } else {
+                        follow
+                    };
                 }
                 // `speculative` is only true when the decoder IS Mtp.
                 (true, Decoder::Plain(_)) => unreachable!("speculative implies a drafter"),

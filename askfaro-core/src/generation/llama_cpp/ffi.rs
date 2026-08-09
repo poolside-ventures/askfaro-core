@@ -16,6 +16,11 @@ struct ScopeChatCtx {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct ScopeRbudget {
+    _private: [u8; 0],
+}
+
 extern "C" {
     fn scope_chat_init(template_str: *const c_char) -> *mut ScopeChatCtx;
     fn scope_chat_apply(
@@ -29,6 +34,222 @@ extern "C" {
     fn scope_chat_caps(ctx: *mut ScopeChatCtx) -> *mut c_char;
     fn scope_chat_free(p: *mut c_char);
     fn scope_chat_ctx_free(ctx: *mut ScopeChatCtx);
+    fn scope_rbudget_init(
+        start: *const i32,
+        n_start: usize,
+        end: *const i32,
+        n_end: usize,
+        forced: *const i32,
+        n_forced: usize,
+        budget: i32,
+    ) -> *mut ScopeRbudget;
+    fn scope_rbudget_accept(s: *mut ScopeRbudget, token: i32);
+    fn scope_rbudget_state(s: *const ScopeRbudget) -> i32;
+    fn scope_rbudget_free(s: *mut ScopeRbudget);
+}
+
+/// `common_reasoning_budget_state`, mirrored by value. The C side is the
+/// authority; `scope_rbudget_state` documents the mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbudgetState {
+    Idle,
+    Counting,
+    Forcing,
+    WaitingUtf8,
+    Done,
+}
+
+impl RbudgetState {
+    fn from_c(v: i32) -> Self {
+        match v {
+            0 => Self::Idle,
+            1 => Self::Counting,
+            2 => Self::Forcing,
+            3 => Self::WaitingUtf8,
+            _ => Self::Done,
+        }
+    }
+}
+
+/// Upstream's reasoning-budget sampler (the one behind llama-server's
+/// `--reasoning-budget`), owned from Rust.
+///
+/// The STATE MACHINE is entirely upstream's; this wrapper adds only the two
+/// pieces of bookkeeping upstream keeps private and the decode loop needs:
+///
+///  - `force_idx`: which forced token comes next. Upstream's sampler expresses
+///    it by masking logits, but this engine's greedy loop can take the token
+///    directly and skip a 262K-candidate apply; the caller built
+///    `forced` itself, so mirroring the index is bookkeeping, not a port. It
+///    advances exactly when upstream's `force_pos` does (on accept while
+///    FORCING).
+///  - `remaining`: the countdown, mirrored so the speculative path can refuse
+///    to start a draft window that would cross the budget boundary. It moves
+///    exactly when upstream's does (on accept while COUNTING, except the
+///    accept that matches the natural end).
+pub struct ReasoningBudget {
+    s: *mut ScopeRbudget,
+    forced: Vec<i32>,
+    force_idx: usize,
+    remaining: i32,
+    budget: i32,
+}
+
+// Only ever touched behind `&mut self` from the owning engine, same as `Chat`.
+unsafe impl Send for ReasoningBudget {}
+
+impl Drop for ReasoningBudget {
+    fn drop(&mut self) {
+        unsafe { scope_rbudget_free(self.s) };
+    }
+}
+
+impl ReasoningBudget {
+    pub fn new(start: &[i32], end: &[i32], forced: Vec<i32>, budget: i32) -> Option<Self> {
+        if start.is_empty() || end.is_empty() {
+            return None;
+        }
+        let s = unsafe {
+            scope_rbudget_init(
+                start.as_ptr(),
+                start.len(),
+                end.as_ptr(),
+                end.len(),
+                forced.as_ptr(),
+                forced.len(),
+                budget,
+            )
+        };
+        if s.is_null() {
+            return None;
+        }
+        Some(Self { s, forced, force_idx: 0, remaining: budget, budget })
+    }
+
+    pub fn state(&self) -> RbudgetState {
+        RbudgetState::from_c(unsafe { scope_rbudget_state(self.s) })
+    }
+
+    /// Feed one COMMITTED token through the state machine. Call exactly once
+    /// per token the decode loop emits, in emission order: the same contract
+    /// as upstream's `common_sampler_accept`.
+    pub fn accept(&mut self, token: i32) {
+        let pre = self.state();
+        unsafe { scope_rbudget_accept(self.s, token) };
+        match pre {
+            // Upstream advances force_pos on every accept while forcing.
+            RbudgetState::Forcing => self.force_idx += 1,
+            // Upstream decrements on every counting accept EXCEPT the one that
+            // completes the natural end sequence (that transitions to DONE
+            // before the decrement).
+            RbudgetState::Counting => {
+                if self.state() != RbudgetState::Done {
+                    self.remaining -= 1;
+                }
+            }
+            // Activation (and re-activation on a second think block) resets
+            // the countdown, exactly as upstream resets `remaining`.
+            RbudgetState::Idle | RbudgetState::Done => {
+                if self.state() == RbudgetState::Counting {
+                    self.remaining = self.budget;
+                }
+            }
+            RbudgetState::WaitingUtf8 => {}
+        }
+    }
+
+    /// True while the sampler is force-feeding the close sequence: the next
+    /// token is [`Self::next_forced`], not a model sample.
+    pub fn forcing(&self) -> bool {
+        self.state() == RbudgetState::Forcing
+    }
+
+    /// The token upstream's mask would force next. `None` never happens while
+    /// [`Self::forcing`] holds (upstream leaves FORCING when the sequence is
+    /// exhausted), but the caller treats it as "sample normally" for safety.
+    pub fn next_forced(&self) -> Option<i32> {
+        self.forced.get(self.force_idx).copied()
+    }
+
+    /// Would a speculative window of `window` tokens risk crossing the budget
+    /// boundary? The drafter proposes without seeing the budget, so a window
+    /// that straddles exhaustion would commit thinking tokens upstream's mask
+    /// had already cut off; the caller degrades those steps to plain decode.
+    pub fn near_exhaustion(&self, window: i32) -> bool {
+        self.state() == RbudgetState::Counting && self.remaining <= window
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drives the UPSTREAM sampler (no model needed: tokens are just ids) and
+    /// checks the mirrored bookkeeping stays in lockstep with its states.
+    #[test]
+    fn budget_counts_down_and_forces_the_close_sequence() {
+        // start = [10, 11], end = [20, 21], forced = [30, 20, 21], budget = 3.
+        let mut rb = ReasoningBudget::new(&[10, 11], &[20, 21], vec![30, 20, 21], 3)
+            .expect("sampler builds");
+        assert_eq!(rb.state(), RbudgetState::Idle);
+
+        // Not the start sequence: stays idle.
+        rb.accept(99);
+        assert_eq!(rb.state(), RbudgetState::Idle);
+
+        // Start sequence activates counting with the full budget.
+        rb.accept(10);
+        rb.accept(11);
+        assert_eq!(rb.state(), RbudgetState::Counting);
+        assert!(!rb.near_exhaustion(2));
+        assert!(rb.near_exhaustion(3));
+
+        // Three thinking tokens exhaust the budget; FORCING begins.
+        rb.accept(100);
+        rb.accept(101);
+        assert_eq!(rb.state(), RbudgetState::Counting);
+        rb.accept(102);
+        assert_eq!(rb.state(), RbudgetState::Forcing);
+
+        // The forced sequence comes back token by token, then DONE.
+        assert_eq!(rb.next_forced(), Some(30));
+        rb.accept(30);
+        assert_eq!(rb.next_forced(), Some(20));
+        rb.accept(20);
+        assert_eq!(rb.next_forced(), Some(21));
+        rb.accept(21);
+        assert_eq!(rb.state(), RbudgetState::Done);
+        assert!(!rb.forcing());
+    }
+
+    /// A natural close inside the budget must deactivate without forcing:
+    /// the model that finishes thinking on its own is the common case.
+    #[test]
+    fn natural_end_inside_budget_never_forces() {
+        let mut rb =
+            ReasoningBudget::new(&[10], &[20, 21], vec![30, 20, 21], 100).expect("sampler builds");
+        rb.accept(10);
+        assert_eq!(rb.state(), RbudgetState::Counting);
+        rb.accept(50);
+        rb.accept(20);
+        rb.accept(21);
+        assert_eq!(rb.state(), RbudgetState::Done);
+    }
+
+    /// Budget zero forces the close the moment the think block opens: the
+    /// per-turn "no thinking" operating point that does NOT change the
+    /// rendered prompt (unlike flipping `enable_thinking`, which invalidates
+    /// the persisted KV prefix).
+    #[test]
+    fn budget_zero_forces_immediately_on_activation() {
+        let mut rb =
+            ReasoningBudget::new(&[10], &[20], vec![20], 0).expect("sampler builds");
+        rb.accept(10);
+        assert_eq!(rb.state(), RbudgetState::Forcing);
+        assert_eq!(rb.next_forced(), Some(20));
+        rb.accept(20);
+        assert_eq!(rb.state(), RbudgetState::Done);
+    }
 }
 
 /// What the model's template produced for this turn.
@@ -60,6 +281,14 @@ pub struct Applied {
     #[allow(dead_code)]
     #[serde(default)]
     pub supports_thinking: bool,
+    /// The template's thinking tags (Gemma 4: `<|channel>thought` /
+    /// `<channel|>`), from upstream's per-family chat params. Empty when the
+    /// template declares none, which is also what makes a reasoning budget on
+    /// such a model a clean no-op rather than a guess at tags.
+    #[serde(default)]
+    pub thinking_start: String,
+    #[serde(default)]
+    pub thinking_end: String,
     /// Stop strings the TEMPLATE declares, e.g. Gemma 4's `<turn|>`.
     ///
     /// Stopping on end-of-turn TOKENS is not enough: the marker is still sitting

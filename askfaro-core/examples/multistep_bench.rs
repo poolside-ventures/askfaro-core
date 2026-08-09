@@ -193,6 +193,21 @@ fn main() {
         })
         .collect();
 
+    // Thinking-length knobs, same env vars as llama_bench so one shell line
+    // configures both gates identically.
+    let reasoning_budget: Option<i32> = std::env::var("FARO_BENCH_REASONING_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(b) = reasoning_budget {
+        eprintln!("reasoning budget: {b} tokens");
+    }
+    let reasoning_close_bias: Option<f32> = std::env::var("FARO_BENCH_CLOSE_BIAS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    if let Some(b) = reasoning_close_bias {
+        eprintln!("close-tag bias: {b:+}");
+    }
+
     let draft = args.next();
     let draft_configured = draft.is_some();
     eprintln!(
@@ -276,7 +291,8 @@ fn main() {
         // user turn. If it were re-stamped per step the cache would break here
         // and nowhere else.
         let user_content = format!(
-            "scopy_context: {{\"now\":\"2026-07-30 08:{:02}\",\"timezone\":\"UTC\"}}\n\n{prompt}",
+            "[internal app context; the user did not write this and cannot see it. Use it silently; never mention or acknowledge it.]\n\n\
+             scopy_context: {{\"now\":\"2026-07-30 08:{:02} (Thu)\",\"timezone\":\"UTC\"}}\n\n{prompt}",
             ci % 60,
         );
         let mut messages = vec![Msg::user(user_content)];
@@ -299,6 +315,10 @@ fn main() {
                 messages: messages.clone(),
                 tools: tools.clone(),
                 slot: 0,
+                // Same variant knobs as llama_bench, so the thinking-length
+                // configuration can be held identical across both gates.
+                reasoning_budget,
+                reasoning_close_bias,
                 ..Default::default()
             }) {
                 Ok(o) => o,

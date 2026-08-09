@@ -143,7 +143,9 @@ pub struct ToolSchema {
 
 /// A generation request. `tools` is the already-selected subset — this crate does
 /// not choose tools.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// PartialEq only: `reasoning_close_bias` is an f32, and floats have no total
+// equality. Nothing keyed a request by Eq (it was derived, not used).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerateRequest {
     /// System / instructions prompt.
     pub system: String,
@@ -177,6 +179,40 @@ pub struct GenerateRequest {
     /// rendered prompt, not of the loaded weights.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Cap the model's REASONING channel at this many tokens for THIS request;
+    /// `None` (or any negative value) leaves thinking unbounded.
+    ///
+    /// This is upstream llama.cpp's reasoning-budget sampler (the mechanism
+    /// behind llama-server's `--reasoning-budget`), not an output cap: when the
+    /// budget runs out mid-thought, a short wrap-up message plus the model's
+    /// own think-close tag are forced token-by-token, and the ANSWER that
+    /// follows is never truncated. `Some(0)` closes the think channel the
+    /// moment it opens: per-turn "don't think" semantics WITHOUT changing the
+    /// rendered prompt, so unlike flipping [`Self::enable_thinking`] it leaves
+    /// the persisted KV prefix and the slot's cache untouched.
+    ///
+    /// Ignored on engines without a thinking-tag template, and on
+    /// grammar-constrained (`json_schema`) turns, whose operating point is
+    /// thinking-off already.
+    #[serde(default)]
+    pub reasoning_budget: Option<i32>,
+    /// Additive logit bias on the FIRST token of the model's think-close tag,
+    /// applied for the whole turn; `None` applies no bias.
+    ///
+    /// The complement to [`Self::reasoning_budget`]: the budget bounds the
+    /// TAIL deterministically, this shifts the MEDIAN by letting easy
+    /// derivations close early (under greedy decode, the close wins wherever
+    /// its logit comes within the bias of the argmax). Measured together on
+    /// the 26-case Scope bench at budget 128 / bias +4.0: 100% fully correct,
+    /// p50 3,468ms to 2,826ms, median thinking halved. On its own a bias
+    /// cannot bound anything (p95 was unmoved in every solo run), so ship it
+    /// WITH a budget, not instead of one.
+    ///
+    /// Same guards as the budget: ignored when thinking is off, when the
+    /// template declares no think tags, and on grammar-constrained
+    /// (`json_schema`) turns.
+    #[serde(default)]
+    pub reasoning_close_bias: Option<f32>,
     /// Constrain the reply to JSON matching this JSON Schema (an OBJECT, per
     /// upstream), enforced at the SAMPLER: tokens outside the grammar are
     /// masked, so a non-conforming reply is unrepresentable rather than merely
