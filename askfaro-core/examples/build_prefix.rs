@@ -109,4 +109,19 @@ fn main() {
     });
     let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!("{out} ({:.1} MB)", bytes as f64 / 1e6);
+
+    // The publish subpath, printed for the pipeline so publisher and consumer
+    // derive it from ONE place (these constants; the installing app computes
+    // the identical string from the same ones). It carries the WEIGHTS
+    // identity, not just the prompt fingerprint the pipeline appends: a
+    // weights update under the same prompt produces a state whose token list
+    // still validates while its VALUES are for the wrong model, which is the
+    // one mismatch the engine's token check cannot catch.
+    use askfaro_core::generation::models::{GEMMA4_E4B_IT_QAT_Q4_0, GEMMA4_E4B_MTP_DRAFTER_Q4_0};
+    println!(
+        "artifact-subpath: {}-{}+{}/v1",
+        GEMMA4_E4B_IT_QAT_Q4_0.id,
+        &GEMMA4_E4B_IT_QAT_Q4_0.files[0].sha256[..12],
+        &GEMMA4_E4B_MTP_DRAFTER_Q4_0.files[0].sha256[..12],
+    );
 }

@@ -25,6 +25,14 @@ pub enum GemmaError {
     Load(String),
 }
 
+/// EmbeddingGemma's context window. The ONNX graph hard-fails past it — the
+/// RotaryEmbedding cos/sin cache is sized at export time, so token 2049 is a
+/// runtime error, not degraded quality. Callers chunk by OTHER tokenizers'
+/// counts (Honcho: 1500 tiktoken tokens, which can be 4x as many SentencePiece
+/// tokens), so the tokenizer truncates to the window here — the same behavior
+/// as the Python sentence-transformers reference (max_seq_length = 2048).
+const MAX_TOKENS: usize = 2048;
+
 /// EmbeddingGemma embedder. Construct once with [`GemmaEmbedder::load`] (loading
 /// the model is the expensive step), then embed many texts.
 pub struct GemmaEmbedder {
@@ -39,7 +47,13 @@ impl GemmaEmbedder {
     /// and `tokenizer.json` — i.e. `EMBEDDINGGEMMA_300M_FP32.dir(cache_root)`.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, GemmaError> {
         let dir = model_dir.as_ref();
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| GemmaError::Load(e.to_string()))?;
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
             .map_err(|e| GemmaError::Load(e.to_string()))?;
         let session = Session::builder()
             .map_err(|e| GemmaError::Load(e.to_string()))?
