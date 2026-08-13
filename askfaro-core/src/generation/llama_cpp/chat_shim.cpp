@@ -149,7 +149,16 @@ char * scope_chat_apply(scope_chat_ctx * ctx,
         out["grammar_lazy"]      = ctx->last.grammar_lazy;
         out["supports_thinking"] = ctx->last.supports_thinking;
         out["thinking_start"]    = ctx->last.thinking_start_tag;
-        out["thinking_end"]      = ctx->last.thinking_end_tag;
+        // llama.cpp #25544 pluralised this to `thinking_end_tags`, because a
+        // template may declare several closers. `thinking_end` stays scalar so
+        // the Rust side and its lockstep tests do not move: Gemma 4 declares
+        // exactly one. The full list travels beside it, so a template with more
+        // than one closer is VISIBLE here rather than silently truncated to the
+        // first, which is what a bare `.front()` would have done.
+        out["thinking_end"]      = ctx->last.thinking_end_tags.empty()
+                                       ? std::string()
+                                       : ctx->last.thinking_end_tags.front();
+        out["thinking_end_all"]  = ctx->last.thinking_end_tags;
         out["format"]            = common_chat_format_name(ctx->last.format);
         // The template's OWN stop strings, not just how many. A caller that
         // stops on end-of-turn tokens alone still has the marker sitting in the
@@ -164,6 +173,19 @@ char * scope_chat_apply(scope_chat_ctx * ctx,
     }
 }
 
+static json chat_msg_to_json(const common_chat_msg & msg, bool salvaged) {
+    json calls = json::array();
+    for (const auto & tc : msg.tool_calls) {
+        calls.push_back({{"name", tc.name}, {"arguments", tc.arguments}, {"id", tc.id}});
+    }
+    json out;
+    out["content"]           = msg.content;
+    out["reasoning_content"] = msg.reasoning_content;
+    out["tool_calls"]        = calls;
+    out["salvaged"]          = salvaged;
+    return out;
+}
+
 /// Parse raw model output into content / reasoning_content / tool_calls.
 ///
 /// This is the function under test: the open upstream reports describe Gemma 4
@@ -172,8 +194,9 @@ char * scope_chat_parse(scope_chat_ctx * ctx, const char * text) {
     if (!ctx || !ctx->has_last) {
         return nullptr;
     }
+
+    common_chat_parser_params params(ctx->last);
     try {
-        common_chat_parser_params params(ctx->last);
         params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
         params.parse_tool_calls = true;
 
@@ -188,20 +211,44 @@ char * scope_chat_parse(scope_chat_ctx * ctx, const char * text) {
         if (!ctx->last.parser.empty()) {
             params.parser = common_peg_arena::from_json(json::parse(ctx->last.parser));
         }
-
-        const common_chat_msg msg = common_chat_parse(text, /*is_partial=*/false, params);
-
-        json calls = json::array();
-        for (const auto & tc : msg.tool_calls) {
-            calls.push_back({{"name", tc.name}, {"arguments", tc.arguments}, {"id", tc.id}});
-        }
-        json out;
-        out["content"]           = msg.content;
-        out["reasoning_content"] = msg.reasoning_content;
-        out["tool_calls"]        = calls;
-        return dup_cstr(out.dump());
     } catch (const std::exception & e) {
         return dup_cstr(json{{"error", e.what()}}.dump());
+    }
+
+    try {
+        return dup_cstr(chat_msg_to_json(common_chat_parse(text, /*is_partial=*/false, params), false).dump());
+    } catch (const std::exception & strict) {
+        // SALVAGE. A strict parse is all-or-nothing: `common_chat_peg_parse`
+        // throws whenever the arena does not consume the WHOLE string, so one
+        // stray byte after an otherwise complete, well-formed tool call takes
+        // the call down with it and this turn fails outright. Upstream
+        // #25986 reports exactly that on the Gemma 4 template, whose top-level
+        // rule permits nothing after the final call, and whose string rule
+        // (`<|"|>` ... `<|"|>`, no escape) ends early on a payload that happens
+        // to contain the delimiter. Long multi-line arguments are where both
+        // bite, which for us means email bodies, note bodies and task
+        // descriptions.
+        //
+        // The recovery is upstream's own, not a second parser: the same
+        // function already maps whatever AST nodes it captured before the
+        // failure, gated behind `is_partial`. Re-running in partial mode
+        // therefore returns the calls it did parse, mapped by the same
+        // `common_chat_peg_gemma4_mapper` the success path uses, and the two
+        // branches differ only by a debug log line.
+        //
+        // Accepted only when it recovers something, so a genuinely empty parse
+        // still surfaces the strict error rather than a silent empty turn. The
+        // flag travels with the payload so the caller can count these instead
+        // of discovering them in a bench months later.
+        try {
+            const common_chat_msg msg = common_chat_parse(text, /*is_partial=*/true, params);
+            if (!msg.tool_calls.empty() || !msg.content.empty()) {
+                return dup_cstr(chat_msg_to_json(msg, true).dump());
+            }
+        } catch (const std::exception &) {
+            // Nothing parsed at all. Report the strict failure, which says where.
+        }
+        return dup_cstr(json{{"error", strict.what()}}.dump());
     }
 }
 
@@ -250,10 +297,18 @@ struct llama_sampler * scope_rbudget_init(const int32_t * start,  size_t n_start
                                           const int32_t * forced, size_t n_forced,
                                           int32_t         budget) {
     try {
-        const std::vector<llama_token> start_tokens(start, start + n_start);
-        const std::vector<llama_token> end_tokens(end, end + n_end);
-        const std::vector<llama_token> forced_tokens(forced, forced + n_forced);
-        return common_reasoning_budget_init(nullptr, start_tokens, end_tokens, forced_tokens, budget);
+        // Upstream took ONE start and ONE end token sequence until llama.cpp
+        // #25544 (merged 2026-07-25, in b10200), which turned both into LISTS of
+        // sequences so a model can close its reasoning block with any of several
+        // tags. We pass exactly one of each, so behaviour is unchanged; the
+        // one-element wrap is the whole of the port. Worth knowing the capacity
+        // is now there: on templates where a tool-call marker also terminates
+        // thinking, that marker can be added as a second end sequence rather
+        // than being handled downstream.
+        const std::vector<llama_tokens> start_seqs{ llama_tokens(start, start + n_start) };
+        const std::vector<llama_tokens> end_seqs{ llama_tokens(end, end + n_end) };
+        const llama_tokens forced_tokens(forced, forced + n_forced);
+        return common_reasoning_budget_init(nullptr, start_seqs, end_seqs, forced_tokens, budget);
     } catch (...) {
         return nullptr;
     }

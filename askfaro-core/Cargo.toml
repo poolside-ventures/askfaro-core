@@ -96,7 +96,7 @@ tokenizers = { version = "0.21", optional = true }
 # Rust bindings to llama.cpp. GPU backends are selected by the CONSUMER via
 # llama-cpp-2's own features (metal / cuda / vulkan), because which accelerator
 # to build for is a property of the app's target, not of this crate.
-llama-cpp-2 = { version = "0.1.153", optional = true, default-features = true }
+llama-cpp-2 = { version = "0.1.154", optional = true, default-features = true }
 
 # The end-to-end smoke test needs the provider AND multi-GB weights, so it must
 # not be built by a default `cargo build --all-targets`. Without this the mirror
@@ -111,8 +111,24 @@ required-features = ["llama-cpp"]
 name = "llama_bench"
 required-features = ["llama-cpp"]
 
+# Parse-rate bench for grammar-constrained (`json_schema`) one-shots. Every
+# other harness here drives tools; this is the only one that exercises the
+# response-format path, which is what a schema-only feature ships on.
+[[example]]
+name = "schema_bench"
+required-features = ["llama-cpp"]
+
 [[example]]
 name = "build_prefix"
+required-features = ["llama-cpp"]
+
+# Probes which tensors a `cpu_tensor_overrides` pattern actually moves. Builds an
+# engine, so same gate. Without this stanza `cargo check --all-targets` picks the
+# example up with no features and dies on the LlamaCppEngine import, which is the
+# pre-push hook's exact failure and the reason the comment at the top of this
+# section exists.
+[[example]]
+name = "buft_override_probe"
 required-features = ["llama-cpp"]
 
 # Reproduces the end-of-turn marker leaking into `content`, with and without the

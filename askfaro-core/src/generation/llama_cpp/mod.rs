@@ -269,6 +269,49 @@ pub struct LlamaCppConfig {
     pub n_ubatch: Option<u32>,
     /// Layers to offload to the GPU. A large value means "all it will take".
     pub n_gpu_layers: u32,
+    /// Tensor-name patterns (llama.cpp regex) to keep in the CPU buffer type
+    /// even when the layer they belong to is offloaded to the GPU.
+    ///
+    /// This exists because on a memory-constrained device the accelerator
+    /// budget, not the model file, is the binding constraint — and the two are
+    /// not the same memory. Measured on an iPhone 14 Pro (A16) 2026-08-11:
+    /// Metal's working set is 4,096 MiB, Gemma 4 E2B q4_0 wires 3,179 MiB of
+    /// it, and the process was killed for a SYSTEM-wide `vm-pageshortage`
+    /// (free memory 36 MiB, wired 4,040 MiB) while its OWN footprint was a
+    /// harmless 875 MiB. Metal buffers are wired and unpageable; CPU-side
+    /// tensors stay file-backed mmap pages the kernel can evict.
+    ///
+    /// The lever that matters for this family is `per_layer_token_embd`:
+    /// 1,838 MiB of E2B's 3,179 MiB, 58% of the model, and a LOOKUP TABLE
+    /// read one row per token per layer rather than a matrix multiplied by
+    /// anything. Keeping it off the accelerator is what the per-layer-embedding
+    /// design is for. Q4_0 is also the quantization that makes this free in
+    /// both directions: llama.cpp implements `get_rows` for it on CPU and GPU
+    /// alike, where the K-quants only support one side.
+    ///
+    /// Empty (the default) preserves the previous behaviour exactly.
+    ///
+    /// **Has no effect while [`use_mmap`](Self::use_mmap) is true.** Measured
+    /// 2026-08-11: with mmap on, llama.cpp maps the whole file into the
+    /// accelerator's buffer and the override changes the reported Metal size by
+    /// exactly zero bytes — it only says which backend COMPUTES with the tensor.
+    /// llama.cpp warns about the combination ("tensor overrides to CPU are used
+    /// with mmap enabled") but does not refuse it, so this is a silent no-op
+    /// unless mmap is also turned off.
+    pub cpu_tensor_overrides: Vec<String>,
+    /// Whether to memory-map the weights. `true` is llama.cpp's default and the
+    /// right answer almost everywhere: pages are file-backed, shared, evictable
+    /// under pressure, and a second load is nearly instant.
+    ///
+    /// Turn it OFF only to make [`cpu_tensor_overrides`](Self::cpu_tensor_overrides)
+    /// real, and know what that trades: without mmap each tensor is allocated
+    /// in its assigned backend, so an overridden tensor genuinely leaves the
+    /// accelerator — but it lands in ANONYMOUS host memory, which is charged to
+    /// the process and cannot be evicted, only compressed. On a phone that
+    /// moves pressure from the system-wide wired total onto the per-process
+    /// footprint. Whether that is a win depends on which limit is binding, so
+    /// measure both rather than assuming.
+    pub use_mmap: bool,
     /// Whether the model may emit a reasoning channel.
     pub enable_thinking: bool,
     /// How many KV cache slots the context supports.
@@ -312,6 +355,8 @@ impl Default for LlamaCppConfig {
             swa_full: false,
             n_ubatch: None,
             n_gpu_layers: 1000,
+            cpu_tensor_overrides: Vec::new(),
+            use_mmap: true,
             enable_thinking: true,
             // Two: the agent loop, plus background one-shots.
             n_slots: 2,
@@ -629,12 +674,34 @@ impl LlamaCppEngine {
         }
         let t = Instant::now();
         let backend = shared_backend()?;
-        let params = LlamaModelParams::default().with_n_gpu_layers(self.cfg.n_gpu_layers);
+        // The override list stores the pattern as a RAW pointer into each
+        // CString, so these must outlive `load_from_file` — hence a named
+        // binding rather than a temporary inside the loop, which would be freed
+        // before the model reads it.
+        let patterns: Vec<std::ffi::CString> = self
+            .cfg
+            .cpu_tensor_overrides
+            .iter()
+            .map(|p| {
+                std::ffi::CString::new(p.as_str()).map_err(|_| {
+                    GenError::Invalid(format!("tensor override has an interior NUL: {p:?}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let mut params = Box::pin(
+            LlamaModelParams::default()
+                .with_n_gpu_layers(self.cfg.n_gpu_layers)
+                .with_use_mmap(self.cfg.use_mmap),
+        );
+        for p in &patterns {
+            params.as_mut().add_cpu_buft_override(p);
+        }
         let model = Box::new(
             LlamaModel::load_from_file(backend, &self.cfg.model_path, &params).map_err(|e| {
                 GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display()))
             })?,
         );
+        drop(patterns);
 
         // The template comes from the GGUF itself, so the shim never has to guess
         // which model family it is rendering for.
@@ -841,6 +908,14 @@ impl LlamaCppEngine {
         h.update(cfg.n_ctx.to_le_bytes());
         h.update(cfg.n_slots.to_le_bytes());
         h.update(cfg.n_gpu_layers.to_le_bytes());
+        // Which tensors sit in which buffer type changes where the computation
+        // happens, so a state computed under one split must not be offered to
+        // another. Same reasoning as n_gpu_layers directly above.
+        for p in &cfg.cpu_tensor_overrides {
+            h.update(p.as_bytes());
+            h.update(b"\0");
+        }
+        h.update([u8::from(cfg.use_mmap)]);
         h.update([u8::from(cfg.enable_thinking)]);
         // The SWA cache's SIZE is part of the persisted state's layout, so a
         // state saved windowed must never be offered to a full-size context or
@@ -1695,18 +1770,47 @@ impl LlamaCppEngine {
                         .get(&slot)
                         .filter(|c| c.tokens.len() <= reuse && tokens.starts_with(&c.tokens))
                 });
-                if let Some(c) = ckpt {
+                // Rewind to the checkpoint boundary — plain and valid for
+                // the full-size base cache; whatever it leaves in the SWA
+                // cache does not matter, because the restore clears the
+                // sequence there before inserting (state_read_meta begins
+                // with seq_rm on the destination).
+                //
+                // A PARTIAL rewind only means anything for an attention KV
+                // cache. On a hybrid recurrent architecture there is no
+                // per-position history to truncate and llama.cpp refuses:
+                // `llama_memory_recurrent::seq_rm` returns false for any
+                // range that is not the whole sequence, surfacing here as
+                // "Couldn't remove partial sequence". Measured on LFM2.5-2.6B
+                // (short-convolution blocks + Gated Delta Net state): 12 of 30
+                // bench cases failed the whole turn on this.
+                //
+                // A refusal is not a reason to lose the turn. This branch
+                // already treats "re-prefill everything" as its floor, so a
+                // refused rewind degrades to exactly that: slow, never wrong.
+                let rewound = match ckpt.map(|c| c.tokens.len()) {
+                    Some(n) => match loaded.dec.ctx().kv_cache_seq_rm(
+                        slot as i32,
+                        Some(n as u32),
+                        None,
+                    ) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            if let Some(sup) = self.log_full_reprefill.permit() {
+                                eprintln!(
+                                    "llama_cpp: slot {slot} cannot rewind to a checkpoint on this \
+                                     architecture ({e}); re-prefilling the whole prompt (slow, \
+                                     not wrong){}",
+                                    suppressed_note(sup),
+                                );
+                            }
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if let Some(c) = ckpt.filter(|_| rewound) {
                     let n = c.tokens.len();
-                    // Rewind to the checkpoint boundary — plain and valid for
-                    // the full-size base cache; whatever it leaves in the SWA
-                    // cache does not matter, because the restore clears the
-                    // sequence there before inserting (state_read_meta begins
-                    // with seq_rm on the destination).
-                    loaded
-                        .dec
-                        .ctx()
-                        .kv_cache_seq_rm(slot as i32, Some(n as u32), None)
-                        .map_err(|e| GenError::Generate(format!("kv rewind to checkpoint: {e}")))?;
                     loaded
                         .dec
                         .ctx()
@@ -1834,11 +1938,23 @@ impl LlamaCppEngine {
                     .kv_cache_seq_rm(slot as i32, None, None)
                     .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
             } else if reuse < prior_len && !evicted {
-                loaded
+                // Same refusal as the checkpoint rewind above, reached by the
+                // ordinary divergence path: a recurrent cache cannot be
+                // trimmed to a position. Drop the sequence whole and re-prefill
+                // rather than losing the turn.
+                if loaded
                     .dec
                     .ctx()
                     .kv_cache_seq_rm(slot as i32, Some(reuse as u32), None)
-                    .map_err(|e| GenError::Generate(format!("kv trim: {e}")))?;
+                    .is_err()
+                {
+                    loaded
+                        .dec
+                        .ctx()
+                        .kv_cache_seq_rm(slot as i32, None, None)
+                        .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+                    reuse = 0;
+                }
             }
         }
         // The speculative path needs the whole prompt announced up front, before
@@ -2251,12 +2367,74 @@ impl LlamaCppEngine {
         }
 
         // --- parse ----------------------------------------------------------
+        // The end-of-turn marker comes OFF before the parse, not after it.
+        //
+        // Failure mode 3 in the module docs says the marker must stay in, and
+        // that was read off Gemma 4, where it happens to be harmless: the
+        // gemma4 PEG rule ends at `zero_or_more(message) + scan_to_toolcall +
+        // tool_call` with NO `p.end()`, so an unconsumed `<turn|>` never fails
+        // the match, it just gets swallowed into `content` and stripped below.
+        // Tolerated, not required — which is not the same claim.
+        //
+        // The LFM2 / LFM2.5 rule DOES end with `p.end()`, so the mandatory
+        // `<|im_end|>` fails the strict parse on every well-formed turn, and
+        // the salvage retry recovers content but not tool calls. Measured on
+        // LFM2.5-2.6B q4_0: 28 of 30 bench cases died as
+        // `GenError::Generate("chat parse: ... at pos N: <|im_end|>")`.
+        //
+        // Both stop kinds are model-supplied (template-declared stops, then
+        // the rendered text of the token that ended the turn), so nothing here
+        // hardcodes a family's marker.
+        let mut parse_input = raw.as_str();
+        for stop in applied.additional_stops.iter().chain(stop_piece.iter()) {
+            if let Some(stripped) = parse_input.strip_suffix(stop.as_str()) {
+                parse_input = stripped;
+            }
+        }
         let parsed = self
             .chat
             .as_mut()
             .expect("chat is set with loaded")
-            .parse(&raw)
+            .parse(parse_input)
             .map_err(|e| GenError::Generate(format!("chat parse: {e}")))?;
+
+        if parsed.salvaged {
+            eprintln!(
+                "llama_cpp: chat parse salvaged from partial ({} tool call(s), {} content chars); \
+                 the tail of this generation did not parse",
+                parsed.tool_calls.len(),
+                parsed.content.len()
+            );
+        }
+
+        // THE SILENT DROP, which is worse than the throw the salvage above
+        // catches. The PEG parser runs LENIENT, so a match that consumes the
+        // reasoning block and then fails to make sense of the tool call does
+        // not raise: it returns a message with no calls and no content, and the
+        // turn evaporates. No error, no warning, nothing for the user.
+        //
+        // Reproduced on 2026-08-13 by bench case `note_long_multiline` (E4B,
+        // shipping config, greedy so deterministic): the model reasoned its way
+        // to the right tool and the right arguments across 237 output tokens,
+        // then produced `toolName: null`, `args: null`, empty content, and no
+        // exception. The body it was asked to write contains the template's own
+        // string delimiter, which is the second mechanism described in
+        // llama.cpp #25986.
+        //
+        // Reasoning is present and output tokens were spent, so "the model said
+        // nothing" is not a possible reading. Fail loudly instead: an error the
+        // agent loop can see and retry beats a blank turn the user cannot
+        // distinguish from a refusal.
+        if parsed.tool_calls.is_empty() && parsed.content.trim().is_empty() && !raw.trim().is_empty()
+        {
+            return Err(GenError::Generate(format!(
+                "chat parse produced neither a tool call nor content from {} raw chars \
+                 ({} chars of reasoning); the generation did not match the template's \
+                 grammar and was silently dropped",
+                raw.len(),
+                parsed.reasoning_content.len()
+            )));
+        }
 
         let tool_calls: Vec<ToolCall> = parsed
             .tool_calls

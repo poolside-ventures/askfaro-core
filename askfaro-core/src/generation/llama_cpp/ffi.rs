@@ -319,6 +319,11 @@ pub struct Parsed {
     pub reasoning_content: String,
     #[serde(default)]
     pub tool_calls: Vec<ParsedToolCall>,
+    /// True when the strict parse failed and the shim recovered this message
+    /// from upstream's partial-parse path instead. The turn is usable; the
+    /// tail of the generation was not parseable. See `scope_chat_parse`.
+    #[serde(default)]
+    pub salvaged: bool,
 }
 
 /// Errors are returned by the shim as `{"error": "..."}` rather than thrown, so
