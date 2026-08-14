@@ -363,6 +363,76 @@ pub enum GenError {
     /// Inference failed.
     #[error("generation failed: {0}")]
     Generate(String),
+    /// The host stopped this call through its [`CancelHandle`].
+    ///
+    /// A variant of its own rather than a `Generate` string, because "the user
+    /// pressed stop" and "inference broke" want opposite responses: nothing to
+    /// report, nothing to retry, and no recovery to perform. An engine that
+    /// returns this leaves itself usable, weights and KV cache included, so the
+    /// next call runs normally.
+    #[error("generation cancelled")]
+    Cancelled,
+}
+
+/// A host's stop signal for work that is already running.
+///
+/// Cloneable and shared: the host keeps one clone OUTSIDE whatever lock the
+/// engine lives behind and gives another to the engine. That is the only shape
+/// that works, because an engine held in a `Mutex` cannot be asked to stop
+/// THROUGH that mutex: the call to be stopped is holding it. Scope desktop
+/// measured turns at p50 16.5s, p90 31.8s and max 65.4s, which is how long
+/// quitting waited for the lock it needed to drop the engine.
+///
+/// The engine clears the flag at the start of every call that can honour it, so
+/// a cancel applies to the call it arrives during and never latches into the
+/// next one.
+///
+/// Read that literally: **one `cancel` stops one call.** In the host shape
+/// above, an engine behind a lock, the window where a stop is dropped is not an
+/// instant but the whole time another caller sits queued on that lock. The
+/// in-flight call aborts, releases the lock, and the queued call clears the flag
+/// and runs to completion, because nothing here can tell "raised while I was
+/// queued" from "left over from a call that already ended". A host that wants a
+/// backlog stopped has to stop enqueueing or keep raising it; a host that wants
+/// one turn stopped, which is what a stop button is, gets exactly that. Making
+/// the engine able to tell the difference means a generation counter or an
+/// explicit re-arm, and neither is worth inventing before something needs it.
+///
+/// A default handle is not armed on anything. It becomes live only where an
+/// engine takes one (for llama.cpp, `LlamaCppConfig::cancel`).
+#[derive(Debug, Clone, Default)]
+pub struct CancelHandle(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelHandle {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask whatever this handle is armed on to stop. Callable from any thread,
+    /// any number of times.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a stop has been asked for and not yet consumed.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Withdraw a stop. An engine calls this itself at the start of every call
+    /// it can honour, so a host normally never needs to; it is public for the
+    /// one case that is not covered, a handle carried from one engine to the
+    /// next after a cancel was raised and never consumed.
+    ///
+    /// `Relaxed` throughout this type: the flag publishes no data, so there is
+    /// nothing for an acquire/release pair to order. The only guarantee needed
+    /// is that a store becomes visible to the polling thread, which every
+    /// ordering gives.
+    pub fn clear(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A provider-agnostic on-device generation engine.
@@ -387,6 +457,25 @@ pub trait GenerationEngine {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A clone must see the original's stop, or the whole design fails: the
+    /// host keeps one clone outside the engine's lock and the engine holds the
+    /// other, and they are the same flag or they are useless.
+    #[test]
+    fn a_cloned_handle_shares_one_flag_across_threads() {
+        let host = CancelHandle::new();
+        let engine_side = host.clone();
+        assert!(!engine_side.is_cancelled());
+
+        let h = std::thread::spawn(move || host.cancel());
+        h.join().unwrap();
+        assert!(engine_side.is_cancelled());
+
+        // What the engine does at the start of every call it can honour, so a
+        // stop never latches into the following one.
+        engine_side.clear();
+        assert!(!engine_side.is_cancelled());
+    }
 
     #[test]
     fn request_roundtrips_through_json() {

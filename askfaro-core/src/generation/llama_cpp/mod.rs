@@ -56,8 +56,8 @@ use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 
 use crate::generation::{
-    Availability, GenError, GenerateRequest, GenerateResponse, GenerationEngine, Msg, Timings,
-    ToolCall,
+    Availability, CancelHandle, GenError, GenerateRequest, GenerateResponse, GenerationEngine, Msg,
+    Timings, ToolCall,
 };
 
 /// Hard cap on generated tokens per turn, so a runaway model cannot hang a UI.
@@ -343,6 +343,21 @@ pub struct LlamaCppConfig {
     /// knows more, the sha256 it verified at download time or a build id, puts
     /// it here and the file name changes with it.
     pub state_key: String,
+    /// The host's stop signal for an in-flight call, or `None` to make every
+    /// call run to completion.
+    ///
+    /// On the config rather than on the engine because of WHEN the host needs
+    /// it: the first call is also the one that pays the cold load (measured up
+    /// to 40.4s for E4B's 5.15 GB), and a host that builds the engine lazily
+    /// inside its own lock has no chance to ask an engine for a handle before
+    /// that. Building the handle first and passing it in covers the load, the
+    /// prefill and the decode of the very first turn.
+    ///
+    /// Arming this is what turns cancellation ON. With `None` the engine takes
+    /// exactly the code path it took before cancellation existed, prefill
+    /// batching and model-load callbacks included, so a host that does not want
+    /// a stop button pays nothing for one.
+    pub cancel: Option<CancelHandle>,
 }
 
 impl Default for LlamaCppConfig {
@@ -365,6 +380,7 @@ impl Default for LlamaCppConfig {
             // no business inventing a cache location.
             prefix_cache_dir: None,
             state_key: String::new(),
+            cancel: None,
         }
     }
 }
@@ -562,6 +578,26 @@ impl LlamaCppEngine {
         self.loaded.is_some()
     }
 
+    /// The slot's recorded prefix length, and the highest position actually
+    /// present in its KV cache. `None` before the weights load.
+    ///
+    /// These two must agree after every turn: the recorded prefix is what the
+    /// NEXT turn's common-prefix scan trusts, and when the cache holds more than
+    /// the record says, that turn appends on top of cells nobody accounts for
+    /// (same sequence, same positions, both visible to attention) and answers
+    /// from a corrupted context. Nothing about that failure is observable from
+    /// the outside, which is why the invariant is exposed rather than inferred:
+    /// see `tests/llama_kv_invariant.rs`.
+    ///
+    /// A cache holding N tokens reports a max position of N-1, so the two agree
+    /// when `prefix_len == pos_max + 1`.
+    pub fn kv_prefix_state(&mut self, slot: u32) -> Option<(usize, i32)> {
+        let loaded = self.loaded.as_mut()?;
+        let prefix_len = loaded.cached.get(&slot).map_or(0, Vec::len);
+        let pos_max = loaded.dec.ctx().kv_cache_seq_pos_max(slot as i32);
+        Some((prefix_len, pos_max))
+    }
+
     /// What the loaded template declares it supports, as the jinja layer names
     /// it: `supports_tools`, `supports_tool_calls`, `supports_object_arguments`,
     /// `supports_system_role`, and so on.
@@ -584,8 +620,21 @@ impl LlamaCppEngine {
     /// instead of in front of a waiting user.
     ///
     /// Idempotent, so a host may call it on every foreground without checking.
+    ///
+    /// Cancellable when [`LlamaCppConfig::cancel`] is armed, which is the point:
+    /// this is the call that pays the 40.4s.
     pub fn warm(&mut self) -> Result<u64, GenError> {
+        self.clear_cancel();
         self.ensure_loaded()
+    }
+
+    /// Drop a stop signal left over from an earlier call, so a cancel only ever
+    /// applies to the call it arrives during. See [`CancelHandle`] for the race
+    /// this trades away.
+    fn clear_cancel(&self) {
+        if let Some(c) = &self.cfg.cancel {
+            c.clear();
+        }
     }
 
     /// Drop the weights, freeing their memory; the engine stays usable and will
@@ -688,17 +737,45 @@ impl LlamaCppEngine {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let mut params = Box::pin(
-            LlamaModelParams::default()
-                .with_n_gpu_layers(self.cfg.n_gpu_layers)
-                .with_use_mmap(self.cfg.use_mmap),
-        );
+        let base = LlamaModelParams::default()
+            .with_n_gpu_layers(self.cfg.n_gpu_layers)
+            .with_use_mmap(self.cfg.use_mmap);
+        // llama.cpp's own load-abort hook: the progress callback is consulted
+        // per tensor group, and returning false stops the read. Installed ONLY
+        // when a handle is armed, because installing one is not neutral:
+        // llama.cpp substitutes its own progress logger when the field is null,
+        // and taking that over would change what an uncancellable build prints.
+        // Records that the callback is what stopped the read, which is a
+        // different question from whether the flag is set. llama.cpp reports an
+        // abort and a genuine failure as the same error, so asking the flag
+        // would report a corrupt model as a cancel whenever a stop happened to
+        // coincide with one, and a host is told to treat `Cancelled` as nothing
+        // to report. That turns a broken download into silence.
+        let vetoed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let base = match self.cfg.cancel.clone() {
+            Some(c) => {
+                let vetoed = vetoed.clone();
+                base.with_progress_callback(move |_| {
+                    if c.is_cancelled() {
+                        vetoed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return false;
+                    }
+                    true
+                })
+            }
+            None => base,
+        };
+        let mut params = Box::pin(base);
         for p in &patterns {
             params.as_mut().add_cpu_buft_override(p);
         }
         let model = Box::new(
             LlamaModel::load_from_file(backend, &self.cfg.model_path, &params).map_err(|e| {
-                GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display()))
+                if vetoed.load(std::sync::atomic::Ordering::Relaxed) {
+                    GenError::Cancelled
+                } else {
+                    GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display()))
+                }
             })?,
         );
         drop(patterns);
@@ -1003,6 +1080,7 @@ impl LlamaCppEngine {
         path: &Path,
     ) -> Result<PrefixReport, GenError> {
         let t = Instant::now();
+        let cancel = self.cfg.cancel.clone();
         let prefix = self.stable_prefix(req)?;
         if prefix.len() >= self.cfg.n_ctx as usize {
             return Err(GenError::ContextWindowExceeded);
@@ -1088,30 +1166,30 @@ impl LlamaCppEngine {
             }
         }
 
-        let fresh = &prefix[start..];
-        let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
-        let last = fresh.len() - 1;
-        for (i, tok) in fresh.iter().enumerate() {
-            batch
-                .add(*tok, (start + i) as i32, &[0], i == last)
-                .map_err(|e| GenError::Generate(e.to_string()))?;
-        }
         // Mirrors a real turn's prefill exactly, drafter bookkeeping included.
         // Gemma 4's MTP head shares the target's KV memory rather than keeping
         // its own, which is what makes persisting the target's sequence enough
         // for speculation to work on the restored turn as well.
+        // The window this batch may later be reused for, in tokens, and 0 when
+        // there is no drafter. Doubles as the `feed the drafter` flag.
+        let drafting = if matches!(loaded.dec, Decoder::Mtp(_)) {
+            1 + self.cfg.draft_n_max.max(0) as usize
+        } else {
+            0
+        };
         if let Decoder::Mtp(spec) = &mut loaded.dec {
             spec.begin(&prefix)
                 .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
         }
-        loaded
-            .dec
-            .ctx()
-            .decode(&mut batch)
-            .map_err(|e| GenError::Generate(e.to_string()))?;
-        if let Decoder::Mtp(spec) = &mut loaded.dec {
-            spec.process(&batch)
-                .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+        Self::prefill_span(loaded, &prefix, start, prefix.len(), 0, drafting, cancel.as_ref())?;
+        // A cancel that lands during the LAST chunk still reaches here, and the
+        // state file is the one artifact of a stopped call that would outlive
+        // the process: written now, every later launch would restore it as if
+        // it had been asked for. The tokens themselves are recorded, because
+        // they are genuinely in the cache.
+        if cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
+            loaded.cached.insert(0, prefix.clone());
+            return Err(GenError::Cancelled);
         }
 
         if let Some(parent) = path.parent() {
@@ -1163,6 +1241,92 @@ impl LlamaCppEngine {
             ms,
             path: path.display().to_string(),
         })
+    }
+
+    /// Read `tokens[start..end]` into `seq`, returning the batch that carried
+    /// the last of them so the caller can sample from its logits.
+    ///
+    /// **This is the only interruption point that can reach inside prefill.**
+    /// A per-token check in the decode loop cannot: prefill is ONE
+    /// `llama_decode` over the whole prompt, and llama.cpp splits it into
+    /// physical micro-batches internally, so the Rust side does not get a turn
+    /// until the first token is sampled. Measured on E2B at `n_ubatch` 128,
+    /// 6,297 prompt tokens: 13.4s of it, and E4B's ~7,700-token prompts are the
+    /// ~27s the persisted prefix exists to remove.
+    ///
+    /// The upstream answer to that would be ggml's abort callback, and it is not
+    /// available here: llama-cpp-2 exposes neither the raw `llama_context` nor
+    /// `llama_context_params`, and on Metal it would be inert anyway. The
+    /// Metal backend does not publish `ggml_backend_set_abort_callback` from
+    /// its registry, so `llama_context::set_abort_callback` installs the hook
+    /// on the CPU backend only, and ggml-metal's own abort check sits inside
+    /// its Metal-capture debug branch.
+    ///
+    /// So the split is made HERE instead, at the same boundary llama.cpp would
+    /// have split on, which leaves each dispatch exactly the shape it had. A
+    /// prefill split at a token boundary is arithmetically identical to an
+    /// unsplit one under causal attention, which the checkpoint machinery in
+    /// `generate_impl` already relies on.
+    ///
+    /// Unarmed, `chunk` is the whole span: one batch, one decode, one
+    /// allocation, which is what every caller got before cancellation existed.
+    fn prefill_span(
+        loaded: &mut Loaded,
+        tokens: &[llama_cpp_2::token::LlamaToken],
+        start: usize,
+        end: usize,
+        seq: i32,
+        draft_slots: usize,
+        cancel: Option<&CancelHandle>,
+    ) -> Result<LlamaBatch<'static>, GenError> {
+        let span = &tokens[start..end];
+        let chunk = match cancel {
+            None => span.len(),
+            Some(_) => loaded.dec.ctx().n_ubatch().max(1) as usize,
+        };
+        // `draft_slots` is in the capacity because `generate_impl` goes on to
+        // reuse this batch for its speculative steps. Unarmed that was free,
+        // since the capacity came from the prompt and dwarfed a draft step. Once
+        // `chunk` is `n_ubatch`, a good interruption granularity would otherwise
+        // silently become a batch too small for the window that follows it.
+        let mut batch = LlamaBatch::new(chunk.min(span.len()).max(512).max(draft_slots), 1);
+        let mut at = 0usize;
+        while at < span.len() {
+            if cancel.is_some_and(CancelHandle::is_cancelled) {
+                // What the sequence actually holds, recorded before returning.
+                // Everything up to here was decoded contiguously from position
+                // 0, so this is a truthful continue-only cache the next turn can
+                // extend, the same contract the persisted prefix and the SWA
+                // checkpoints are validated against. Trimming BACK to where the
+                // turn started would be the wrong repair: a windowed SWA cache
+                // cannot rewind.
+                loaded.cached.insert(seq as u32, tokens[..start + at].to_vec());
+                return Err(GenError::Cancelled);
+            }
+            let upto = (at + chunk).min(span.len());
+            batch.clear();
+            // Logits on the span's final token only. An intermediate chunk is
+            // pure context, and asking for its logits would pay a 262K-row
+            // output projection for a row nothing reads.
+            for (i, t) in span[at..upto].iter().enumerate() {
+                batch
+                    .add(*t, (start + at + i) as i32, &[seq], at + i == span.len() - 1)
+                    .map_err(|e| GenError::Generate(e.to_string()))?;
+            }
+            loaded
+                .dec
+                .ctx()
+                .decode(&mut batch)
+                .map_err(|e| GenError::Generate(e.to_string()))?;
+            if draft_slots > 0 {
+                if let Decoder::Mtp(spec) = &mut loaded.dec {
+                    spec.process(&batch)
+                        .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
+                }
+            }
+            at = upto;
+        }
+        Ok(batch)
     }
 
     /// Delete every `prefix-*.kv` beside `keep` that is not `keep`.
@@ -1317,6 +1481,7 @@ impl LlamaCppEngine {
                 "no prefix_cache_dir configured, so there is nowhere to persist a prefix".into(),
             ));
         };
+        self.clear_cancel();
         self.ensure_loaded()?;
         let prefix = self.stable_prefix(req)?;
         let current = {
@@ -1405,6 +1570,7 @@ impl GenerationEngine for LlamaCppEngine {
     }
 
     fn generate(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
+        self.clear_cancel();
         let out = self.generate_impl(req);
         match &out {
             // Fires before any decode touches the KV cache, and hosts retry it
@@ -1418,6 +1584,12 @@ impl GenerationEngine for LlamaCppEngine {
             // good. Unloading here would make one malformed request cost the
             // next good one a multi-second reload.
             Err(GenError::Invalid(_)) => {}
+            // The host stopped this turn, which is not a fault to recover from.
+            // Every cancel point leaves the slot's KV cache and its token
+            // bookkeeping agreeing with each other, which is the contract that
+            // makes the engine reusable, so unloading here would throw away
+            // multi-gigabyte warm weights, and the reload, to fix nothing.
+            Err(GenError::Cancelled) => {}
             // Any other failure may have left llama.cpp's state inconsistent
             // with the slot bookkeeping, and the engine cannot tell from here.
             // The desktop's memory deriver found the concrete case: a Metal
@@ -1466,6 +1638,10 @@ impl LlamaCppEngine {
         }
 
         let load_ms = self.ensure_loaded()?;
+        // Both read up front so the code below stays readable once `loaded`
+        // holds a mutable borrow of `self`.
+        let cancel = self.cfg.cancel.clone();
+        let draft_n_max = self.cfg.draft_n_max.max(0) as usize;
         let enable_thinking = req.enable_thinking.unwrap_or(self.cfg.enable_thinking);
         let n_ctx = self.cfg.n_ctx;
 
@@ -1703,6 +1879,9 @@ impl LlamaCppEngine {
         let slot = req.slot;
         let speculative =
             slot == 0 && matches!(loaded.dec, Decoder::Mtp(_)) && grammar.is_none();
+        // In tokens, because prefill_span sizes its batch to hold this: the
+        // batch it returns is the one the speculative steps below reuse.
+        let draft_slots = if speculative { 1 + draft_n_max } else { 0 };
         let prior = loaded.cached.entry(slot).or_default();
         let common = prior
             .iter()
@@ -2027,24 +2206,15 @@ impl LlamaCppEngine {
             // boundary already IS the capture point, i.e. an appended turn
             // whose fresh tail is shorter than the margin).
             if cap > prefilled {
-                let head = &tokens[prefilled..cap];
-                let mut b = LlamaBatch::new(head.len().max(512), 1);
-                let last = head.len() - 1;
-                for (i, t) in head.iter().enumerate() {
-                    b.add(*t, (prefilled + i) as i32, &[slot as i32], i == last)
-                        .map_err(|e| GenError::Generate(e.to_string()))?;
-                }
-                loaded
-                    .dec
-                    .ctx()
-                    .decode(&mut b)
-                    .map_err(|e| GenError::Generate(e.to_string()))?;
-                if speculative {
-                    if let Decoder::Mtp(spec) = &mut loaded.dec {
-                        spec.process(&b)
-                            .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
-                    }
-                }
+                Self::prefill_span(
+                    loaded,
+                    &tokens,
+                    prefilled,
+                    cap,
+                    slot as i32,
+                    draft_slots,
+                    cancel.as_ref(),
+                )?;
                 prefilled = cap;
             }
             // Best-effort: a turn without a checkpoint is a turn that may pay
@@ -2074,26 +2244,15 @@ impl LlamaCppEngine {
             }
         }
 
-        let fresh = &tokens[prefilled..];
-        let mut batch = LlamaBatch::new(fresh.len().max(512), 1);
-        let last = fresh.len() - 1;
-        for (i, t) in fresh.iter().enumerate() {
-            batch
-                .add(*t, (prefilled + i) as i32, &[slot as i32], i == last)
-                .map_err(|e| GenError::Generate(e.to_string()))?;
-        }
-
-        loaded
-            .dec
-            .ctx()
-            .decode(&mut batch)
-            .map_err(|e| GenError::Generate(e.to_string()))?;
-        if speculative {
-            if let Decoder::Mtp(spec) = &mut loaded.dec {
-                spec.process(&batch)
-                    .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
-            }
-        }
+        let mut batch = Self::prefill_span(
+            loaded,
+            &tokens,
+            prefilled,
+            tokens.len(),
+            slot as i32,
+            draft_slots,
+            cancel.as_ref(),
+        )?;
         // Building the prefix IS prefill, so it is reported as prefill. Hiding it
         // would make the turn that pays for the file look free and every later
         // turn look unchanged, which is the opposite of what the number is for.
@@ -2150,7 +2309,19 @@ impl LlamaCppEngine {
         // try_accept(...)`), and the NEXT sample aborts the process on
         // `GGML_ASSERT(!stacks.empty())`. Found by the json_schema test the
         // first time it ran.
+        let mut cancelled = false;
         'gen: while output_tokens < MAX_OUTPUT_TOKENS {
+            // One check per token, which bounds a stop to a single decode step
+            // (a speculative window at most). Here rather than anywhere else in
+            // the loop because of the invariant this point has and no other
+            // does: `next` is sampled but not yet in the cache, and the previous
+            // iteration has already rolled back its rejected drafts, so `cached`
+            // and the KV agree exactly. Nothing needs repairing, and the
+            // write-back below is the same line a completed turn runs.
+            if cancel.as_ref().is_some_and(CancelHandle::is_cancelled) {
+                cancelled = true;
+                break 'gen;
+            }
             // The end-of-turn token stays in the text: the parser's grammar
             // matches a complete turn. See failure mode 3 in the module docs.
             let piece = loaded
@@ -2299,6 +2470,18 @@ impl LlamaCppEngine {
                     // activation with a tiny budget), not impossible.
                     let mut committed = 0usize;
                     let mut budget_cut = false;
+                    // A turn that ends inside an accepted draft leaves this
+                    // loop by flag, not by `break 'gen`, and that is the whole
+                    // point: leaving 'gen from in here jumped over the KV
+                    // rollback below, so the proposals this window did NOT
+                    // commit stayed in the cache at positions `cached` (written
+                    // back at the end of the turn) does not know about. The next
+                    // turn then read that record, found its prompt extends it,
+                    // took the `reuse == prior_len` fast path that trims
+                    // nothing, and decoded on top of the stale cells. Both cells
+                    // carry the same sequence and position, so attention sees
+                    // both: a corrupted answer, not a slow one.
+                    let mut end_turn = false;
                     for d in drafts.iter().take(accepted) {
                         let piece = loaded
                             .model
@@ -2317,10 +2500,12 @@ impl LlamaCppEngine {
                             // marker has to be captured here too, not only on
                             // the directly sampled path above.
                             stop_piece = Some(piece);
-                            break 'gen;
+                            end_turn = true;
+                            break;
                         }
                         if output_tokens >= MAX_OUTPUT_TOKENS {
-                            break 'gen;
+                            end_turn = true;
+                            break;
                         }
                         if rbudget.as_ref().is_some_and(|rb| rb.forcing()) {
                             budget_cut = true;
@@ -2332,18 +2517,23 @@ impl LlamaCppEngine {
                     // drop them: keeping them would corrupt every later position.
                     // A no-op when everything was accepted. A budget cut rolls
                     // back the same way: the surviving drafts were never
-                    // committed, so the cache must not carry them.
+                    // committed, so the cache must not carry them. Every exit
+                    // from the commit loop above reaches this, including the two
+                    // that end the turn, which is what keeps the loop-top
+                    // invariant ("`cached` and the KV agree exactly") true for
+                    // the last window as well as every earlier one.
                     n_cur = pos_of_next + 1 + committed as i32;
                     spec.target_context_mut()
                         .kv_cache_seq_rm(0, Some(n_cur as u32), None)
                         .map_err(|e| GenError::Generate(format!("kv rollback: {e}")))?;
                     // Told the COMMITTED count, after the commit loop, so a
                     // budget cut reports the same boundary the KV rollback
-                    // just enforced. The `break 'gen` paths above skip this
-                    // call entirely, which is safe: `begin` on the next turn
-                    // resets the wrapper's pending-draft latch.
+                    // just enforced.
                     spec.accept(committed as u16)
                         .map_err(|e| GenError::Generate(format!("mtp accept: {e}")))?;
+                    if end_turn {
+                        break 'gen;
+                    }
                     next = if budget_cut {
                         // The forced close begins at the cut, dictated rather
                         // than sampled; `follow` belonged to the discarded
@@ -2358,6 +2548,14 @@ impl LlamaCppEngine {
             }
         }
         loaded.cached.insert(slot, cached);
+        // After the write-back, so the tokens this turn did decode stay
+        // reusable: an identical retry reuses everything up to its divergence
+        // exactly as it would after a completed turn. Before the parse, because
+        // a half-written turn is not a turn and must never reach a caller as
+        // one.
+        if cancelled {
+            return Err(GenError::Cancelled);
+        }
         let decode_ms = t_decode.elapsed().as_millis() as u64;
         if draft_proposed > 0 {
             eprintln!(

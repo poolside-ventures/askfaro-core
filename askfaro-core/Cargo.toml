@@ -51,6 +51,15 @@ embeddinggemma = ["search", "dep:ort", "dep:tokenizers"]
 # Non-default on purpose: a consumer who only wants `search` must never inherit
 # an inference runtime.
 llama-cpp = ["generation", "model", "dep:llama-cpp-2", "dep:cc"]
+# Which accelerator to compile is still the CONSUMER's choice, but it is made
+# through these rather than by the consumer declaring llama-cpp-2 itself. That
+# is the only way cargo lets you switch on a dependency's feature, and it drags
+# a second version requirement for llama-cpp-2 into the app's manifest: two
+# places to keep in step, and two llama.cpp source trees on any machine where
+# they drift (the build.rs header hunt exists because of exactly that).
+metal = ["llama-cpp", "llama-cpp-2/metal"]
+cuda = ["llama-cpp", "llama-cpp-2/cuda"]
+vulkan = ["llama-cpp", "llama-cpp-2/vulkan"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

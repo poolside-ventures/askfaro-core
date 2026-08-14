@@ -69,24 +69,68 @@ impl GemmaEmbedder {
         })
     }
 
+    /// `None` is the contract [`EmbedEngine`] gives callers, and it carries no
+    /// reason. So the reason is printed here instead of being dropped: a host
+    /// that logs "embedding failed" and nothing else leaves no way to tell a
+    /// text too long for the graph from a corrupt model file from a poisoned
+    /// mutex. Same failure mode, and same fix, as the parse path in
+    /// `generation::llama_cpp` (5c8c230).
     fn embed_one(&self, prompted: &str) -> Option<Vec<f32>> {
-        let enc = self.tokenizer.encode(prompted, true).ok()?;
+        match self.run_one(prompted) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!(
+                    "embeddinggemma: embed failed for {} chars: {e}",
+                    prompted.len()
+                );
+                None
+            }
+        }
+    }
+
+    fn run_one(&self, prompted: &str) -> Result<Vec<f32>, String> {
+        let enc = self
+            .tokenizer
+            .encode(prompted, true)
+            .map_err(|e| format!("tokenize: {e}"))?;
         let ids: Vec<i64> = enc.get_ids().iter().map(|&x| x as i64).collect();
         let mask: Vec<i64> = enc.get_attention_mask().iter().map(|&x| x as i64).collect();
         let n = ids.len();
-        let id_tensor = Tensor::from_array(([1_usize, n], ids)).ok()?;
-        let mask_tensor = Tensor::from_array(([1_usize, n], mask)).ok()?;
-        let mut session = self.session.lock().ok()?;
+        // The graph hard-fails past its window rather than degrading, and the
+        // tokenizer is configured to truncate there, so a sequence that arrives
+        // longer than MAX_TOKENS means the truncation did not apply (a tokenizer
+        // file carrying its own config, for instance). Say which of the two it
+        // is instead of letting ort report an opaque shape error.
+        if n > MAX_TOKENS {
+            return Err(format!(
+                "{n} tokens after truncation, past the {MAX_TOKENS}-token window"
+            ));
+        }
+        let id_tensor =
+            Tensor::from_array(([1_usize, n], ids)).map_err(|e| format!("input_ids: {e}"))?;
+        let mask_tensor =
+            Tensor::from_array(([1_usize, n], mask)).map_err(|e| format!("attention_mask: {e}"))?;
+        let mut session = self.session.lock().map_err(|e| format!("session lock: {e}"))?;
         let outputs = session
             .run(ort::inputs![
                 "input_ids" => id_tensor,
                 "attention_mask" => mask_tensor,
             ])
-            .ok()?;
-        let (_, data) = outputs["sentence_embedding"]
+            .map_err(|e| format!("onnx run ({n} tokens): {e}"))?;
+        let (_, data) = outputs
+            .get("sentence_embedding")
+            .ok_or_else(|| {
+                format!(
+                    "no sentence_embedding output; graph exposes [{}]",
+                    outputs.keys().collect::<Vec<_>>().join(", ")
+                )
+            })?
             .try_extract_tensor::<f32>()
-            .ok()?;
-        Some(data.to_vec())
+            .map_err(|e| format!("sentence_embedding extract: {e}"))?;
+        if data.is_empty() {
+            return Err(format!("empty sentence_embedding for {n} tokens"));
+        }
+        Ok(data.to_vec())
     }
 }
 
