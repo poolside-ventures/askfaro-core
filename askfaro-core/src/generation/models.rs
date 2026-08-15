@@ -6,14 +6,59 @@
 
 use crate::model::{ModelFile, ModelSpec};
 
-/// Gemma 4 E4B, instruction-tuned, QAT q4_0. **The shipping brain.**
+/// Gemma 4 E2B, instruction-tuned, **quantization-aware-trained q4_0**.
+/// **The mobile brain, and only that.**
+///
+/// This spec was removed on 2026-08-09 and is restored deliberately, for a
+/// workload the disqualification never covered. It was cut because the 20-case
+/// bench found 5 deterministic TOOL-CALLING failures (one wrong tool, four
+/// argument misses) that E4B does not have — a verdict about an agent loop
+/// choosing and parameterising tools. Mobile runs no agent loop: it runs
+/// one-shot drafting and two grammar-constrained style derivations, where the
+/// sampler makes a malformed answer unrepresentable rather than merely
+/// unlikely. On that path E2B scored 26/26 (drafting, both overlay depths and
+/// the profile compile) and beat E4B on decisiveness, 30/30 against 24/30; it
+/// lost on engaging with specifics, 60% against 90%. See
+/// `scope/docs/on-device-capability-status.md`.
+///
+/// **Do not promote this to the desktop brain on the strength of that.** The
+/// tool-calling failures are still real and still unfixed; nothing here
+/// re-litigates them.
+///
+/// What forces the choice is memory. E4B is 5.15 GB of weights before KV cache
+/// and Metal compute buffers, which no shipping iPhone can hold in a
+/// foregrounded app. E2B at 3.35 GB is the only member of the family that is
+/// even a candidate, and whether it fits is itself measured, not assumed.
+///
+/// Google's own QAT GGUF, chosen over the community requantizations so the
+/// existing measurements transfer rather than needing to be re-established.
+/// Byte-comparable to what Ollama serves as `gemma4:e2b-it-qat`: 3,349,516,256
+/// here against Ollama's 3,349,514,112, a 2,144-byte difference that is Ollama's
+/// GGUF metadata rewriting, not different weights. Swapping quant (Q4_K_M,
+/// IQ4_XS, a UD variant) is a **measurable change, not a free one**.
+///
+/// One file, unlike the ONNX specs: a GGUF carries weights, tokenizer and chat
+/// template together, which is also why the engine can read the chat template
+/// straight out of the model rather than being told which family it is.
+pub const GEMMA4_E2B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
+    id: "gemma-4-e2b-it-qat-q4_0",
+    display_name: "Gemma 4 E2B (instruction-tuned, QAT q4_0)",
+    files: &[ModelFile {
+        name: "gemma-4-E2B_q4_0-it.gguf",
+        url: "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf",
+        sha256: "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+        size: 3_349_516_256,
+    }],
+};
+
+/// Gemma 4 E4B, instruction-tuned, QAT q4_0. **The shipping DESKTOP brain.**
 ///
 /// Chosen over E2B on quality: E4B is materially better at memory processing,
-/// which is the work that matters. E2B's spec was REMOVED 2026-08-08 — its
-/// error rate made it unusable in practice (the 20-case bench that once
-/// scored it 94% later showed 5 deterministic failures E4B does not have),
-/// and nothing shipped it. The numbers below that cite E2B are historical
-/// baselines, not an available alternative.
+/// which is the work that matters, and it does not have E2B's deterministic
+/// tool-calling failures. That verdict stands for anything running an agent
+/// loop. It does not reach mobile, which cannot hold these weights at all —
+/// see [`GEMMA4_E2B_IT_QAT_Q4_0`] above for the workload that survives on E2B
+/// and the reason it is a different question.
 ///
 /// It is NOT chosen on raw decode, where it runs at roughly half E2B's rate. It
 /// wins the thing a user actually waits for, because it says the same thing in
