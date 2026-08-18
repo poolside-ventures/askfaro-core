@@ -69,6 +69,15 @@ pub struct RawHit {
     pub partition: Option<String>,
     pub title: Option<String>,
     pub payload: Option<String>,
+    /// The indexed text. Searched by every retriever and, until 2026-08-18,
+    /// discarded by all of them: a caller could match on a document's contents
+    /// and never read them back.
+    pub body: Option<String>,
+    /// The stamped attribute JSON that [`Filters::attrs`] filters on. Returned
+    /// for the same reason as `body`: a caller that can filter on an attribute
+    /// but not read it has to re-fetch the row from somewhere else to learn what
+    /// it just matched.
+    pub attrs: Option<String>,
     /// Populated by the semantic retriever only.
     pub sim: Option<f32>,
 }
@@ -118,6 +127,15 @@ pub struct SearchResult {
     pub partition: Option<String>,
     pub title: Option<String>,
     pub payload: Option<String>,
+    /// The indexed text, carried through from [`RawHit::body`].
+    ///
+    /// A result used to be title + payload only, which quietly made `payload`
+    /// the sole channel for anything a caller wanted to display. Consumers then
+    /// denormalized content INTO the payload to get it back, duplicating what
+    /// the index already stored. Returning the body removes that pressure.
+    pub body: Option<String>,
+    /// The stamped attributes, carried through from [`RawHit::attrs`].
+    pub attrs: Option<String>,
     pub score: f64,
     pub match_type: MatchType,
     pub lexical_rank: Option<usize>,

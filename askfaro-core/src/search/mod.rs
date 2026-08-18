@@ -279,6 +279,8 @@ pub fn list(
             partition: h.partition,
             title: h.title,
             payload: h.payload,
+            body: h.body,
+            attrs: h.attrs,
             score: 0.0,
             match_type: MatchType::Filter,
             lexical_rank: None,
@@ -326,6 +328,43 @@ mod tests {
         old.source_updated_at = "2026-06-01T00:00:00Z".into();
         index.upsert_many(&[live, old]).unwrap();
         index
+    }
+
+    /// A result carries the document, not just a label for it.
+    ///
+    /// Until 2026-08-18 `SearchResult` was title + payload, so a caller could
+    /// search a body it was never allowed to read and filter on an attr it
+    /// could not inspect. Consumers worked around it by copying content into
+    /// the payload, duplicating what the index already held. Both retrieval
+    /// paths are asserted because they build `RawHit` from separate queries
+    /// with separate column orders, which is exactly where a shifted index
+    /// would go unnoticed.
+    #[test]
+    fn results_carry_body_and_attrs_on_both_paths() {
+        let index = seeded_index();
+
+        let listed = index
+            .list(&SearchParams {
+                k: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let n1 = listed.iter().find(|r| r.object_id == "n1").unwrap();
+        assert_eq!(n1.body.as_deref(), Some("milk eggs bread"));
+        assert_eq!(n1.attrs.as_deref(), Some(r#"{"archived": false}"#));
+
+        let searched = index
+            .search(
+                "dentist",
+                &SearchParams {
+                    k: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let n2 = searched.iter().find(|r| r.object_id == "n2").unwrap();
+        assert_eq!(n2.body.as_deref(), Some("call the dentist"));
+        assert_eq!(n2.attrs.as_deref(), Some(r#"{"archived": true}"#));
     }
 
     #[test]

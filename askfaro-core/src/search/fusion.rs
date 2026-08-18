@@ -69,6 +69,8 @@ pub fn rrf_fuse(lexical: &[RawHit], semantic: &[RawHit]) -> Vec<SearchResult> {
             partition: hit.partition.clone(),
             title: hit.title.clone(),
             payload: hit.payload.clone(),
+            body: hit.body.clone(),
+            attrs: hit.attrs.clone(),
             score,
             match_type,
             lexical_rank: lex_rank,

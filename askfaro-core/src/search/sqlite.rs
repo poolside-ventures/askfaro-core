@@ -449,7 +449,8 @@ impl SqliteBackend {
         };
         let sql = format!(
             "SELECT si.object_type, si.object_id, si.node_kind, si.partition_key, \
-                    si.title, si.payload, MAX(si.source_updated_at) AS sua \
+                    si.title, si.payload, si.body, si.attrs, \
+                    MAX(si.source_updated_at) AS sua \
              FROM search_index si \
              WHERE si.deleted_at IS NULL{where_sql}{group_sql} \
              ORDER BY sua DESC, si.object_id DESC LIMIT ?"
@@ -466,6 +467,8 @@ impl SqliteBackend {
                 partition: r.get(3)?,
                 title: r.get(4)?,
                 payload: r.get(5)?,
+                body: r.get(6)?,
+                attrs: r.get(7)?,
                 sim: None,
             })
         })?;
@@ -485,7 +488,7 @@ impl SqliteBackend {
         let (where_sql, fparams) = self.filter_sql(filters)?;
         let sql = format!(
             "SELECT si.object_type, si.object_id, si.node_kind, si.partition_key, \
-                    si.title, si.payload \
+                    si.title, si.payload, si.body, si.attrs \
              FROM search_fts \
              JOIN search_index si ON si.id = search_fts.rowid \
              WHERE search_fts MATCH ? AND si.deleted_at IS NULL{where_sql} \
@@ -504,6 +507,8 @@ impl SqliteBackend {
                 partition: r.get(3)?,
                 title: r.get(4)?,
                 payload: r.get(5)?,
+                body: r.get(6)?,
+                attrs: r.get(7)?,
                 sim: None,
             })
         })?;
@@ -526,14 +531,14 @@ impl SqliteBackend {
         let (where_sql, params) = self.filter_sql(filters)?;
         let sql = format!(
             "SELECT si.object_type, si.object_id, si.node_kind, si.partition_key, \
-                    si.title, si.payload, si.{c} \
+                    si.title, si.payload, si.body, si.attrs, si.{c} \
              FROM search_index si \
              WHERE si.{c} IS NOT NULL AND si.deleted_at IS NULL{where_sql}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let mut scored: Vec<(f32, RawHit)> = stmt
             .query_map(params_from_iter(params), |r| {
-                let blob: Vec<u8> = r.get(6)?;
+                let blob: Vec<u8> = r.get(8)?;
                 let sim = cosine(query_vec, &unpack(&blob));
                 Ok((
                     sim,
@@ -544,6 +549,8 @@ impl SqliteBackend {
                         partition: r.get(3)?,
                         title: r.get(4)?,
                         payload: r.get(5)?,
+                        body: r.get(6)?,
+                        attrs: r.get(7)?,
                         sim: Some(sim),
                     },
                 ))
