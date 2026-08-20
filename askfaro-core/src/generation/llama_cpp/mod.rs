@@ -1339,6 +1339,50 @@ impl LlamaCppEngine {
         Self::prefix_path_for(cfg)
     }
 
+    /// The state's SHAPE, as a short id for whoever publishes and whoever
+    /// downloads a prebuilt artifact.
+    ///
+    /// [`Self::prefix_key_for`] already answers "may this file be opened", but
+    /// only on the machine that holds the file: it hashes local paths, so it
+    /// cannot name an artifact in a bucket. A published artifact therefore
+    /// needs its own name for the same question, and the name has to be
+    /// derivable on both sides from the same fields.
+    ///
+    /// **This exists because the URL could not express a shape change and a
+    /// shape change is silent.** The published key was
+    /// `{model-id}-{weights-sha}/v1/{prompt-fingerprint}`, which covers the
+    /// WEIGHTS and the PROMPT and nothing else. When the desktop moved its
+    /// window from 16,384 to 65,536 on 2026-08-20, the publisher kept building
+    /// at the old default and the URL stayed byte-identical, so a fresh install
+    /// would fetch a 16k-shaped state, rename it into its own 64k key, and hand
+    /// llama.cpp a cache built under a different layout. That is the same class
+    /// of mismatch the weights half of the key exists to prevent, and the token
+    /// check at restore cannot see it either: the tokens are right, the values
+    /// are for a different cache.
+    ///
+    /// The weights and the paths are deliberately NOT in here. The weights are
+    /// the other half of the published key already, and the paths are the part
+    /// that cannot travel. Everything else that [`Self::prefix_key_for`] hashes
+    /// is, so adding a field there and forgetting it here is the one drift this
+    /// is meant to make impossible — keep the two lists together.
+    pub fn prefix_shape_id(cfg: &LlamaCppConfig) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"askfaro-kv-prefix-shape-v1\0");
+        h.update(cfg.n_ctx.to_le_bytes());
+        h.update(cfg.n_slots.to_le_bytes());
+        h.update(cfg.n_gpu_layers.to_le_bytes());
+        for p in &cfg.cpu_tensor_overrides {
+            h.update(p.as_bytes());
+            h.update(b"\0");
+        }
+        h.update([u8::from(cfg.use_mmap)]);
+        h.update([u8::from(cfg.enable_thinking)]);
+        h.update([u8::from(cfg.swa_full)]);
+        h.update([cfg.cache_type_k as u8, cfg.cache_type_v as u8]);
+        hex::encode(&h.finalize()[..6])
+    }
+
     /// The invalidation key, as a file name.
     ///
     /// **A stale restore is not an error, it is wrong output.** llama.cpp's
@@ -3221,6 +3265,42 @@ mod tests {
         assert_eq!(
             LlamaCppEngine::prefix_key_for(&cfg()),
             LlamaCppEngine::prefix_key_for(&c)
+        );
+    }
+
+    /// The published artifact's shape id moves when the WINDOW moves.
+    ///
+    /// This is the regression that armed a live hazard on 2026-08-20: the
+    /// desktop went from 16,384 to 65,536 while the publish path said `v1`
+    /// either way, so a 16k-shaped state was addressable at the URL a 64k
+    /// install fetches. The URL now carries this id on both sides, and the
+    /// property that makes it worth carrying is exactly this one.
+    #[test]
+    fn the_shape_id_moves_with_the_window() {
+        let mut c = cfg();
+        c.n_ctx = 65536;
+        assert_ne!(
+            LlamaCppEngine::prefix_shape_id(&cfg()),
+            LlamaCppEngine::prefix_shape_id(&c)
+        );
+    }
+
+    /// ...and does NOT move for a background context, for the same reason
+    /// [`an_extra_context_does_not_move_the_prefix_key`] gives. The two hashes
+    /// read the same fields and must agree about which ones; a published
+    /// artifact that went stale whenever a host retuned a background window
+    /// would send every install back to a cold build for nothing.
+    #[test]
+    fn an_extra_context_does_not_move_the_shape_id() {
+        let mut c = cfg();
+        c.extra_contexts = vec![ContextSpec {
+            n_ctx: 4096,
+            n_slots: 1,
+            n_ubatch: Some(128),
+        }];
+        assert_eq!(
+            LlamaCppEngine::prefix_shape_id(&cfg()),
+            LlamaCppEngine::prefix_shape_id(&c)
         );
     }
 

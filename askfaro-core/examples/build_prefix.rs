@@ -34,11 +34,51 @@ fn read_json(path: &str) -> Value {
 
 fn main() {
     let mut args = std::env::args().skip(1);
+
+    // `--print-shape <n_ctx>`: the shape half of the publish path, without
+    // weights, without a GPU and without a prompt. The pipeline needs the URL
+    // BEFORE it decides whether to spend a 5 GB download and a cold prefill on
+    // rebuilding what is already published, and the shape is a pure function of
+    // the config. Reimplementing that hash in the workflow would be a second
+    // statement of the spec, which is the drift this whole pipeline is built to
+    // avoid.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--print-shape") {
+        let n_ctx: u32 = argv.get(1).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+            eprintln!("usage: build_prefix --print-shape <n_ctx>");
+            std::process::exit(2);
+        });
+        println!(
+            "{}",
+            LlamaCppEngine::prefix_shape_id(&LlamaCppConfig { n_ctx, ..Default::default() })
+        );
+        return;
+    }
+
     let (model_path, repo, draft, out) = match (args.next(), args.next(), args.next(), args.next())
     {
         (Some(m), Some(r), Some(d), Some(o)) => (m, r, d, o),
         _ => {
-            eprintln!("usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv>");
+            eprintln!(
+                "usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> <n_ctx>"
+            );
+            std::process::exit(2);
+        }
+    };
+    // REQUIRED, and deliberately not defaulted. It used to inherit
+    // `LlamaCppConfig::default()`, which was 16,384 and happened to equal the
+    // desktop's window — until the desktop moved to 65,536 on 2026-08-20 and
+    // this kept publishing a 16k-shaped state under a URL that could not say
+    // so. A default here is a silent agreement with a caller that is free to
+    // change, so the caller states it and a mismatch is a missing argument
+    // rather than a wrong artifact.
+    let n_ctx: u32 = match args.next().map(|v| v.parse()) {
+        Some(Ok(v)) => v,
+        _ => {
+            eprintln!(
+                "error: pass n_ctx explicitly; it must equal the app's \
+                 GEMMA4_E4B.contextWindow (shared/src/agent/model-profile.ts)"
+            );
             std::process::exit(2);
         }
     };
@@ -80,11 +120,13 @@ fn main() {
         model_path: model_path.clone().into(),
         draft_path: Some(draft.into()),
         prefix_cache_dir: Some(staging.clone()),
+        n_ctx,
         // Only the file NAME depends on this; the artifact is renamed by the
         // installing host anyway. Content depends on the fields above.
         state_key: "prefix-artifact".into(),
         ..Default::default()
     };
+    let shape = LlamaCppEngine::prefix_shape_id(&cfg);
     let artifact_src = LlamaCppEngine::prefix_artifact_path(&cfg).expect("cache dir configured");
 
     let mut engine = LlamaCppEngine::new(cfg);
@@ -111,15 +153,17 @@ fn main() {
     println!("{out} ({:.1} MB)", bytes as f64 / 1e6);
 
     // The publish subpath, printed for the pipeline so publisher and consumer
-    // derive it from ONE place (these constants; the installing app computes
-    // the identical string from the same ones). It carries the WEIGHTS
-    // identity, not just the prompt fingerprint the pipeline appends: a
-    // weights update under the same prompt produces a state whose token list
-    // still validates while its VALUES are for the wrong model, which is the
-    // one mismatch the engine's token check cannot catch.
+    // derive it from ONE place (these constants and this function; the
+    // installing app computes the identical string from the same ones).
+    //
+    // It carries the WEIGHTS identity and the state's SHAPE, not just the
+    // prompt fingerprint the pipeline appends. Both are mismatches the engine's
+    // token check cannot catch, because in both cases the tokens are right and
+    // the cached VALUES belong to something else: to a different model in the
+    // weights case, and to a differently laid-out cache in the shape case.
     use askfaro_core::generation::models::{GEMMA4_E4B_IT_QAT_Q4_0, GEMMA4_E4B_MTP_DRAFTER_Q4_0};
     println!(
-        "artifact-subpath: {}-{}+{}/v1",
+        "artifact-subpath: {}-{}+{}/{shape}",
         GEMMA4_E4B_IT_QAT_Q4_0.id,
         &GEMMA4_E4B_IT_QAT_Q4_0.files[0].sha256[..12],
         &GEMMA4_E4B_MTP_DRAFTER_Q4_0.files[0].sha256[..12],
