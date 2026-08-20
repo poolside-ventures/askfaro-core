@@ -16,7 +16,12 @@ use askfaro_core::search::EmbedEngine;
 #[ignore = "requires the EmbeddingGemma model on EMB_GEMMA_DIR"]
 fn long_inputs_embed() {
     let dir = std::env::var("EMB_GEMMA_DIR").expect("set EMB_GEMMA_DIR to the model dir");
-    let embedder = GemmaEmbedder::load(&dir).expect("load EmbeddingGemma");
+    // The graph file is named per variant, so the shipping fp16 export can be
+    // put through the same test as the fp32 reference rather than only the
+    // reference being covered.
+    let graph = std::env::var("EMB_GEMMA_GRAPH").unwrap_or_else(|_| "model.onnx".to_string());
+    let embedder = GemmaEmbedder::load_graph(&dir, &graph, "embeddinggemma_300m_fp32")
+        .expect("load EmbeddingGemma");
 
     // Short sanity input.
     let short = embedder.embed_documents(&["hello world"]);

@@ -237,6 +237,13 @@ required-features = ["progressive"]
 name = "gemma_e2e"
 required-features = ["embeddinggemma"]
 
+# The fp16 tripwire. Needs BOTH model dirs, so it is ignored by default like the
+# other model-backed tests; the gate here only keeps it out of a featureless
+# `cargo check --all-targets`.
+[[test]]
+name = "gemma_fp16_parity"
+required-features = ["embeddinggemma"]
+
 # On-device free-tool surface (public re-exports of the vendored slice).
 [[test]]
 name = "free_tools"

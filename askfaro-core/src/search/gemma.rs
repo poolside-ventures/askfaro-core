@@ -33,6 +33,34 @@ pub enum GemmaError {
 /// as the Python sentence-transformers reference (max_seq_length = 2048).
 const MAX_TOKENS: usize = 2048;
 
+/// Session knobs that move the embedder's RESIDENT footprint. Defaults are what
+/// the shipping embedder uses; they trade a little throughput for memory, which
+/// is the right trade for a model that stays warm for the life of the app on a
+/// machine that is also holding a 4-bit brain.
+pub struct GemmaOptions {
+    /// ONNX Runtime's CPU arena allocator. Off by default: it is a high-water
+    /// mark that is never released, and the sequence lengths this embedder sees
+    /// vary continuously (every query and document is a different token count),
+    /// so the mark keeps climbing.
+    pub cpu_arena: bool,
+    /// ORT's memory-pattern planner, which pre-allocates one block sized to the
+    /// first run's shapes. Off by default for the same reason: it is a win for
+    /// fixed shapes and a leak for varying ones.
+    pub memory_pattern: bool,
+    /// Intra-op threads. `None` leaves ORT's default (one per core).
+    pub intra_threads: Option<usize>,
+}
+
+impl Default for GemmaOptions {
+    fn default() -> Self {
+        GemmaOptions {
+            cpu_arena: false,
+            memory_pattern: false,
+            intra_threads: None,
+        }
+    }
+}
+
 /// EmbeddingGemma embedder. Construct once with [`GemmaEmbedder::load`] (loading
 /// the model is the expensive step), then embed many texts.
 pub struct GemmaEmbedder {
@@ -46,6 +74,47 @@ impl GemmaEmbedder {
     /// Load from a model directory containing `model.onnx` (+ its `.onnx_data`)
     /// and `tokenizer.json` — i.e. `EMBEDDINGGEMMA_300M_FP32.dir(cache_root)`.
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, GemmaError> {
+        Self::load_graph(
+            model_dir,
+            "model.onnx",
+            crate::search::models::EMBEDDINGGEMMA_SPACE,
+        )
+    }
+
+    /// Load a variant from the model cache root — the entry point callers want,
+    /// because it is the one that cannot pair the wrong graph with the wrong
+    /// directory or the wrong space.
+    pub fn load_variant(
+        variant: &crate::search::models::GemmaVariant,
+        cache_root: &Path,
+    ) -> Result<Self, GemmaError> {
+        Self::load_graph(variant.spec.dir(cache_root), variant.graph, variant.space)
+    }
+
+    /// Load a named graph from the directory, declaring the space it writes.
+    ///
+    /// The quantized exports keep their own file names (`model_quantized.onnx`
+    /// + `model_quantized.onnx_data`), because the graph's external-data record
+    /// names its weight file: renaming the pair to `model.onnx` breaks the load.
+    /// And a variant that shifts vectors is a different space (the hard rule,
+    /// §7), so the caller names both together or neither.
+    pub fn load_graph(
+        model_dir: impl AsRef<Path>,
+        graph: &str,
+        space: &str,
+    ) -> Result<Self, GemmaError> {
+        Self::load_with(model_dir, graph, space, &GemmaOptions::default())
+    }
+
+    /// Load with explicit session options. See [`GemmaOptions`] — the defaults
+    /// are what the embedder ships with, and they are chosen for resident
+    /// footprint, not for throughput.
+    pub fn load_with(
+        model_dir: impl AsRef<Path>,
+        graph: &str,
+        space: &str,
+        opts: &GemmaOptions,
+    ) -> Result<Self, GemmaError> {
         let dir = model_dir.as_ref();
         let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| GemmaError::Load(e.to_string()))?;
@@ -55,17 +124,34 @@ impl GemmaEmbedder {
                 ..Default::default()
             }))
             .map_err(|e| GemmaError::Load(e.to_string()))?;
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| GemmaError::Load(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| GemmaError::Load(e.to_string()))?
-            .commit_from_file(dir.join("model.onnx"))
+            .with_memory_pattern(opts.memory_pattern)
+            .map_err(|e| GemmaError::Load(e.to_string()))?;
+        if let Some(n) = opts.intra_threads {
+            builder = builder
+                .with_intra_threads(n)
+                .map_err(|e| GemmaError::Load(e.to_string()))?;
+        }
+        // Registering the CPU provider explicitly is the only way to reach
+        // `DisableCpuMemArena`. The arena never returns memory: it grows to the
+        // high-water mark of every shape the session has ever seen and holds it
+        // for the life of the process, which for a warm embedder is forever.
+        builder = builder
+            .with_execution_providers([ort::ep::CPU::default()
+                .with_arena_allocator(opts.cpu_arena)
+                .build()])
+            .map_err(|e| GemmaError::Load(e.to_string()))?;
+        let session = builder
+            .commit_from_file(dir.join(graph))
             .map_err(|e| GemmaError::Load(e.to_string()))?;
         Ok(GemmaEmbedder {
             session: Mutex::new(session),
             tokenizer,
             // The model identity is the space name (the hard rule, §7).
-            space: crate::search::models::EMBEDDINGGEMMA_SPACE.to_string(),
+            space: space.to_string(),
         })
     }
 
