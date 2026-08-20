@@ -98,9 +98,11 @@ pub const EMBEDDINGGEMMA_FP16: GemmaVariant = GemmaVariant {
     space: EMBEDDINGGEMMA_SPACE,
 };
 
-/// fp32 — the parity-exact reference the space is named for, and what the server
-/// still embeds documents with. Kept as a variant so a parity check can load
-/// both without hand-assembling the triple.
+/// fp32 — the reference half of the fp16 tripwire, and a mirror of what the
+/// SERVER embeds documents with. No app provisions it: every on-device consumer
+/// downloads [`EMBEDDINGGEMMA_FP16`]. It is here so `gemma_fp16_parity` can name
+/// the thing it compares against, and so the file the server runs is written
+/// down in the same place as the file the device runs.
 pub const EMBEDDINGGEMMA_FP32: GemmaVariant = GemmaVariant {
     spec: &EMBEDDINGGEMMA_300M_FP32,
     graph: "model.onnx",
@@ -136,14 +138,13 @@ pub const EMBEDDINGGEMMA_300M_FP16: ModelSpec = ModelSpec {
 
 /// EmbeddingGemma-300M, fp32 ONNX (`onnx-community/embeddinggemma-300m-ONNX`).
 ///
-/// fp32 is the parity-exact reference (Phase 1 spike: cosine 1.0 vs the Python
-/// `onnxruntime` pipeline), and still what the SERVER embeds documents with.
-/// The device moved to [`EMBEDDINGGEMMA_FP16`]; the space is unchanged because
-/// the two produce the same vectors to seven decimals.
+/// The parity-exact reference (Phase 1 spike: cosine 1.0 vs the Python
+/// `onnxruntime` pipeline), and what the SERVER embeds documents with. **Not a
+/// model any device provisions** — see [`EMBEDDINGGEMMA_FP32`] for why it is
+/// still declared here.
 ///
 /// External-data ONNX: two files (`model.onnx` graph + `model.onnx_data`
-/// weights) plus the tokenizer. The host downloads all three; the crate verifies
-/// all three.
+/// weights) plus the tokenizer.
 pub const EMBEDDINGGEMMA_300M_FP32: ModelSpec = ModelSpec {
     id: "embeddinggemma-300m-fp32",
     display_name: "EmbeddingGemma 300M (multilingual, fp32)",

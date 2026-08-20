@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! cargo run --release --features embeddinggemma --example embed_probe -- \
-//!   "$HOME/Library/Application Support/com.getscopy.desktop/models/embeddinggemma-300m-fp32"
+//!   "$HOME/Library/Application Support/com.getscopy.desktop/models"
 //! ```
 //!
 //! An optional second argument is a file whose contents are embedded verbatim,
@@ -19,8 +19,11 @@ fn main() {
     use askfaro_core::search::gemma::GemmaEmbedder;
 
     let mut args = std::env::args().skip(1);
-    let dir = args.next().expect("usage: embed_probe <model_dir> [text_file]");
-    let embedder = match GemmaEmbedder::load(&dir) {
+    let root = args.next().expect("usage: embed_probe <model_cache_root> [text_file]");
+    let embedder = match GemmaEmbedder::load_variant(
+        &askfaro_core::search::models::EMBEDDINGGEMMA_FP16,
+        std::path::Path::new(&root),
+    ) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("load failed: {e}");

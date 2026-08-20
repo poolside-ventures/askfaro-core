@@ -11,15 +11,22 @@
 //! So this asserts the thing that would be false if that ever changed. Run it on
 //! any `ort` bump, any execution-provider change, and any new target:
 //!
+//! Both variants resolve their own directory under the model cache root, so the
+//! test names the same constants the app does rather than two hand-written paths
+//! that can drift from them:
+//!
 //! ```text
-//! EMB_GEMMA_FP32_DIR="$HOME/Library/Application Support/com.getscopy.desktop/models/embeddinggemma-300m-fp32" \
-//! EMB_GEMMA_FP16_DIR="$HOME/Library/Application Support/com.getscopy.desktop/models/embeddinggemma-300m-fp16" \
+//! EMB_GEMMA_CACHE_ROOT="$HOME/Library/Application Support/com.getscopy.desktop/models" \
 //! cargo test -p askfaro-core --features embeddinggemma --test gemma_fp16_parity -- --ignored --nocapture
 //! ```
+//!
+//! The fp32 half is not a model any device provisions; fetch it from the URLs in
+//! `EMBEDDINGGEMMA_300M_FP32` when you need to run this.
 
 #![cfg(feature = "embeddinggemma")]
 
 use askfaro_core::search::gemma::GemmaEmbedder;
+use askfaro_core::search::models::{EMBEDDINGGEMMA_FP16, EMBEDDINGGEMMA_FP32};
 use askfaro_core::search::EmbedEngine;
 
 /// Measured floor, not an aspiration: over 300 real queries the worst pair
@@ -37,14 +44,14 @@ const TEXTS: &[&str] = &[
 ];
 
 #[test]
-#[ignore = "requires both EmbeddingGemma model dirs"]
+#[ignore = "requires both EmbeddingGemma variants under EMB_GEMMA_CACHE_ROOT"]
 fn fp16_matches_fp32() {
-    let fp32_dir = std::env::var("EMB_GEMMA_FP32_DIR").expect("set EMB_GEMMA_FP32_DIR");
-    let fp16_dir = std::env::var("EMB_GEMMA_FP16_DIR").expect("set EMB_GEMMA_FP16_DIR");
+    let root = std::env::var("EMB_GEMMA_CACHE_ROOT").expect("set EMB_GEMMA_CACHE_ROOT");
+    let root = std::path::Path::new(&root);
 
-    let fp32 = GemmaEmbedder::load_graph(&fp32_dir, "model.onnx", "parity")
+    let fp32 = GemmaEmbedder::load_variant(&EMBEDDINGGEMMA_FP32, root)
         .expect("load fp32 EmbeddingGemma");
-    let fp16 = GemmaEmbedder::load_graph(&fp16_dir, "model_fp16.onnx", "parity")
+    let fp16 = GemmaEmbedder::load_variant(&EMBEDDINGGEMMA_FP16, root)
         .expect("load fp16 EmbeddingGemma");
 
     let mut worst = 1.0f32;

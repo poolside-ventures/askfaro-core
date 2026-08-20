@@ -13,13 +13,14 @@ pub use crate::model::{
     is_present, missing, sha256_file, verify, ModelFile, ModelSpec,
 };
 
-/// **The default since 2026-08-20:** NVIDIA Parakeet TDT 0.6B v3, int4 encoder,
-/// multilingual. Smaller AND more accurate than the int8 build it replaces.
+/// The on-device speech model: NVIDIA Parakeet TDT 0.6B v3, int4 encoder,
+/// multilingual. Smaller AND more accurate than the int8 build it replaced
+/// on 2026-08-20, which is why nothing here offers the int8 one any more.
 ///
 /// The encoder's linear and pointwise-Conv weights are `MatMulNBits` at 4 bits,
 /// block 64, asymmetric (depthwise Conv stays float); the decoder/joiner graph
-/// and the vocab are byte-identical to [`PARAKEET_TDT_V3_INT8`]'s, same sha256.
-/// 390 MiB against 640.
+/// and the vocab are byte-identical to the int8 build's, same sha256. 390 MiB
+/// against 640.
 ///
 /// Measured 2026-08-20 on an M1 Pro, 324 clips / 79 minutes, WER after
 /// lowercasing and stripping punctuation — int8 (what we shipped) → int4:
@@ -64,34 +65,6 @@ pub const PARAKEET_TDT_V3_INT4: ModelSpec = ModelSpec {
         ModelFile {
             name: "vocab.txt",
             url: "https://huggingface.co/efederici/parakeet-tdt-0.6b-v3-onnx-int4/resolve/main/vocab.txt",
-            sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
-            size: 93_939,
-        },
-    ],
-};
-
-/// The int8 build this replaced. `parakeet-rs` resolves the encoder by trying
-/// known names and then globbing `encoder*.onnx`, so the two must never share a
-/// directory — they do not, because the directory is the spec id.
-pub const PARAKEET_TDT_V3_INT8: ModelSpec = ModelSpec {
-    id: "parakeet-tdt-0.6b-v3-int8",
-    display_name: "Parakeet TDT 0.6B v3 (multilingual)",
-    files: &[
-        ModelFile {
-            name: "encoder-model.int8.onnx",
-            url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
-            sha256: "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09",
-            size: 652_183_999,
-        },
-        ModelFile {
-            name: "decoder_joint-model.int8.onnx",
-            url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
-            sha256: "eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70",
-            size: 18_202_004,
-        },
-        ModelFile {
-            name: "vocab.txt",
-            url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
             sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
             size: 93_939,
         },

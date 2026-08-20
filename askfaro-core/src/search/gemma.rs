@@ -61,8 +61,8 @@ impl Default for GemmaOptions {
     }
 }
 
-/// EmbeddingGemma embedder. Construct once with [`GemmaEmbedder::load`] (loading
-/// the model is the expensive step), then embed many texts.
+/// EmbeddingGemma embedder. Construct once with [`GemmaEmbedder::load_variant`]
+/// (loading the model is the expensive step), then embed many texts.
 pub struct GemmaEmbedder {
     // ort `Session::run` takes `&mut self`; a Mutex keeps `EmbedEngine` `&self`.
     session: Mutex<Session>,
@@ -71,16 +71,6 @@ pub struct GemmaEmbedder {
 }
 
 impl GemmaEmbedder {
-    /// Load from a model directory containing `model.onnx` (+ its `.onnx_data`)
-    /// and `tokenizer.json` — i.e. `EMBEDDINGGEMMA_300M_FP32.dir(cache_root)`.
-    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, GemmaError> {
-        Self::load_graph(
-            model_dir,
-            "model.onnx",
-            crate::search::models::EMBEDDINGGEMMA_SPACE,
-        )
-    }
-
     /// Load a variant from the model cache root — the entry point callers want,
     /// because it is the one that cannot pair the wrong graph with the wrong
     /// directory or the wrong space.
