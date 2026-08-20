@@ -35,22 +35,35 @@ fn read_json(path: &str) -> Value {
 fn main() {
     let mut args = std::env::args().skip(1);
 
-    // `--print-shape <n_ctx>`: the shape half of the publish path, without
-    // weights, without a GPU and without a prompt. The pipeline needs the URL
-    // BEFORE it decides whether to spend a 5 GB download and a cold prefill on
-    // rebuilding what is already published, and the shape is a pure function of
-    // the config. Reimplementing that hash in the workflow would be a second
-    // statement of the spec, which is the drift this whole pipeline is built to
-    // avoid.
+    // `--print-shape <n_ctx> <n_slots>`: the shape half of the publish path,
+    // without weights, without a GPU and without a prompt. The pipeline needs
+    // the URL BEFORE it decides whether to spend a 5 GB download and a cold
+    // prefill on rebuilding what is already published, and the shape is a pure
+    // function of the config. Reimplementing that hash in the workflow would be
+    // a second statement of the spec, which is the drift this whole pipeline is
+    // built to avoid.
+    //
+    // Both arguments are REQUIRED, for the reason `n_ctx` became required below:
+    // a default that happens to agree with its caller is a bug waiting for the
+    // caller to change. `n_slots` was left defaulted when `n_ctx` was fixed on
+    // 2026-08-20 and agreed with the desktop for exactly one day, until the
+    // background workload moved to its own context and the app dropped its base
+    // context to one slot. `prefix_shape_id` hashes BOTH, so that published
+    // every artifact under a shape id no consumer would ever ask for.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("--print-shape") {
-        let n_ctx: u32 = argv.get(1).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
-            eprintln!("usage: build_prefix --print-shape <n_ctx>");
+        let mut shape = argv.iter().skip(1).map(|v| v.parse::<u32>());
+        let (Some(Ok(n_ctx)), Some(Ok(n_slots))) = (shape.next(), shape.next()) else {
+            eprintln!("usage: build_prefix --print-shape <n_ctx> <n_slots>");
             std::process::exit(2);
-        });
+        };
         println!(
             "{}",
-            LlamaCppEngine::prefix_shape_id(&LlamaCppConfig { n_ctx, ..Default::default() })
+            LlamaCppEngine::prefix_shape_id(&LlamaCppConfig {
+                n_ctx,
+                n_slots,
+                ..Default::default()
+            })
         );
         return;
     }

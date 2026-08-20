@@ -11,9 +11,17 @@
 //!
 //! ```sh
 //! cargo run --release --features llama-cpp --example kv_footprint -- \
-//!     <model.gguf> [big] [small] [big_ubatch] [small_ubatch] 2>&1 \
+//!     <model.gguf> [big] [small] [big_ubatch] [small_ubatch] [drafter.gguf] 2>&1 \
 //!   | grep -E '===|kv_cache: size|compute buffer size|slot windows|read off disk'
 //! ```
+//!
+//! Pass the drafter to measure what the app actually holds. Read its KV lines
+//! carefully: they print a `size =` with no `MTL0 KV buffer size` above it and
+//! `layer N: sharing with layer M` below, because `new_context_with_ctx_other`
+//! points the MTP head at the TARGET's KV tensors. That `size =` is a report,
+//! not an allocation, and adding it to the target's double-counts. What the
+//! drafter does cost on top is its weights and a compute buffer of its own,
+//! sized by `DRAFT_N_UBATCH` rather than by the window.
 //!
 //! **Do not measure this with process RSS**: the weights are mmapped, so
 //! `load_tensors: model buffer size` prints 0.00 MiB and RSS for one identical
@@ -33,7 +41,7 @@ fn main() {
     let Some(model) = args.next() else {
         eprintln!(
             "usage: kv_footprint <model.gguf> [big_n_ctx] [small_n_ctx] \
-             [big_ubatch] [small_ubatch]"
+             [big_ubatch] [small_ubatch] [drafter.gguf]"
         );
         std::process::exit(2);
     };
@@ -46,12 +54,16 @@ fn main() {
         .next()
         .map(|a| a.parse().expect("small n_ubatch"))
         .or(ubatch);
+    let draft = args.next();
 
     let base = LlamaCppConfig {
         model_path: model.into(),
         n_ubatch: ubatch,
-        // Thinking off and no drafter: this measures cache shapes, and the
-        // drafter shares the target's KV memory, which would muddy the lines.
+        // Off by default, so the lines describe the target context alone; pass a
+        // path to read the shape the app ships, drafter included.
+        draft_path: draft.map(Into::into),
+        // Thinking is a sampling and prompt setting, not an allocation, and off
+        // keeps the run short.
         enable_thinking: false,
         ..Default::default()
     };
