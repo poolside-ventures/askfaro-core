@@ -39,7 +39,116 @@ pub struct GemmaVariant {
     pub space: &'static str,
 }
 
-/// **fp16 — what the device ships.** Same weights as fp32 at half the bytes:
+/// The embedding **space** for the QAT 4-bit embedder — a different space from
+/// [`EMBEDDINGGEMMA_SPACE`] because it is a different set of weights, not a
+/// different precision of the same ones. Adopting it means a backfill.
+pub const EMBEDDINGGEMMA_QAT_Q4_SPACE: &str = "embeddinggemma_300m_qat_q4";
+
+/// **QAT 4-bit — what the device ships.** 199 MiB of weights against fp16's
+/// 589, 250 MiB resident against 363, and roughly a third of the query latency.
+///
+/// The reason this is not the `model_q4.onnx` everyone else uses: every
+/// published 4-bit ONNX of EmbeddingGemma is quantized from the ORDINARY
+/// checkpoint, and Google also ships a checkpoint whose weights were TRAINED to
+/// sit on the 4-bit grid. Nobody had exported that one, so we do
+/// (`scripts/build_embeddinggemma_qat_q4.py` in the Scope repo, reproduced and
+/// sha-gated by CI before it publishes).
+///
+/// Measured 2026-08-20 on an M1 Pro against a real 6,696-row device shard,
+/// 1,500 documents re-embedded per arm, 200 known-item queries, both sides of
+/// each arm using the same weights:
+///
+/// | variant | disk | resident | query p50 | known-item MRR |
+/// |---|---|---|---|---|
+/// | fp32, the reference | 1,178 MiB | 572 MiB | 30.8 ms | 0.6671 |
+/// | post-training q4 (onnx-community) | 188 MiB | 228 MiB | 23.8 ms | 0.6540 |
+/// | QAT fp32 | 1,177 MiB | 578 MiB | 25.8 ms | 0.6589 |
+/// | **QAT q4 — this** | **199 MiB** | **250 MiB** | **18.4 ms** | **0.6647** |
+///
+/// Post-training q4 costs 2.0% of MRR; this costs 0.4%, which at 200 queries is
+/// indistinguishable from zero, and it is AHEAD on the deeper cuts (R@5 0.820
+/// against fp32's 0.815, R@10 0.890 against 0.875). The control that makes the
+/// claim believable is the third row: QAT q4 scores ABOVE its own fp32, which is
+/// the signature of weights that were trained for the grid — quantizing them
+/// costs nothing. Same quantizer, same settings, both checkpoints; the only
+/// variable is which weights went in.
+///
+/// Read it as "indistinguishable from fp32", not "better than": one corpus, 200
+/// queries, one retrieval task.
+pub const EMBEDDINGGEMMA_QAT_Q4: GemmaVariant = GemmaVariant {
+    spec: &EMBEDDINGGEMMA_300M_QAT_Q4,
+    graph: "model_q4.onnx",
+    space: EMBEDDINGGEMMA_QAT_Q4_SPACE,
+};
+
+/// EmbeddingGemma-300M, QAT 4-bit ONNX — **ours**, served by us, because no
+/// public export of the QAT checkpoint exists. See [`EMBEDDINGGEMMA_QAT_Q4`].
+///
+/// Built from `unsloth/embeddinggemma-300m-qat-q4_0-unquantized` rather than
+/// Google's own repo, which is manually gated and answers 401 to CI; the
+/// unsloth copy is byte-identical and its revision is pinned by the publish
+/// job. Quantized at 4 bits, block 32, symmetric, with the embedding `Gather`
+/// included — the same grid the QAT training targeted.
+///
+/// **Only one of these two files is reproducible, and that is deliberate.** The
+/// weight blob is byte-identical on every build; the 254 KB graph beside it is
+/// not, because the exporter emits parallel branches in a varying order, so two
+/// builds are isomorphic rather than equal. Canonicalizing graph isomorphism was
+/// judged out of proportion to the benefit. What makes that safe is that the
+/// graph is PORTABLE: initializers are named by the sha256 of their contents and
+/// sorted by it, so the blob's layout is a function of the model, and one build's
+/// graph paired with another build's blob was verified to produce bitwise
+/// identical vectors. So the graph is checked into the Scope repo as the pinned
+/// artifact and CI rebuilds only the blob, gating on this sha plus a bitwise
+/// reference-vector check before it publishes either.
+///
+/// The tokenizer is unchanged and still comes from onnx-community: it is the
+/// same file, byte for byte, as the one the fp16 build used, and token ids were
+/// checked to match across scripts before any of the numbers above were taken.
+pub const EMBEDDINGGEMMA_300M_QAT_Q4: ModelSpec = ModelSpec {
+    id: "embeddinggemma-300m-qat-q4",
+    display_name: "EmbeddingGemma 300M (multilingual, QAT 4-bit)",
+    files: &[
+        ModelFile {
+            name: "model_q4.onnx",
+            url: "https://files.scopy.app/ondevice/weights/embeddinggemma-300m-qat-q4/9faaa87d8f52/model_q4.onnx",
+            sha256: "f352a9797f521cffb18d1bfd9369d6d5a09bfc8844d76b5ed8db51150b7281e9",
+            size: 254_180,
+        },
+        ModelFile {
+            name: "model_q4.onnx.data",
+            url: "https://files.scopy.app/ondevice/weights/embeddinggemma-300m-qat-q4/9faaa87d8f52/model_q4.onnx.data",
+            sha256: "9faaa87d8f52a6f91f104ac8c469fa4fbd31510cb40578da48ee50337839a243",
+            size: 208_456_704,
+        },
+        ModelFile {
+            name: "tokenizer.json",
+            url: "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/tokenizer.json",
+            sha256: "4dda02faaf32bc91031dc8c88457ac272b00c1016cc679757d1c441b248b9c47",
+            size: 20_323_312,
+        },
+    ],
+    // Nothing to name: this lands in its own directory (`embeddinggemma-300m-qat-q4`),
+    // so the fp16 build it replaces goes away with its directory rather than
+    // leaving a file behind inside this one.
+    supersedes: &[],
+};
+
+/// The QAT checkpoint the artifact above is built FROM. Not a model anything
+/// provisions — the publish job reads it to fetch and verify the input before
+/// transforming it, so the crate and the workflow name one source rather than
+/// two. Same role as `GEMMA4_E4B_IT_QAT_Q4_0_UPSTREAM`.
+pub const EMBEDDINGGEMMA_QAT_UPSTREAM_REPO: &str = "unsloth/embeddinggemma-300m-qat-q4_0-unquantized";
+/// Pinned revision of [`EMBEDDINGGEMMA_QAT_UPSTREAM_REPO`], so a re-run of the
+/// build cannot silently pick up different weights.
+pub const EMBEDDINGGEMMA_QAT_UPSTREAM_REV: &str = "a2f8a2faf81988899f996a2fb3a1abe91486403a";
+/// sha256 of that checkpoint's `model.safetensors`, checked before the build.
+pub const EMBEDDINGGEMMA_QAT_UPSTREAM_SHA256: &str =
+    "92b0b41d51116cd40db3d136f90f6176271f267a5c3d82c99a5f19a8ad39005e";
+
+/// fp16 — the previous on-device embedder, kept as the reference half of the
+/// fp16 tripwire and as the definition of the space the SERVER still writes.
+/// Same weights as fp32 at half the bytes:
 /// 609 MiB on disk against 1,198, and 338 MiB resident against 572. It is not a
 /// quantization in the sense the hard rule is about, and it is the only variant
 /// measured to leave retrieval untouched, so it stays in the fp32 space rather
@@ -114,6 +223,7 @@ pub const EMBEDDINGGEMMA_FP32: GemmaVariant = GemmaVariant {
 pub const EMBEDDINGGEMMA_300M_FP16: ModelSpec = ModelSpec {
     id: "embeddinggemma-300m-fp16",
     display_name: "EmbeddingGemma 300M (multilingual, fp16)",
+    supersedes: &[],
     files: &[
         ModelFile {
             name: "model_fp16.onnx",
@@ -148,6 +258,7 @@ pub const EMBEDDINGGEMMA_300M_FP16: ModelSpec = ModelSpec {
 pub const EMBEDDINGGEMMA_300M_FP32: ModelSpec = ModelSpec {
     id: "embeddinggemma-300m-fp32",
     display_name: "EmbeddingGemma 300M (multilingual, fp32)",
+    supersedes: &[],
     files: &[
         ModelFile {
             name: "model.onnx",

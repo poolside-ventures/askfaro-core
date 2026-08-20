@@ -385,7 +385,14 @@ fn stats(xs: &[f64]) -> serde_json::Value {
 fn weights_bytes(dir: &str, graph: &str) -> u64 {
     let base = std::path::Path::new(dir);
     let mut total = 0;
-    for name in [graph.to_string(), format!("{graph}_data")] {
+    // External data is `model.onnx_data` from onnx-community's exporter and
+    // `model.onnx.data` from torch's; a size that silently reads 3 MiB because
+    // it guessed the wrong one is worse than no size at all.
+    for name in [
+        graph.to_string(),
+        format!("{graph}_data"),
+        format!("{graph}.data"),
+    ] {
         if let Ok(m) = std::fs::metadata(base.join(&name)) {
             total += m.len();
         }

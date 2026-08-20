@@ -49,6 +49,7 @@ pub use crate::model::{
 pub const PARAKEET_TDT_V3_INT4: ModelSpec = ModelSpec {
     id: "parakeet-tdt-0.6b-v3-int4",
     display_name: "Parakeet TDT 0.6B v3 (multilingual)",
+    supersedes: &[],
     files: &[
         ModelFile {
             name: "encoder-model.int4.onnx",

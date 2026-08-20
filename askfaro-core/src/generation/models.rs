@@ -43,6 +43,7 @@ use crate::model::{ModelFile, ModelSpec};
 pub const GEMMA4_E2B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
     id: "gemma-4-e2b-it-qat-q4_0",
     display_name: "Gemma 4 E2B (instruction-tuned, QAT q4_0)",
+    supersedes: &[],
     files: &[ModelFile {
         name: "gemma-4-E2B_q4_0-it.gguf",
         url: "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf",
@@ -111,6 +112,7 @@ pub const GEMMA4_E2B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
 pub const GEMMA4_E4B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
     id: "gemma-4-e4b-it-qat-q4_0",
     display_name: "Gemma 4 E4B (instruction-tuned, QAT q4_0, embeddings q4_0)",
+    supersedes: &[],
     files: &[ModelFile {
         // Content-addressed on the sha below, so republishing different bytes
         // can never be served from a cache of the old ones.
@@ -131,6 +133,7 @@ pub const GEMMA4_E4B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
 pub const GEMMA4_E4B_IT_QAT_Q4_0_UPSTREAM: ModelSpec = ModelSpec {
     id: "gemma-4-e4b-it-qat-q4_0-upstream",
     display_name: "Gemma 4 E4B (instruction-tuned, QAT q4_0, Google original)",
+    supersedes: &[],
     files: &[ModelFile {
         name: "gemma-4-E4B_q4_0-it.gguf",
         url: "https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf",
@@ -158,6 +161,7 @@ pub const GEMMA4_E4B_IT_QAT_Q4_0_UPSTREAM: ModelSpec = ModelSpec {
 pub const GEMMA4_E4B_MTP_DRAFTER_Q4_0: ModelSpec = ModelSpec {
     id: "gemma-4-e4b-it-qat-assistant-q4_0",
     display_name: "Gemma 4 E4B MTP drafter (QAT q4_0)",
+    supersedes: &[],
     files: &[ModelFile {
         name: "gemma-4-E4B-it-qat-assistant-q4_0.gguf",
         url: "https://huggingface.co/cascade-tech/gemma-4-E4B-it-qat-q4_0-unquantized-assistant-gguf/resolve/main/gemma-4-E4B-it-qat-assistant-q4_0.gguf",

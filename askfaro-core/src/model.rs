@@ -36,6 +36,28 @@ pub struct ModelSpec {
     pub display_name: &'static str,
     /// The files that make up the model.
     pub files: &'static [ModelFile],
+    /// File names this spec REPLACES inside its own directory, named one by one.
+    ///
+    /// A model directory is keyed on [`ModelSpec::id`], so a spec that keeps its
+    /// id and changes a file name leaves the old file behind forever: nothing in
+    /// the provisioning path prunes, [`is_present`] only asks whether the CURRENT
+    /// files exist, and the host downloads the new one alongside the old. That is
+    /// how the 2026-08-20 requantised E4B would have left an upgrading machine
+    /// holding 9.4 GB in a directory meant for 4.26.
+    ///
+    /// **Why a named list rather than "delete whatever is not in `files`".** A
+    /// model directory is not exclusively ours. Scope's persisted KV prefix lives
+    /// in the weights directory (`brain_prefix_dir()` IS `GEN_SPEC.dir()`), so
+    /// that directory currently also holds `prefix-<hash>.kv` and
+    /// `prefix-inputs.json`. A delete-by-default rule needs an allowlist of every
+    /// foreign file that has ever been put there, and it silently destroys the
+    /// next one somebody adds without knowing to update the list. The failure
+    /// mode is data loss with no error. Naming what we replace can only ever
+    /// remove something a human decided to remove, and it leaves the migration
+    /// history readable in the spec itself.
+    ///
+    /// Empty for a spec that has never replaced a file, which is most of them.
+    pub supersedes: &'static [&'static str],
 }
 
 impl ModelSpec {
@@ -57,6 +79,38 @@ pub fn is_present(spec: &ModelSpec, cache_root: &Path) -> bool {
             .map(|m| m.len() == f.size)
             .unwrap_or(false)
     })
+}
+
+/// Remove the files this spec supersedes, and report what went.
+///
+/// Call it only AFTER the new files verify: the whole point is that losing the
+/// old copy is safe once the replacement is known good, and unsafe before. It
+/// is deliberately conservative and silent about everything it was not told to
+/// remove.
+///
+/// Refuses to remove a name that appears in `spec.files`, so a spec that lists
+/// a current file as superseded (a copy-paste away) deletes the model it just
+/// downloaded rather than the one it replaced. Only ever touches the spec's own
+/// directory, and a name containing a path separator is ignored rather than
+/// followed.
+pub fn drop_superseded(spec: &ModelSpec, cache_root: &Path) -> Vec<PathBuf> {
+    let dir = spec.dir(cache_root);
+    let mut removed = Vec::new();
+    for name in spec.supersedes {
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            continue;
+        }
+        if spec.files.iter().any(|f| f.name == *name) {
+            continue;
+        }
+        let p = dir.join(name);
+        if std::fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false)
+            && std::fs::remove_file(&p).is_ok()
+        {
+            removed.push(p);
+        }
+    }
+    removed
 }
 
 /// The files that are absent or the wrong size, and so need downloading.
