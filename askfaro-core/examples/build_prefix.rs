@@ -9,7 +9,7 @@
 //!
 //! ```sh
 //! cargo run --release --features llama-cpp --example build_prefix -- \
-//!   <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv>
+//!   <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> <n_ctx> <n_slots>
 //! ```
 //!
 //! The engine config below MUST mirror the desktop's `brain_config` for every
@@ -73,7 +73,8 @@ fn main() {
         (Some(m), Some(r), Some(d), Some(o)) => (m, r, d, o),
         _ => {
             eprintln!(
-                "usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> <n_ctx>"
+                "usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> \
+                 <n_ctx> <n_slots>"
             );
             std::process::exit(2);
         }
@@ -91,6 +92,20 @@ fn main() {
             eprintln!(
                 "error: pass n_ctx explicitly; it must equal the app's \
                  GEMMA4_E4B.contextWindow (shared/src/agent/model-profile.ts)"
+            );
+            std::process::exit(2);
+        }
+    };
+    // Same rule, and the same trap one field over. `--print-shape` above was
+    // taught to take this and the BUILD below was not, so the two disagreed:
+    // the workflow addressed the artifact at a one-slot shape and this built a
+    // two-slot state to put there. Required, for the reason `n_ctx` is.
+    let n_slots: u32 = match args.next().map(|v| v.parse()) {
+        Some(Ok(v)) => v,
+        _ => {
+            eprintln!(
+                "error: pass n_slots explicitly; it must equal the app's base \
+                 context slot count (workload::AGENT_SLOTS)"
             );
             std::process::exit(2);
         }
@@ -134,6 +149,7 @@ fn main() {
         draft_path: Some(draft.into()),
         prefix_cache_dir: Some(staging.clone()),
         n_ctx,
+        n_slots,
         // Only the file NAME depends on this; the artifact is renamed by the
         // installing host anyway. Content depends on the fields above.
         state_key: "prefix-artifact".into(),
