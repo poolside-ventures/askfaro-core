@@ -90,17 +90,25 @@ pub const EMBEDDINGGEMMA_QAT_Q4: GemmaVariant = GemmaVariant {
 /// job. Quantized at 4 bits, block 32, symmetric, with the embedding `Gather`
 /// included — the same grid the QAT training targeted.
 ///
-/// **Only one of these two files is reproducible, and that is deliberate.** The
-/// weight blob is byte-identical on every build; the 254 KB graph beside it is
-/// not, because the exporter emits parallel branches in a varying order, so two
-/// builds are isomorphic rather than equal. Canonicalizing graph isomorphism was
-/// judged out of proportion to the benefit. What makes that safe is that the
-/// graph is PORTABLE: initializers are named by the sha256 of their contents and
-/// sorted by it, so the blob's layout is a function of the model, and one build's
-/// graph paired with another build's blob was verified to produce bitwise
-/// identical vectors. So the graph is checked into the Scope repo as the pinned
-/// artifact and CI rebuilds only the blob, gating on this sha plus a bitwise
-/// reference-vector check before it publishes either.
+/// **Neither file reproduces the way the E4B weights do, and the shas below say
+/// which build they came from.** The 254 KB graph is not byte-stable at all: the
+/// exporter emits parallel branches in a varying order, so two builds on ONE
+/// machine are isomorphic rather than equal. The 208 MB blob is byte-stable per
+/// machine but NOT across architectures — the quantizer's float rounding differs,
+/// so an arm64 Mac and an x86_64 runner disagree. The first publish attempt
+/// caught exactly that, which is the gate working.
+///
+/// So: the graph is checked into the Scope repo and uploaded verbatim, and the
+/// blob is the one `embedder-weights.yml` builds on ubuntu-latest, whose sha is
+/// what this pins. Pairing them is sound because the graph is PORTABLE —
+/// initializers are named by the sha256 of their contents and sorted by it, so
+/// the blob's layout is a function of the model, and one build's graph against
+/// another build's blob was verified to produce bitwise identical vectors.
+///
+/// The gate that actually protects the model is therefore behavioural, not a
+/// hash: before uploading anything the job embeds fixed token sequences with the
+/// pair and compares against reference vectors recorded from the build every
+/// number above was measured on. A model that had drifted would fail there.
 ///
 /// The tokenizer is unchanged and still comes from onnx-community: it is the
 /// same file, byte for byte, as the one the fp16 build used, and token ids were
@@ -111,14 +119,14 @@ pub const EMBEDDINGGEMMA_300M_QAT_Q4: ModelSpec = ModelSpec {
     files: &[
         ModelFile {
             name: "model_q4.onnx",
-            url: "https://files.scopy.app/ondevice/weights/embeddinggemma-300m-qat-q4/9faaa87d8f52/model_q4.onnx",
+            url: "https://files.scopy.app/ondevice/weights/embeddinggemma-300m-qat-q4/a94b15f2ffce/model_q4.onnx",
             sha256: "f352a9797f521cffb18d1bfd9369d6d5a09bfc8844d76b5ed8db51150b7281e9",
             size: 254_180,
         },
         ModelFile {
             name: "model_q4.onnx.data",
-            url: "https://files.scopy.app/ondevice/weights/embeddinggemma-300m-qat-q4/9faaa87d8f52/model_q4.onnx.data",
-            sha256: "9faaa87d8f52a6f91f104ac8c469fa4fbd31510cb40578da48ee50337839a243",
+            url: "https://files.scopy.app/ondevice/weights/embeddinggemma-300m-qat-q4/a94b15f2ffce/model_q4.onnx.data",
+            sha256: "a94b15f2ffce5a2dd9066e6fb1e9c309d46c46e02fc3a279e1d162d3ab79e0f6",
             size: 208_456_704,
         },
         ModelFile {
