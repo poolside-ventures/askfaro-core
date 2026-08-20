@@ -190,6 +190,13 @@ required-features = ["llama-cpp"]
 name = "ubatch_sweep"
 required-features = ["llama-cpp"]
 
+# Prints the KV and compute buffers of a shared-window context against a split
+# one, so the memory a second context gives back (and the compute buffer it
+# costs) is read off llama.cpp rather than guessed. Builds engines, same gate.
+[[example]]
+name = "kv_footprint"
+required-features = ["llama-cpp"]
+
 # Does a free tool ACCEPT the intent the model actually sends it? Every other
 # check grades which tool was NAMED and never executes one. Needs free-tools.
 [[example]]

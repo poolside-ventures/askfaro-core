@@ -54,7 +54,7 @@ pub mod llama_cpp;
 pub mod models;
 
 #[cfg(feature = "llama-cpp")]
-pub use llama_cpp::{LlamaCppConfig, LlamaCppEngine, PrefixReport};
+pub use llama_cpp::{ContextSpec, KvCacheType, LlamaCppConfig, LlamaCppEngine, PrefixReport};
 
 /// One conversation turn. `role` is the OpenAI role (`"system"`, `"user"`,
 /// `"assistant"`, `"tool"`); the engine maps it to the provider's transcript.

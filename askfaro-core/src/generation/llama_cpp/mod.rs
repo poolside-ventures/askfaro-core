@@ -45,7 +45,7 @@ mod ffi;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{KvCacheType as LlamaKvCacheType, LlamaContextParams};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
@@ -217,6 +217,191 @@ fn shared_backend() -> Result<&'static LlamaBackend, GenError> {
     Ok(BACKEND.get_or_init(|| b))
 }
 
+/// What makes two model loads interchangeable.
+///
+/// Everything here is an input to `llama_model_load_from_file`, so two configs
+/// that agree on all of it would produce byte-identical weights in memory and
+/// may share one load. Context parameters are deliberately absent: they belong
+/// to `llama_context`, which is per-context by construction, and holding them
+/// in this key is what would force a second load for a second window.
+///
+/// The path is canonicalized and its length taken, the same "what this crate
+/// can see" identity [`LlamaCppEngine::prefix_key_for`] uses. A file swapped in
+/// place at the same length is not detected here either; a host that knows more
+/// than the filesystem does keeps its weights at distinct paths.
+#[derive(PartialEq, Eq, Hash)]
+struct ModelKey {
+    path: PathBuf,
+    len: u64,
+    n_gpu_layers: u32,
+    use_mmap: bool,
+    cpu_tensor_overrides: Vec<String>,
+}
+
+impl ModelKey {
+    fn of(cfg: &LlamaCppConfig) -> Self {
+        let path =
+            std::fs::canonicalize(&cfg.model_path).unwrap_or_else(|_| cfg.model_path.clone());
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            path,
+            len,
+            n_gpu_layers: cfg.n_gpu_layers,
+            use_mmap: cfg.use_mmap,
+            cpu_tensor_overrides: cfg.cpu_tensor_overrides.clone(),
+        }
+    }
+}
+
+/// How many times weights have actually been read off disk in this process.
+static MODEL_LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process-wide weight registry: one loaded [`LlamaModel`] per [`ModelKey`],
+/// handed out to every context that wants it.
+///
+/// **Weights are the expensive resident thing and contexts are not.** E4B is
+/// 5.15 GB and 12-40s to load; a context over it is a KV cache sized by its own
+/// window. Before this, one engine meant one model meant one window, so a host
+/// that wanted a second window either scaled the shared one up (llama.cpp
+/// divides a context's KV evenly across its sequences, so every workload gets
+/// the largest one's window) or built a second engine — which loaded the same
+/// 5.15 GB a second time and could OOM Metal with both warm.
+///
+/// [`Weak`](std::sync::Weak), not `Arc`: an entry must not keep weights alive
+/// after the last engine unloads, or `unload` would stop freeing memory, which
+/// is the one thing it exists to do. A dead entry is replaced by the next load.
+fn shared_model(
+    cfg: &LlamaCppConfig,
+    backend: &'static LlamaBackend,
+) -> Result<std::sync::Arc<LlamaModel>, GenError> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    static MODELS: OnceLock<Mutex<HashMap<ModelKey, Weak<LlamaModel>>>> = OnceLock::new();
+
+    let key = ModelKey::of(cfg);
+    // Held across the load on purpose: two engines racing for the SAME weights
+    // must produce one load, not two, and the second caller wants the first
+    // one's result rather than its own 40 seconds. The price is that a load
+    // also blocks a concurrent load of DIFFERENT weights, which no host does
+    // (a device runs one model family at a time) and which costs waiting,
+    // never correctness.
+    let mut reg = MODELS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|e| GenError::Generate(e.to_string()))?;
+    if let Some(m) = reg.get(&key).and_then(Weak::upgrade) {
+        return Ok(m);
+    }
+    let m = Arc::new(load_model(cfg, backend)?);
+    MODEL_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    reg.insert(key, Arc::downgrade(&m));
+    // Entries whose weights are gone: dropped here rather than in `unload`,
+    // which has no lock and no key. The map holds one small entry per distinct
+    // model a process ever loaded, so this is tidiness, not a leak fix.
+    reg.retain(|_, w| w.strong_count() > 0);
+    Ok(m)
+}
+
+/// Read the weights off disk. Every caller goes through [`shared_model`].
+fn load_model(
+    cfg: &LlamaCppConfig,
+    backend: &'static LlamaBackend,
+) -> Result<LlamaModel, GenError> {
+    // The override list stores the pattern as a RAW pointer into each
+    // CString, so these must outlive `load_from_file` — hence a named
+    // binding rather than a temporary inside the loop, which would be freed
+    // before the model reads it.
+    let patterns: Vec<std::ffi::CString> = cfg
+        .cpu_tensor_overrides
+        .iter()
+        .map(|p| {
+            std::ffi::CString::new(p.as_str()).map_err(|_| {
+                GenError::Invalid(format!("tensor override has an interior NUL: {p:?}"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let base = LlamaModelParams::default()
+        .with_n_gpu_layers(cfg.n_gpu_layers)
+        .with_use_mmap(cfg.use_mmap);
+    // llama.cpp's own load-abort hook: the progress callback is consulted
+    // per tensor group, and returning false stops the read. Installed ONLY
+    // when a handle is armed, because installing one is not neutral:
+    // llama.cpp substitutes its own progress logger when the field is null,
+    // and taking that over would change what an uncancellable build prints.
+    // Records that the callback is what stopped the read, which is a
+    // different question from whether the flag is set. llama.cpp reports an
+    // abort and a genuine failure as the same error, so asking the flag
+    // would report a corrupt model as a cancel whenever a stop happened to
+    // coincide with one, and a host is told to treat `Cancelled` as nothing
+    // to report. That turns a broken download into silence.
+    let vetoed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let base = match cfg.cancel.clone() {
+        Some(c) => {
+            let vetoed = vetoed.clone();
+            base.with_progress_callback(move |_| {
+                if c.is_cancelled() {
+                    vetoed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                true
+            })
+        }
+        None => base,
+    };
+    let mut params = Box::pin(base);
+    for p in &patterns {
+        params.as_mut().add_cpu_buft_override(p);
+    }
+    LlamaModel::load_from_file(backend, &cfg.model_path, &params).map_err(|e| {
+        if vetoed.load(std::sync::atomic::Ordering::Relaxed) {
+            GenError::Cancelled
+        } else {
+            GenError::Generate(format!("load {}: {e}", cfg.model_path.display()))
+        }
+    })
+}
+
+/// One context over the shared weights, and the slots it serves.
+///
+/// **A context's slots are necessarily equal-sized**: llama.cpp divides a
+/// context's KV cache evenly across its sequences, so `n_ctx` here is the
+/// window EACH of this context's slots gets and the total is scaled by
+/// `n_slots`. Two workloads that want different windows therefore need two
+/// contexts, which is what this type is for.
+///
+/// The measured reason to bother: Gemma 4 E4B at a 64K window costs 1,024 MiB
+/// of KV per slot against 256 MiB at 16K. A desktop running an agent loop plus
+/// short background extraction turns on one 64K two-slot context pays the
+/// agent's window twice; giving the background workload its own 16K context
+/// gives back 768 MiB at zero decode cost.
+#[derive(Debug, Clone)]
+pub struct ContextSpec {
+    /// Window in tokens for EACH slot of this context.
+    pub n_ctx: u32,
+    /// How many slots (llama.cpp sequences) this context serves.
+    pub n_slots: u32,
+    /// Physical micro-batch for this context, or `None` to inherit
+    /// [`LlamaCppConfig::n_ubatch`].
+    ///
+    /// Per-context because the compute buffer is per-context and scales with
+    /// it (~1 MiB per token of ubatch on E4B), so a second context inherits a
+    /// prefill-throughput setting chosen for the first one and charges a second
+    /// full-size buffer for it. A background slot that prefills a few hundred
+    /// tokens per job has no use for the big dispatch the agent's window was
+    /// sized for.
+    pub n_ubatch: Option<u32>,
+}
+
+impl Default for ContextSpec {
+    fn default() -> Self {
+        Self {
+            n_ctx: 16384,
+            n_slots: 1,
+            n_ubatch: None,
+        }
+    }
+}
+
 /// Configuration for [`LlamaCppEngine`].
 #[derive(Debug, Clone)]
 pub struct LlamaCppConfig {
@@ -234,8 +419,12 @@ pub struct LlamaCppConfig {
     /// rejected drafts still cost a verify pass, so 5 lands at 33.3 tok/s and 8
     /// at 24.3, the latter BELOW not speculating at all (34.0).
     pub draft_n_max: i32,
-    /// Total context window in tokens. A property of the MODEL, so the caller
-    /// supplies it from its model profile; this crate does not decide it.
+    /// Context window in tokens for each slot of the BASE context. A property
+    /// of the MODEL, so the caller supplies it from its model profile; this
+    /// crate does not decide it.
+    ///
+    /// A workload that wants a different window gets its own context; see
+    /// [`extra_contexts`](Self::extra_contexts).
     pub n_ctx: u32,
     /// Whether sliding-window-attention layers keep a FULL-size KV cache
     /// (`true`) or only their window (`false`, the default).
@@ -314,13 +503,37 @@ pub struct LlamaCppConfig {
     pub use_mmap: bool,
     /// Whether the model may emit a reasoning channel.
     pub enable_thinking: bool,
-    /// How many KV cache slots the context supports.
+    /// How many KV cache slots the BASE context supports.
     ///
-    /// Must cover the highest `GenerateRequest::slot` a host will use. A context
-    /// built with the default of ONE sequence rejects slot 1 outright, and the
-    /// symptom is not a clear error about sequences: llama.cpp reports "failed
-    /// to initialize batch" and then `n_tokens == 0`.
+    /// Must cover the highest `GenerateRequest::slot` a host will use, together
+    /// with [`extra_contexts`](Self::extra_contexts). A context built with the
+    /// default of ONE sequence rejects slot 1 outright, and the symptom is not
+    /// a clear error about sequences: llama.cpp reports "failed to initialize
+    /// batch" and then `n_tokens == 0`.
+    ///
+    /// Every slot of one context has the SAME window ([`n_ctx`](Self::n_ctx)),
+    /// because llama.cpp divides a context's KV evenly across its sequences.
+    /// Slots that want different windows go in different contexts.
     pub n_slots: u32,
+    /// Further contexts over the same loaded weights, each with its own window.
+    ///
+    /// Empty is the default and the previous behaviour exactly: one context,
+    /// [`n_slots`](Self::n_slots) slots of [`n_ctx`](Self::n_ctx) tokens each.
+    ///
+    /// Slots are numbered consecutively across contexts: the base context owns
+    /// slots `0..n_slots`, the first extra the `n_slots` that follow, and so on.
+    /// So a desktop that keeps its agent on slot 0 and background work on slot 1
+    /// asks for `n_slots: 1` plus one extra context of `n_slots: 1`, and neither
+    /// side changes which slot number it sends.
+    ///
+    /// The weights are loaded ONCE regardless (see [`shared_model`]); what each
+    /// entry costs is its own KV cache and compute buffer. That is the whole
+    /// point: KV is what scales with the window, and a background workload that
+    /// never fills 64K should not be charged for one.
+    ///
+    /// Slot 0 keeps everything that is written against it: the persisted KV
+    /// prefix and the MTP drafter both live on the base context.
+    pub extra_contexts: Vec<ContextSpec>,
     /// Directory to persist slot 0's KV prefix in, or `None` to never persist.
     ///
     /// Prefix reuse already makes the SECOND turn of a session cheap; this makes
@@ -343,6 +556,31 @@ pub struct LlamaCppConfig {
     /// knows more, the sha256 it verified at download time or a build id, puts
     /// it here and the file name changes with it.
     pub state_key: String,
+    /// Element type of the K cache. [`KvCacheType::F16`] is llama.cpp's default.
+    ///
+    /// The KV cache is the one buffer that grows with the conversation rather
+    /// than with the weights, so quantizing it is the only lever that gets
+    /// cheaper the longer a session runs. `Q8_0` halves it.
+    ///
+    /// **This is not a free setting and the generic advice does not transfer.**
+    /// Whether it is safe is a property of the MODEL: published KL-divergence
+    /// comparisons put Gemma an order of magnitude worse than Qwen under q8_0
+    /// KV, and a model whose attention is already mostly windowed has little
+    /// KV left to save. Measure the model in hand rather than adopting a
+    /// number from another family.
+    pub cache_type_k: KvCacheType,
+    /// Element type of the V cache. See [`cache_type_k`](Self::cache_type_k).
+    ///
+    /// **A quantized V requires flash attention.** llama.cpp refuses the
+    /// context outright ("V cache quantization requires flash_attn",
+    /// `llama_init_from_model`) rather than degrading, so a host that turns
+    /// flash attention off and quantizes V gets a load failure, not slow
+    /// answers. Flash attention is AUTO by default here and resolves to
+    /// enabled on Metal.
+    ///
+    /// Both types additionally require the block size to divide the head
+    /// dimension, checked per layer at context creation.
+    pub cache_type_v: KvCacheType,
     /// The host's stop signal for an in-flight call, or `None` to make every
     /// call run to completion.
     ///
@@ -375,12 +613,51 @@ impl Default for LlamaCppConfig {
             enable_thinking: true,
             // Two: the agent loop, plus background one-shots.
             n_slots: 2,
+            extra_contexts: Vec::new(),
             // Off unless a host names a directory: persisting state is a policy
             // decision (where it lives, when it is cleared) and this crate has
             // no business inventing a cache location.
             prefix_cache_dir: None,
             state_key: String::new(),
+            cache_type_k: KvCacheType::F16,
+            cache_type_v: KvCacheType::F16,
             cancel: None,
+        }
+    }
+}
+
+/// Element type for one half of the KV cache.
+///
+/// Its own enum rather than the binding's `llama_cpp_2::context::params::
+/// KvCacheType`, so a host can name a cache type without depending on the
+/// binding crate at the same version this one resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvCacheType {
+    /// llama.cpp's default, and the only one that needs no flash attention.
+    #[default]
+    F16,
+    F32,
+    BF16,
+    /// Half the bytes of `F16`. The usual first stop, and the one with
+    /// published quality data.
+    Q8_0,
+    Q5_1,
+    Q5_0,
+    Q4_1,
+    Q4_0,
+}
+
+impl From<KvCacheType> for LlamaKvCacheType {
+    fn from(t: KvCacheType) -> Self {
+        match t {
+            KvCacheType::F16 => Self::F16,
+            KvCacheType::F32 => Self::F32,
+            KvCacheType::BF16 => Self::BF16,
+            KvCacheType::Q8_0 => Self::Q8_0,
+            KvCacheType::Q5_1 => Self::Q5_1,
+            KvCacheType::Q5_0 => Self::Q5_0,
+            KvCacheType::Q4_1 => Self::Q4_1,
+            KvCacheType::Q4_0 => Self::Q4_0,
         }
     }
 }
@@ -453,25 +730,52 @@ pub struct LlamaCppEngine {
     log_pinned_restore: LogThrottle,
 }
 
+/// Where one host slot lives: which context, which sequence inside it, and how
+/// big a window it therefore has.
+///
+/// Copy, and computed once per turn, because the borrow discipline below
+/// depends on it: the context is reached as `loaded.decs[at.ctx]`, a borrow of
+/// ONE field, so the checkpoint rings and the token records in the sibling
+/// fields stay reachable at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlotAddr {
+    /// The host's slot number, which keys everything the engine records.
+    slot: u32,
+    /// Index into [`Loaded::decs`].
+    ctx: usize,
+    /// The llama.cpp sequence id INSIDE that context. Equal to `slot` only for
+    /// the base context.
+    seq: i32,
+    /// Tokens this slot may hold.
+    n_ctx: u32,
+}
+
 /// The loaded engine.
 ///
 /// **Field order is load-bearing.** Rust drops fields in declaration order, and
-/// `ctx` borrows `model`, so it must be declared (and torn down) first. Getting
-/// this wrong is not a leak, it is a SIGABRT: ggml-metal asserts at exit that
-/// its resource sets were released (`GGML_ASSERT([rsets->data count] == 0)`),
-/// which in an app reads as a crash on quit. An earlier version leaked the
-/// model to dodge the self-reference and hit exactly that.
+/// every context borrows `model`, so they must be declared (and torn down)
+/// first. Getting this wrong is not a leak, it is a SIGABRT: ggml-metal asserts
+/// at exit that its resource sets were released
+/// (`GGML_ASSERT([rsets->data count] == 0)`), which in an app reads as a crash
+/// on quit. An earlier version leaked the model to dodge the self-reference and
+/// hit exactly that.
 ///
 /// The backend is NOT a field: it is the process-wide [`shared_backend`],
 /// which outlives every `Loaded` by construction.
 struct Loaded {
-    /// The decoder: either a plain context, or an MTP speculative wrapper that
-    /// OWNS the target context (and the drafter's).
+    /// One decoder per context, base first. Each is either a plain context or
+    /// an MTP speculative wrapper that OWNS the target context (and the
+    /// drafter's).
     ///
     /// One enum rather than two `Option`s so "both set" and "neither set" are
     /// unrepresentable; the speculative path takes the context by value, so they
     /// genuinely cannot coexist.
-    dec: Decoder,
+    ///
+    /// Several entries because a context's slots are all the same size and two
+    /// workloads may not want the same window; see [`ContextSpec`].
+    decs: Vec<Decoder>,
+    /// Host slot -> where it lives, indexed by slot number.
+    slots: Vec<SlotAddr>,
     /// The tokens currently in each KV cache SLOT, so the next turn on that slot
     /// decodes only what diverges from them.
     ///
@@ -503,12 +807,39 @@ struct Loaded {
     /// already covers it.
     pinned_heads: std::collections::HashMap<u32, SwaCheckpoint>,
     /// Boxed for a stable address the drafter's context borrows. Dropped after
-    /// `dec`, which holds that context.
+    /// `decs`, which holds that context. Only the base context drafts.
     #[allow(dead_code)]
     draft_model: Option<Box<LlamaModel>>,
-    /// Boxed for a stable address that the context can borrow. Dropped after `dec`.
-    #[allow(dead_code)]
-    model: Box<LlamaModel>,
+    /// The shared weights, from [`shared_model`]. Heap-allocated, so its address
+    /// is stable for the `'static` reborrow every context takes; dropped after
+    /// `decs`, and the weights themselves only when this is the last handle.
+    model: std::sync::Arc<LlamaModel>,
+}
+
+impl Loaded {
+    /// Where `slot` lives.
+    ///
+    /// A slot past the last one declared addresses the last context, where
+    /// llama.cpp rejects it exactly as it always has ("failed to initialize
+    /// batch", then `n_tokens == 0`): the sequence id is out of that context's
+    /// range by construction, since the declared slots cover every context up
+    /// to its end. Unchanged behaviour on purpose — an over-range slot has been
+    /// a decode-level failure the engine recovers from by unloading, and
+    /// `tests/llama_two_engines.rs` pins that recovery.
+    fn addr(&self, slot: u32) -> SlotAddr {
+        match self.slots.get(slot as usize) {
+            Some(&a) => a,
+            None => {
+                let last = *self.slots.last().expect("at least one slot");
+                SlotAddr {
+                    slot,
+                    ctx: last.ctx,
+                    seq: (slot - last.slot) as i32 + last.seq,
+                    n_ctx: last.n_ctx,
+                }
+            }
+        }
+    }
 }
 
 /// Plain decode, or MTP speculative decode.
@@ -593,9 +924,52 @@ impl LlamaCppEngine {
     /// when `prefix_len == pos_max + 1`.
     pub fn kv_prefix_state(&mut self, slot: u32) -> Option<(usize, i32)> {
         let loaded = self.loaded.as_mut()?;
+        let at = loaded.addr(slot);
         let prefix_len = loaded.cached.get(&slot).map_or(0, Vec::len);
-        let pos_max = loaded.dec.ctx().kv_cache_seq_pos_max(slot as i32);
+        let pos_max = loaded.decs[at.ctx].ctx().kv_cache_seq_pos_max(at.seq);
         Some((prefix_len, pos_max))
+    }
+
+    /// The window each slot actually has, read from llama.cpp rather than from
+    /// the configuration.
+    ///
+    /// Empty before the weights load. This is the observable half of
+    /// [`LlamaCppConfig::extra_contexts`]: a host that asked for a 64K agent
+    /// slot and a 16K background slot can check that is what it got, and so can
+    /// a diagnostics view, without inferring it from a config it does not hold.
+    ///
+    /// Reported per SLOT, not per context, because a context's `n_ctx` is the
+    /// total across its sequences and a slot only ever gets its share.
+    pub fn slot_windows(&mut self) -> std::collections::BTreeMap<u32, u32> {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return Default::default();
+        };
+        let addrs = loaded.slots.clone();
+        addrs
+            .iter()
+            .map(|a| {
+                // llama.cpp reports a context's TOTAL, and the binding does not
+                // expose `n_seq_max`, so the share is taken over the slots this
+                // engine mapped into that context — which is the same number it
+                // built the context with.
+                let seqs = addrs.iter().filter(|b| b.ctx == a.ctx).count().max(1) as u32;
+                (a.slot, loaded.decs[a.ctx].ctx().n_ctx() / seqs)
+            })
+            .collect()
+    }
+
+    /// How many times GGUF weights have been read off disk in this process.
+    ///
+    /// The point of the shared registry is that this does NOT go up when a
+    /// second context, or a second engine, wants weights that are already
+    /// resident: a load is 5.15 GB and 12-40s for E4B, and a second copy of it
+    /// is what could OOM Metal with both warm. Exposed so that can be asserted
+    /// rather than believed — process RSS cannot say it, because the weights
+    /// are mmapped (`model buffer size` prints 0.00 MiB and RSS for one
+    /// identical configuration has been observed at both 6.44 and 1.66 GiB
+    /// across two runs).
+    pub fn model_loads() -> u64 {
+        MODEL_LOADS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the loaded template declares it supports, as the jinja layer names
@@ -648,6 +1022,12 @@ impl LlamaCppEngine {
     /// measured **~3-5s** against the 37s cold load, because the weights are
     /// mmapped and the OS page cache survives the unload. Do not assume the cold
     /// number applies to a reload.
+    ///
+    /// Frees this engine's contexts (their KV caches and compute buffers) always,
+    /// and the WEIGHTS only when no other engine still holds them: they are
+    /// shared through [`shared_model`], and the last handle out turns off the
+    /// lights. `true` reports that this engine had something to release, not
+    /// that 5 GB came back.
     pub fn unload(&mut self) -> bool {
         let was = self.loaded.is_some();
         // `chat` is derived from the model's template, so it must go too or a
@@ -717,68 +1097,93 @@ impl LlamaCppEngine {
         Ok((ctx, dm))
     }
 
+    /// The layout this configuration asks for: the base context first, then
+    /// whatever extras were declared.
+    ///
+    /// One place, because the slot map, the context build and
+    /// [`slot_windows`](Self::slot_windows) must agree about which slot lives
+    /// where, and a host reading a window that the engine does not actually
+    /// serve would be worse than no accessor at all.
+    fn context_specs(&self) -> Vec<ContextSpec> {
+        let base = ContextSpec {
+            n_ctx: self.cfg.n_ctx,
+            n_slots: self.cfg.n_slots.max(1),
+            n_ubatch: self.cfg.n_ubatch,
+        };
+        std::iter::once(base)
+            .chain(self.cfg.extra_contexts.iter().cloned().map(|s| ContextSpec {
+                n_slots: s.n_slots.max(1),
+                n_ubatch: s.n_ubatch.or(self.cfg.n_ubatch),
+                ..s
+            }))
+            .collect()
+    }
+
+    /// The slot map for a layout: slot numbers run consecutively across
+    /// contexts, so a host that adds a context does not renumber the slots it
+    /// was already sending.
+    fn slot_map(specs: &[ContextSpec]) -> Vec<SlotAddr> {
+        let mut slots = Vec::new();
+        for (ctx, spec) in specs.iter().enumerate() {
+            for seq in 0..spec.n_slots {
+                slots.push(SlotAddr {
+                    slot: slots.len() as u32,
+                    ctx,
+                    seq: seq as i32,
+                    n_ctx: spec.n_ctx,
+                });
+            }
+        }
+        slots
+    }
+
+    /// The context parameters, in ONE place.
+    ///
+    /// There are three call sites (the base context, each extra one, and the
+    /// rebuild after an MTP init failure) and the drafter derives its own from
+    /// whatever the base produced. When they were written out twice they had
+    /// already drifted once; a KV element type that differs between the two
+    /// would be worse than the `n_ubatch` drift was, because the persisted
+    /// prefix is keyed on it and the mismatch shows up as a state file that
+    /// silently will not restore.
+    ///
+    /// `n_ctx` is the TOTAL across sequences: llama.cpp gives each sequence
+    /// `n_ctx / n_seq_max`. So asking for two slots at face value would
+    /// silently HALVE the caller's window, from the profile's 16,384 to 8,192,
+    /// and the first symptom would be a mid-conversation `NoKvCacheSlot` rather
+    /// than anything naming the window. [`ContextSpec::n_ctx`] is a property of
+    /// the MODEL and of the workload, so it is honoured per slot and the total
+    /// is scaled here instead.
+    ///
+    /// `n_batch` caps how many tokens one `decode()` call may carry, and it
+    /// defaults far below a real prompt: the Gemma 4 template renders the tool
+    /// schemas into tens of thousands of characters, which asserts out at
+    /// `n_tokens_all <= cparams.n_batch`. Sized to this context's window, which
+    /// is also the longest prompt it will accept.
+    fn ctx_params(&self, spec: &ContextSpec) -> LlamaContextParams {
+        let slots = spec.n_slots.max(1);
+        let mut p = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(spec.n_ctx.saturating_mul(slots)))
+            .with_n_batch(spec.n_ctx)
+            .with_n_seq_max(slots)
+            .with_swa_full(self.cfg.swa_full)
+            .with_type_k(self.cfg.cache_type_k.into())
+            .with_type_v(self.cfg.cache_type_v.into());
+        if let Some(ub) = spec.n_ubatch.filter(|&ub| ub > 0) {
+            p = p.with_n_ubatch(ub);
+        }
+        p
+    }
+
     fn ensure_loaded(&mut self) -> Result<u64, GenError> {
         if self.loaded.is_some() {
             return Ok(0);
         }
         let t = Instant::now();
         let backend = shared_backend()?;
-        // The override list stores the pattern as a RAW pointer into each
-        // CString, so these must outlive `load_from_file` — hence a named
-        // binding rather than a temporary inside the loop, which would be freed
-        // before the model reads it.
-        let patterns: Vec<std::ffi::CString> = self
-            .cfg
-            .cpu_tensor_overrides
-            .iter()
-            .map(|p| {
-                std::ffi::CString::new(p.as_str()).map_err(|_| {
-                    GenError::Invalid(format!("tensor override has an interior NUL: {p:?}"))
-                })
-            })
-            .collect::<Result<_, _>>()?;
-        let base = LlamaModelParams::default()
-            .with_n_gpu_layers(self.cfg.n_gpu_layers)
-            .with_use_mmap(self.cfg.use_mmap);
-        // llama.cpp's own load-abort hook: the progress callback is consulted
-        // per tensor group, and returning false stops the read. Installed ONLY
-        // when a handle is armed, because installing one is not neutral:
-        // llama.cpp substitutes its own progress logger when the field is null,
-        // and taking that over would change what an uncancellable build prints.
-        // Records that the callback is what stopped the read, which is a
-        // different question from whether the flag is set. llama.cpp reports an
-        // abort and a genuine failure as the same error, so asking the flag
-        // would report a corrupt model as a cancel whenever a stop happened to
-        // coincide with one, and a host is told to treat `Cancelled` as nothing
-        // to report. That turns a broken download into silence.
-        let vetoed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let base = match self.cfg.cancel.clone() {
-            Some(c) => {
-                let vetoed = vetoed.clone();
-                base.with_progress_callback(move |_| {
-                    if c.is_cancelled() {
-                        vetoed.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return false;
-                    }
-                    true
-                })
-            }
-            None => base,
-        };
-        let mut params = Box::pin(base);
-        for p in &patterns {
-            params.as_mut().add_cpu_buft_override(p);
-        }
-        let model = Box::new(
-            LlamaModel::load_from_file(backend, &self.cfg.model_path, &params).map_err(|e| {
-                if vetoed.load(std::sync::atomic::Ordering::Relaxed) {
-                    GenError::Cancelled
-                } else {
-                    GenError::Generate(format!("load {}: {e}", self.cfg.model_path.display()))
-                }
-            })?,
-        );
-        drop(patterns);
+        // One load per (weights, model params) in the process, however many
+        // engines and contexts want them. See `shared_model`.
+        let model = shared_model(&self.cfg, backend)?;
 
         // The template comes from the GGUF itself, so the shim never has to guess
         // which model family it is rendering for.
@@ -790,33 +1195,15 @@ impl LlamaCppEngine {
         let mut chat = ffi::Chat::new(&template)
             .map_err(|e| GenError::Generate(format!("chat shim init: {e}")))?;
 
-        // n_batch caps how many tokens one decode() call may carry, and it
-        // defaults far below a real prompt: the Gemma 4 template renders the tool
-        // schemas into tens of thousands of characters, which asserts out at
-        // `n_tokens_all <= cparams.n_batch`. Size it to the window.
-        // `n_ctx` is the TOTAL across sequences: llama.cpp gives each sequence
-        // `n_ctx / n_seq_max`. So asking for two slots at face value would have
-        // silently HALVED the caller's window, from the profile's 16,384 to
-        // 8,192, and the first symptom would be a mid-conversation
-        // `NoKvCacheSlot` rather than anything naming the window.
-        //
-        // `n_ctx` here is a property of the MODEL, so it is honoured per slot and
-        // the total is scaled instead. The cost is KV memory, which scales with
-        // the number of slots; that is the real price of running two workloads
-        // on one engine, and it is worth naming rather than discovering.
-        let slots = self.cfg.n_slots.max(1);
-        let total_ctx = self.cfg.n_ctx.saturating_mul(slots);
-        let mut ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
-            .with_n_batch(self.cfg.n_ctx)
-            .with_n_seq_max(slots)
-            .with_swa_full(self.cfg.swa_full);
-        if let Some(ub) = self.cfg.n_ubatch.filter(|&ub| ub > 0) {
-            ctx_params = ctx_params.with_n_ubatch(ub);
-        }
-        // SAFETY: `model` is boxed, so its address is stable and outlives `ctx`;
-        // `Loaded` declares `ctx` first so it is dropped first. The backend is
-        // genuinely `'static` (shared_backend), no extension needed.
+        // The base context, then one per extra spec. Each has its OWN window and
+        // its own KV cache; they share only the weights, which is where the
+        // memory is.
+        let specs = self.context_specs();
+        let ctx_params = self.ctx_params(&specs[0]);
+        // SAFETY: `model` is an `Arc`, so the weights sit at a stable heap
+        // address for as long as any handle lives, and `Loaded` holds one and
+        // declares `decs` first so every context is dropped before it. The
+        // backend is genuinely `'static` (shared_backend), no extension needed.
         let model_ref: &'static LlamaModel = unsafe { &*(&*model as *const LlamaModel) };
         let ctx = model_ref
             .new_context(backend, ctx_params.clone())
@@ -842,14 +1229,7 @@ impl LlamaCppEngine {
                             // `MtpSpeculative::new` consumed both contexts, so
                             // there is nothing to fall back WITH; rebuild one.
                             eprintln!("llama_cpp: MTP init failed ({e}); plain decode");
-                            let mut p = LlamaContextParams::default()
-                                .with_n_ctx(std::num::NonZeroU32::new(total_ctx))
-                                .with_n_batch(self.cfg.n_ctx)
-                                .with_n_seq_max(slots)
-                                .with_swa_full(self.cfg.swa_full);
-                            if let Some(ub) = self.cfg.n_ubatch.filter(|&ub| ub > 0) {
-                                p = p.with_n_ubatch(ub);
-                            }
+                            let p = self.ctx_params(&specs[0]);
                             let c = model_ref
                                 .new_context(backend, p)
                                 .map_err(|e| GenError::Generate(e.to_string()))?;
@@ -879,14 +1259,25 @@ impl LlamaCppEngine {
         // its own deserializer's exceptions and removes the half-written
         // sequence), and the correct response to all of them is the same: carry
         // on cold. A cold start is slow, not wrong.
-        let mut dec = dec;
+        // The extras. Built after the base one because the drafter binds to the
+        // base context and must find it already there; plain contexts, because
+        // the MTP head shares the target's KV memory and there is one of those.
+        let mut decs = vec![dec];
+        for spec in &specs[1..] {
+            let p = self.ctx_params(spec);
+            let c = model_ref
+                .new_context(backend, p)
+                .map_err(|e| GenError::Generate(e.to_string()))?;
+            decs.push(Decoder::Plain(c));
+        }
+
         let mut cached = std::collections::HashMap::new();
         let mut prefix = PrefixState::Disabled;
         if let Some(path) = Self::prefix_path_for(&self.cfg) {
             prefix = PrefixState::Missing;
             if path.exists() {
                 let t_restore = Instant::now();
-                match dec
+                match decs[0]
                     .ctx()
                     .state_seq_load_file(&path, 0, self.cfg.n_ctx as usize)
                 {
@@ -911,7 +1302,8 @@ impl LlamaCppEngine {
         }
 
         self.loaded = Some(Loaded {
-            dec,
+            decs,
+            slots: Self::slot_map(&specs),
             cached,
             prefix,
             checkpoints: Default::default(),
@@ -982,6 +1374,12 @@ impl LlamaCppEngine {
             }
             None => h.update(b"no-drafter"),
         }
+        // The BASE context's shape, and deliberately not the extra contexts':
+        // the prefix is slot 0's, it is saved out of and restored into the base
+        // context, and an extra context is a separate `llama_context` that
+        // cannot change a cell of it. Hashing the whole layout would throw away
+        // the agent's ~27s prefill every time a host retuned a background
+        // window — an invalidation that buys nothing.
         h.update(cfg.n_ctx.to_le_bytes());
         h.update(cfg.n_slots.to_le_bytes());
         h.update(cfg.n_gpu_layers.to_le_bytes());
@@ -1000,6 +1398,13 @@ impl LlamaCppEngine {
         // mismatch, but "likely rejected" is not the contract this key exists
         // to provide.
         h.update([u8::from(cfg.swa_full)]);
+        // The cache's ELEMENT TYPE is the other half of its layout. A state
+        // written with an f16 cache and restored into a q8_0 one is the same
+        // class of hazard as the quantization mismatch `state_key` exists for:
+        // the byte count differs, so this one would at least be caught, but
+        // being caught means a silent full re-prefill on every launch rather
+        // than an error anyone sees.
+        h.update([cfg.cache_type_k as u8, cfg.cache_type_v as u8]);
         hex::encode(&h.finalize()[..8])
     }
 
@@ -1100,8 +1505,7 @@ impl LlamaCppEngine {
                 // prefills from scratch, rather than trimming a restored state
                 // back to a common point the sliding-window layers cannot cover.
                 let loaded = self.loaded.as_mut().expect("loaded");
-                loaded
-                    .dec
+                loaded.decs[0]
                     .ctx()
                     .kv_cache_seq_rm(0, None, None)
                     .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
@@ -1121,8 +1525,7 @@ impl LlamaCppEngine {
         // records every cell in the sequence, and the token list beside it is
         // only metadata. Saving a longer sequence under a shorter token list is
         // how a restore comes back with cells nothing accounts for.
-        loaded
-            .dec
+        loaded.decs[0]
             .ctx()
             .kv_cache_seq_rm(0, None, None)
             .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
@@ -1141,7 +1544,7 @@ impl LlamaCppEngine {
         // state cannot do is REWIND, which this never does.
         let mut start = 0usize;
         if path.exists() {
-            match loaded.dec.ctx().state_seq_load_file(&path, 0, self.cfg.n_ctx as usize) {
+            match loaded.decs[0].ctx().state_seq_load_file(&path, 0, self.cfg.n_ctx as usize) {
                 Ok((toks, _)) if !toks.is_empty() && prefix.len() > toks.len()
                     && prefix[..toks.len()] == toks[..] =>
                 {
@@ -1156,8 +1559,7 @@ impl LlamaCppEngine {
                 Ok(_) => {
                     // Restored but not a strict prefix: drop it whole and
                     // rebuild from scratch. Never trim a windowed state.
-                    loaded
-                        .dec
+                    loaded.decs[0]
                         .ctx()
                         .kv_cache_seq_rm(0, None, None)
                         .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
@@ -1172,16 +1574,17 @@ impl LlamaCppEngine {
         // for speculation to work on the restored turn as well.
         // The window this batch may later be reused for, in tokens, and 0 when
         // there is no drafter. Doubles as the `feed the drafter` flag.
-        let drafting = if matches!(loaded.dec, Decoder::Mtp(_)) {
+        let drafting = if matches!(loaded.decs[0], Decoder::Mtp(_)) {
             1 + self.cfg.draft_n_max.max(0) as usize
         } else {
             0
         };
-        if let Decoder::Mtp(spec) = &mut loaded.dec {
+        if let Decoder::Mtp(spec) = &mut loaded.decs[0] {
             spec.begin(&prefix)
                 .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
         }
-        Self::prefill_span(loaded, &prefix, start, prefix.len(), 0, drafting, cancel.as_ref())?;
+        let at = loaded.addr(0);
+        Self::prefill_span(loaded, at, &prefix, start, prefix.len(), drafting, cancel.as_ref())?;
         // A cancel that lands during the LAST chunk still reaches here, and the
         // state file is the one artifact of a stopped call that would outlive
         // the process: written now, every later launch would restore it as if
@@ -1200,8 +1603,7 @@ impl LlamaCppEngine {
         // leaves the previous good file rather than a truncated one that reads
         // as present.
         let tmp = path.with_extension("kv.tmp");
-        let bytes = loaded
-            .dec
+        let bytes = loaded.decs[0]
             .ctx()
             .state_seq_save_file(&tmp, 0, &prefix)
             .map_err(|e| GenError::Generate(format!("kv state save: {e}")))?;
@@ -1272,17 +1674,17 @@ impl LlamaCppEngine {
     /// allocation, which is what every caller got before cancellation existed.
     fn prefill_span(
         loaded: &mut Loaded,
+        at: SlotAddr,
         tokens: &[llama_cpp_2::token::LlamaToken],
         start: usize,
         end: usize,
-        seq: i32,
         draft_slots: usize,
         cancel: Option<&CancelHandle>,
     ) -> Result<LlamaBatch<'static>, GenError> {
         let span = &tokens[start..end];
         let chunk = match cancel {
             None => span.len(),
-            Some(_) => loaded.dec.ctx().n_ubatch().max(1) as usize,
+            Some(_) => loaded.decs[at.ctx].ctx().n_ubatch().max(1) as usize,
         };
         // `draft_slots` is in the capacity because `generate_impl` goes on to
         // reuse this batch for its speculative steps. Unarmed that was free,
@@ -1290,8 +1692,8 @@ impl LlamaCppEngine {
         // `chunk` is `n_ubatch`, a good interruption granularity would otherwise
         // silently become a batch too small for the window that follows it.
         let mut batch = LlamaBatch::new(chunk.min(span.len()).max(512).max(draft_slots), 1);
-        let mut at = 0usize;
-        while at < span.len() {
+        let mut done = 0usize;
+        while done < span.len() {
             if cancel.is_some_and(CancelHandle::is_cancelled) {
                 // What the sequence actually holds, recorded before returning.
                 // Everything up to here was decoded contiguously from position
@@ -1300,31 +1702,35 @@ impl LlamaCppEngine {
                 // checkpoints are validated against. Trimming BACK to where the
                 // turn started would be the wrong repair: a windowed SWA cache
                 // cannot rewind.
-                loaded.cached.insert(seq as u32, tokens[..start + at].to_vec());
+                loaded.cached.insert(at.slot, tokens[..start + done].to_vec());
                 return Err(GenError::Cancelled);
             }
-            let upto = (at + chunk).min(span.len());
+            let upto = (done + chunk).min(span.len());
             batch.clear();
             // Logits on the span's final token only. An intermediate chunk is
             // pure context, and asking for its logits would pay a 262K-row
             // output projection for a row nothing reads.
-            for (i, t) in span[at..upto].iter().enumerate() {
+            for (i, t) in span[done..upto].iter().enumerate() {
                 batch
-                    .add(*t, (start + at + i) as i32, &[seq], at + i == span.len() - 1)
+                    .add(
+                        *t,
+                        (start + done + i) as i32,
+                        &[at.seq],
+                        done + i == span.len() - 1,
+                    )
                     .map_err(|e| GenError::Generate(e.to_string()))?;
             }
-            loaded
-                .dec
+            loaded.decs[at.ctx]
                 .ctx()
                 .decode(&mut batch)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
             if draft_slots > 0 {
-                if let Decoder::Mtp(spec) = &mut loaded.dec {
+                if let Decoder::Mtp(spec) = &mut loaded.decs[at.ctx] {
                     spec.process(&batch)
                         .map_err(|e| GenError::Generate(format!("mtp process: {e}")))?;
                 }
             }
-            at = upto;
+            done = upto;
         }
         Ok(batch)
     }
@@ -1643,7 +2049,11 @@ impl LlamaCppEngine {
         let cancel = self.cfg.cancel.clone();
         let draft_n_max = self.cfg.draft_n_max.max(0) as usize;
         let enable_thinking = req.enable_thinking.unwrap_or(self.cfg.enable_thinking);
-        let n_ctx = self.cfg.n_ctx;
+        // Where this request's slot lives, and how big a window it therefore
+        // has. Read once, before `loaded` is borrowed, and Copy, so the borrow
+        // splitting below stays field-level.
+        let at = self.loaded.as_ref().expect("just loaded").addr(req.slot);
+        let n_ctx = at.n_ctx;
 
         // --- render the prompt through the model's own template -------------
         let applied = self
@@ -1878,7 +2288,7 @@ impl LlamaCppEngine {
         // the whole prompt on every speculative turn.
         let slot = req.slot;
         let speculative =
-            slot == 0 && matches!(loaded.dec, Decoder::Mtp(_)) && grammar.is_none();
+            slot == 0 && matches!(loaded.decs[at.ctx], Decoder::Mtp(_)) && grammar.is_none();
         // In tokens, because prefill_span sizes its batch to hold this: the
         // batch it returns is the one the speculative steps below reuse.
         let draft_slots = if speculative { 1 + draft_n_max } else { 0 };
@@ -1923,7 +2333,7 @@ impl LlamaCppEngine {
             // — the overwhelmingly common case — never trim and never pay
             // this. With `swa_full: true`, pos_min stays 0 and nothing
             // changes.
-            let evicted = loaded.dec.ctx().kv_cache_seq_pos_min(slot as i32) > 0;
+            let evicted = loaded.decs[at.ctx].ctx().kv_cache_seq_pos_min(at.seq) > 0;
             if evicted {
                 // The way back: a checkpoint at or before the divergence whose
                 // tokens this prompt still starts with. Newest first, because
@@ -1968,8 +2378,8 @@ impl LlamaCppEngine {
                 // already treats "re-prefill everything" as its floor, so a
                 // refused rewind degrades to exactly that: slow, never wrong.
                 let rewound = match ckpt.map(|c| c.tokens.len()) {
-                    Some(n) => match loaded.dec.ctx().kv_cache_seq_rm(
-                        slot as i32,
+                    Some(n) => match loaded.decs[at.ctx].ctx().kv_cache_seq_rm(
+                        at.seq,
                         Some(n as u32),
                         None,
                     ) {
@@ -1990,10 +2400,9 @@ impl LlamaCppEngine {
                 };
                 if let Some(c) = ckpt.filter(|_| rewound) {
                     let n = c.tokens.len();
-                    loaded
-                        .dec
+                    loaded.decs[at.ctx]
                         .ctx()
-                        .state_seq_set(&c.state, slot as i32)
+                        .state_seq_set(&c.state, at.seq)
                         .map_err(|e| GenError::Generate(format!("checkpoint restore: {e}")))?;
                     if pinned {
                         // Fires once per background job during a backlog
@@ -2042,14 +2451,12 @@ impl LlamaCppEngine {
                     if slot == 0 {
                         if let Some(path) = Self::prefix_path_for(&self.cfg) {
                             if path.exists() {
-                                loaded
-                                    .dec
+                                loaded.decs[at.ctx]
                                     .ctx()
                                     .kv_cache_seq_rm(0, None, None)
                                     .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
                                 let t_restore = Instant::now();
-                                match loaded
-                                    .dec
+                                match loaded.decs[at.ctx]
                                     .ctx()
                                     .state_seq_load_file(&path, 0, self.cfg.n_ctx as usize)
                                 {
@@ -2069,8 +2476,7 @@ impl LlamaCppEngine {
                                             );
                                             restored = n;
                                         } else {
-                                            loaded
-                                                .dec
+                                            loaded.decs[at.ctx]
                                                 .ctx()
                                                 .kv_cache_seq_rm(0, None, None)
                                                 .map_err(|e| {
@@ -2111,26 +2517,23 @@ impl LlamaCppEngine {
                 }
             }
             if reuse == 0 {
-                loaded
-                    .dec
+                loaded.decs[at.ctx]
                     .ctx()
-                    .kv_cache_seq_rm(slot as i32, None, None)
+                    .kv_cache_seq_rm(at.seq, None, None)
                     .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
             } else if reuse < prior_len && !evicted {
                 // Same refusal as the checkpoint rewind above, reached by the
                 // ordinary divergence path: a recurrent cache cannot be
                 // trimmed to a position. Drop the sequence whole and re-prefill
                 // rather than losing the turn.
-                if loaded
-                    .dec
+                if loaded.decs[at.ctx]
                     .ctx()
-                    .kv_cache_seq_rm(slot as i32, Some(reuse as u32), None)
+                    .kv_cache_seq_rm(at.seq, Some(reuse as u32), None)
                     .is_err()
                 {
-                    loaded
-                        .dec
+                    loaded.decs[at.ctx]
                         .ctx()
-                        .kv_cache_seq_rm(slot as i32, None, None)
+                        .kv_cache_seq_rm(at.seq, None, None)
                         .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
                     reuse = 0;
                 }
@@ -2139,7 +2542,7 @@ impl LlamaCppEngine {
         // The speculative path needs the whole prompt announced up front, before
         // any decode, so the drafter's own context is primed from the same text.
         if speculative {
-            if let Decoder::Mtp(spec) = &mut loaded.dec {
+            if let Decoder::Mtp(spec) = &mut loaded.decs[at.ctx] {
                 spec.begin(&tokens)
                     .map_err(|e| GenError::Generate(format!("mtp begin: {e}")))?;
             }
@@ -2206,23 +2609,14 @@ impl LlamaCppEngine {
             // boundary already IS the capture point, i.e. an appended turn
             // whose fresh tail is shorter than the margin).
             if cap > prefilled {
-                Self::prefill_span(
-                    loaded,
-                    &tokens,
-                    prefilled,
-                    cap,
-                    slot as i32,
-                    draft_slots,
-                    cancel.as_ref(),
-                )?;
+                Self::prefill_span(loaded, at, &tokens, prefilled, cap, draft_slots, cancel.as_ref())?;
                 prefilled = cap;
             }
             // Best-effort: a turn without a checkpoint is a turn that may pay
             // a full re-prefill later, not a wrong turn.
-            match loaded
-                .dec
+            match loaded.decs[at.ctx]
                 .ctx()
-                .state_seq_get(slot as i32, LlamaStateSeqFlags::PARTIAL_ONLY)
+                .state_seq_get(at.seq, LlamaStateSeqFlags::PARTIAL_ONLY)
             {
                 Ok(state) => {
                     let ckpt = SwaCheckpoint {
@@ -2246,10 +2640,10 @@ impl LlamaCppEngine {
 
         let mut batch = Self::prefill_span(
             loaded,
+            at,
             &tokens,
             prefilled,
             tokens.len(),
-            slot as i32,
             draft_slots,
             cancel.as_ref(),
         )?;
@@ -2289,7 +2683,7 @@ impl LlamaCppEngine {
         let mut next = match forced_next(&rbudget) {
             Some(t) => t,
             None => sample_with_grammar(
-                loaded.dec.ctx(),
+                loaded.decs[at.ctx].ctx(),
                 &mut sampler,
                 grmr.as_mut(),
                 batch.n_tokens() - 1,
@@ -2365,13 +2759,13 @@ impl LlamaCppEngine {
                 && rbudget
                     .as_ref()
                     .map_or(true, |rb| !rb.forcing() && !rb.near_exhaustion(draft_window));
-            match (spec_now, &mut loaded.dec) {
+            match (spec_now, &mut loaded.decs[at.ctx]) {
                 // --- plain: one token in, one token out ---------------------
                 (false, dec) => {
                     let ctx = dec.ctx();
                     batch.clear();
                     batch
-                        .add(next, n_cur, &[slot as i32], true)
+                        .add(next, n_cur, &[at.seq], true)
                         .map_err(|e| GenError::Generate(e.to_string()))?;
                     cached.push(next);
                     n_cur += 1;
@@ -2719,6 +3113,9 @@ mod tests {
             swa_full: true,
             prefix_cache_dir: Some(PathBuf::from("/cache")),
             state_key: "model-sha-aaa".into(),
+            // Non-default (default is F16), like every other field here.
+            cache_type_k: KvCacheType::Q8_0,
+            cache_type_v: KvCacheType::Q8_0,
             ..Default::default()
         }
     }
@@ -2771,6 +3168,17 @@ mod tests {
         let mut c = cfg();
         c.draft_path = Some(PathBuf::from("/models/other-draft.gguf"));
         assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "drafter swapped");
+
+        // The cache's element type sizes every entry in it, so it is part of
+        // the saved layout exactly as `swa_full` is. K and V are separately
+        // settable and must be separately keyed.
+        let mut c = cfg();
+        c.cache_type_k = KvCacheType::F16;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "cache_type_k");
+
+        let mut c = cfg();
+        c.cache_type_v = KvCacheType::F16;
+        assert_ne!(base, LlamaCppEngine::prefix_key_for(&c), "cache_type_v");
     }
 
     /// The mirror of the above, and the half that makes the cache worth having:
@@ -2795,6 +3203,73 @@ mod tests {
             LlamaCppEngine::prefix_key_for(&cfg()),
             LlamaCppEngine::prefix_key_for(&c)
         );
+    }
+
+    /// A background context is not part of slot 0's state. Keying on it would
+    /// mean that retuning the background window discards the agent's persisted
+    /// prefix and pays a ~27s cold prefill on the next launch, for a file that
+    /// is still perfectly valid: the prefix is saved out of and restored into
+    /// the base context, and an extra context is a separate `llama_context`.
+    #[test]
+    fn an_extra_context_does_not_move_the_prefix_key() {
+        let mut c = cfg();
+        c.extra_contexts = vec![ContextSpec {
+            n_ctx: 4096,
+            n_slots: 1,
+            n_ubatch: Some(128),
+        }];
+        assert_eq!(
+            LlamaCppEngine::prefix_key_for(&cfg()),
+            LlamaCppEngine::prefix_key_for(&c)
+        );
+    }
+
+    /// Slot numbers run consecutively ACROSS contexts, so a host that adds a
+    /// second context does not renumber the slots it was already sending: the
+    /// desktop keeps its agent on slot 0 and its background work on slot 1
+    /// either way, and only the window changes.
+    #[test]
+    fn slots_number_consecutively_across_contexts() {
+        let mut c = cfg();
+        c.n_ctx = 65536;
+        c.n_slots = 1;
+        c.extra_contexts = vec![ContextSpec {
+            n_ctx: 16384,
+            n_slots: 2,
+            n_ubatch: None,
+        }];
+        let e = LlamaCppEngine::new(c);
+        let specs = e.context_specs();
+        let map = LlamaCppEngine::slot_map(&specs);
+        assert_eq!(
+            map.iter()
+                .map(|a| (a.slot, a.ctx, a.seq, a.n_ctx))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0, 65536), (1, 1, 0, 16384), (2, 1, 1, 16384)],
+        );
+    }
+
+    /// One context's slots are all the same size — llama.cpp divides its KV
+    /// evenly across sequences — so the TOTAL is what gets scaled, and a host
+    /// that asks for two 16K slots must not silently get two 8K ones.
+    #[test]
+    fn a_contexts_window_is_per_slot_and_the_total_is_scaled() {
+        let mut c = cfg();
+        c.n_ctx = 16384;
+        c.n_slots = 2;
+        c.extra_contexts = vec![ContextSpec {
+            n_ctx: 4096,
+            n_slots: 1,
+            n_ubatch: None,
+        }];
+        let e = LlamaCppEngine::new(c);
+        let specs = e.context_specs();
+        let p: Vec<_> = specs
+            .iter()
+            .map(|s| e.ctx_params(s))
+            .map(|p| (p.n_ctx().map(|n| n.get()), p.n_batch()))
+            .collect();
+        assert_eq!(p, vec![(Some(32768), 16384), (Some(4096), 4096)]);
     }
 
     #[test]

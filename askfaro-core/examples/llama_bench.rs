@@ -22,9 +22,30 @@
 //! to force a rebuild.
 
 use askfaro_core::generation::{
-    GenerateRequest, GenerationEngine, LlamaCppConfig, LlamaCppEngine, Msg, ToolSchema,
+    GenerateRequest, GenerationEngine, KvCacheType, LlamaCppConfig, LlamaCppEngine, Msg, ToolSchema,
 };
 use serde_json::{json, Value};
+
+/// Read a cache type from the environment, so one binary can measure the
+/// shipping f16 cache and a quantized one in the same sitting. Refuses an
+/// unknown name rather than falling back to f16: a typo that silently measures
+/// the baseline twice is the failure this bench exists to avoid.
+fn cache_type_from_env(var: &str) -> KvCacheType {
+    match std::env::var(var).as_deref().map(str::trim) {
+        Err(_) | Ok("") | Ok("f16") => KvCacheType::F16,
+        Ok("f32") => KvCacheType::F32,
+        Ok("bf16") => KvCacheType::BF16,
+        Ok("q8_0") => KvCacheType::Q8_0,
+        Ok("q5_1") => KvCacheType::Q5_1,
+        Ok("q5_0") => KvCacheType::Q5_0,
+        Ok("q4_1") => KvCacheType::Q4_1,
+        Ok("q4_0") => KvCacheType::Q4_0,
+        Ok(other) => {
+            eprintln!("{var}: unknown cache type {other:?}");
+            std::process::exit(2);
+        }
+    }
+}
 
 fn read_json(path: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|e| {
@@ -146,11 +167,25 @@ fn main() {
     // blob store and has no business writing into someone else's model cache.
     let model_path: std::path::PathBuf = model_path.into();
     let prefix_dir = std::env::temp_dir().join("faro-bench-prefix");
+    // The app does not run the crate defaults: it sets `n_ubatch` for UI
+    // responsiveness. Measuring memory against a default the app never uses
+    // reports a footprint nobody has, so the shipping value is the default
+    // HERE too, and the env vars exist to move off it deliberately.
+    let n_ubatch: u32 = std::env::var("FARO_BENCH_N_UBATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let cache_type_k = cache_type_from_env("FARO_BENCH_CACHE_TYPE_K");
+    let cache_type_v = cache_type_from_env("FARO_BENCH_CACHE_TYPE_V");
+    eprintln!("n_ubatch {n_ubatch} | KV cache k={cache_type_k:?} v={cache_type_v:?}");
     let mut engine = LlamaCppEngine::new(LlamaCppConfig {
         model_path: model_path.clone(),
         draft_path: draft.map(Into::into),
         prefix_cache_dir: Some(prefix_dir.clone()),
         state_key: "llama_bench".into(),
+        n_ubatch: Some(n_ubatch),
+        cache_type_k,
+        cache_type_v,
         ..Default::default()
     });
 
