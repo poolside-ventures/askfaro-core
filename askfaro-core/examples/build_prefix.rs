@@ -74,7 +74,7 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> \
-                 <n_ctx> <n_slots>"
+                 <n_ctx> <n_slots> <tool-registry.json>"
             );
             std::process::exit(2);
         }
@@ -111,8 +111,33 @@ fn main() {
         }
     };
 
+    // The registry FILENAME, not a flag and not a default. The caller ships more
+    // than one tool set now (a first release exposes a generated subset of the
+    // registry, with its own wording), and each set is a different prompt, so a
+    // different prefix, so a different artifact. This example does not know
+    // which sets exist or what they mean: it builds a prefix for the tool list
+    // it is handed, which keeps release policy on the caller's side where it
+    // belongs.
+    //
+    // Required, for the reason `n_ctx` is required above: defaulting to
+    // `scope_tools.json` would silently agree with one caller, and the day a
+    // second set became the common case this would publish the wrong bytes
+    // under a URL that cannot say so.
+    let registry_file: String = match args.next() {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "error: pass the tool registry filename explicitly, relative to \
+                 <scope-repo-root>/frontend/src/platform (e.g. scope_tools.json \
+                 or scope_tools_v1.json); the prompt, and so the artifact, \
+                 differs per tool set"
+            );
+            std::process::exit(2);
+        }
+    };
+
     let platform = format!("{repo}/frontend/src/platform");
-    let registry = read_json(&format!("{platform}/scope_tools.json"));
+    let registry = read_json(&format!("{platform}/{registry_file}"));
     let prompt_consts = read_json(&format!("{platform}/scopy_prompt.json"));
     let index = read_json(&format!("{platform}/scopy_instructions_index.json"));
 
