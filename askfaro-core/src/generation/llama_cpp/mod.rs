@@ -728,6 +728,26 @@ pub struct LlamaCppEngine {
     /// backlog-drain volume (one line per background job).
     log_full_reprefill: LogThrottle,
     log_pinned_restore: LogThrottle,
+    /// Memoized [`Self::stable_prefix`] result, keyed by
+    /// [`Self::stable_prefix_key`].
+    ///
+    /// `stable_prefix` costs TWO `chat.apply` calls, and each of those renders
+    /// the whole tool payload THREE times inside upstream's gemma4 handler
+    /// (once for the prompt, twice more to recover the generation prompt by
+    /// diffing). Measured on the M1 Pro floor machine against our own vendored
+    /// llama.cpp: one `chat.apply` is 63ms on the shipping 23-tool registry, so
+    /// the pair is ~130ms.
+    ///
+    /// `ensure_prefix` pays that unconditionally BEFORE testing whether the
+    /// on-disk prefix is already current, and "already current" is the common
+    /// case: every launch after the first, and every idle reclaim. So the work
+    /// was being redone to answer a question whose answer had not changed.
+    ///
+    /// Lives on the engine rather than on [`Loaded`], for the same reason
+    /// `head_len` does: the key pins the model file and its length, so a
+    /// reload of the SAME weights can reuse it and a different model cannot
+    /// collide with it.
+    prefix_tokens_memo: Option<(String, Vec<llama_cpp_2::token::LlamaToken>)>,
 }
 
 /// Where one host slot lives: which context, which sequence inside it, and how
@@ -901,6 +921,7 @@ impl LlamaCppEngine {
             head_len: Default::default(),
             log_full_reprefill: LogThrottle::new(),
             log_pinned_restore: LogThrottle::new(),
+            prefix_tokens_memo: None,
         }
     }
 
@@ -1487,7 +1508,77 @@ impl LlamaCppEngine {
     /// chat templates fold the system message INTO the first user turn, so a
     /// system-only render is not a prefix of anything. Two probes make the
     /// boundary an observation instead.
+    /// Everything [`Self::stable_prefix`] actually reads, as one hash.
+    ///
+    /// Two halves. [`Self::prefix_key_for`] already covers the engine side: the
+    /// model file and its length (so the template and the vocabulary are
+    /// pinned), the drafter, the context shape and `enable_thinking`. What it
+    /// does not cover is the per-request side, because it takes only the
+    /// config, so the system block, the tool set and the response format are
+    /// hashed here.
+    ///
+    /// `req.messages` are deliberately absent, and that is not an oversight:
+    /// `render_tokens` clears them and substitutes its own one-character probe,
+    /// and `ensure_prefix` documents that a prefix by definition ends before
+    /// the conversation. A key that included them would never hit.
+    fn stable_prefix_key(&self, req: &GenerateRequest) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"askfaro-stable-prefix-v1\0");
+        h.update(Self::prefix_key_for(&self.cfg).as_bytes());
+        h.update(b"\0");
+        h.update(req.system.as_bytes());
+        h.update(b"\0");
+        // Name, description AND parameter schema: an argument enum that gains a
+        // value changes the rendered tool block without changing any name, and
+        // that is exactly the edit a registry rebuild makes.
+        for t in &req.tools {
+            h.update(t.name.as_bytes());
+            h.update(b"\0");
+            h.update(t.description.as_bytes());
+            h.update(b"\0");
+            h.update(t.parameters.to_string().as_bytes());
+            h.update(b"\0");
+        }
+        // The shim forwards this into `inputs.json_schema`, so it is an input to
+        // the same `chat.apply` the render goes through.
+        match &req.json_schema {
+            Some(s) => h.update(s.to_string().as_bytes()),
+            None => h.update(b"no-schema"),
+        }
+        hex::encode(&h.finalize()[..8])
+    }
+
     fn stable_prefix(
+        &mut self,
+        req: &GenerateRequest,
+    ) -> Result<Vec<llama_cpp_2::token::LlamaToken>, GenError> {
+        let key = self.stable_prefix_key(req);
+        if let Some((cached_key, cached)) = &self.prefix_tokens_memo {
+            if *cached_key == key {
+                let hit = cached.clone();
+                // The memo claims a pure function of the key. In debug builds,
+                // prove it rather than trust it: a stale prefix is silent, and
+                // the failure it causes (a full re-prefill on every launch)
+                // looks like a cold start rather than like a bug.
+                #[cfg(debug_assertions)]
+                {
+                    let fresh = self.stable_prefix_uncached(req)?;
+                    debug_assert_eq!(
+                        fresh, hit,
+                        "stable_prefix memo returned a different prefix than a fresh render; \
+                         the key is missing an input"
+                    );
+                }
+                return Ok(hit);
+            }
+        }
+        let out = self.stable_prefix_uncached(req)?;
+        self.prefix_tokens_memo = Some((key, out.clone()));
+        Ok(out)
+    }
+
+    fn stable_prefix_uncached(
         &mut self,
         req: &GenerateRequest,
     ) -> Result<Vec<llama_cpp_2::token::LlamaToken>, GenError> {
@@ -3170,6 +3261,87 @@ mod tests {
     /// produced it, so a mismatched file deserializes happily and answers
     /// plausible nonsense. Each of these fields changes the tokens or the cache
     /// layout, so each MUST change the file name.
+    /// The memo in `stable_prefix` is only as safe as this key. A missing input
+    /// does not throw: it returns a prefix computed for a DIFFERENT system block
+    /// or tool set, and the symptom is a full re-prefill that reads as a cold
+    /// start. So every input the render actually consumes has to move the key,
+    /// and `messages` has to NOT move it, because `render_tokens` throws them
+    /// away and a key that included them would never hit.
+    #[test]
+    fn every_input_that_changes_the_stable_prefix_changes_its_key() {
+        use crate::generation::ToolSchema;
+        let req = || GenerateRequest {
+            system: "you are scopy".into(),
+            tools: vec![ToolSchema {
+                name: "scopy_task_create".into(),
+                description: "create a task".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"title": {"type": "string"}}}),
+            }],
+            ..Default::default()
+        };
+        let eng = LlamaCppEngine::new(cfg());
+        let base = eng.stable_prefix_key(&req());
+
+        assert_eq!(base, eng.stable_prefix_key(&req()), "must be stable");
+
+        let mut r = req();
+        r.system = "you are something else".into();
+        assert_ne!(base, eng.stable_prefix_key(&r), "system block");
+
+        let mut r = req();
+        r.tools[0].name = "scopy_task_delete".into();
+        assert_ne!(base, eng.stable_prefix_key(&r), "tool name");
+
+        let mut r = req();
+        r.tools[0].description = "create a thing".into();
+        assert_ne!(base, eng.stable_prefix_key(&r), "tool description");
+
+        // The edit a registry rebuild actually makes: an argument schema grows a
+        // property while every name stays put.
+        let mut r = req();
+        r.tools[0].parameters =
+            serde_json::json!({"type": "object", "properties": {"title": {"type": "string"}, "due": {"type": "string"}}});
+        assert_ne!(base, eng.stable_prefix_key(&r), "tool parameter schema");
+
+        let mut r = req();
+        r.tools.push(ToolSchema {
+            name: "scopy_note".into(),
+            description: "write a note".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+        assert_ne!(base, eng.stable_prefix_key(&r), "tool count");
+
+        let mut r = req();
+        r.json_schema = Some(serde_json::json!({"type": "object"}));
+        assert_ne!(base, eng.stable_prefix_key(&r), "json_schema");
+
+        // The engine half, proving prefix_key_for is really folded in.
+        let mut c = cfg();
+        c.model_path = PathBuf::from("/models/b.gguf");
+        assert_ne!(
+            base,
+            LlamaCppEngine::new(c).stable_prefix_key(&req()),
+            "model path"
+        );
+
+        let mut c = cfg();
+        c.enable_thinking = !c.enable_thinking;
+        assert_ne!(
+            base,
+            LlamaCppEngine::new(c).stable_prefix_key(&req()),
+            "enable_thinking"
+        );
+
+        // And the one that must NOT move it.
+        let mut r = req();
+        r.messages = vec![Msg::user("anything at all")];
+        assert_eq!(
+            base,
+            eng.stable_prefix_key(&r),
+            "messages are discarded by render_tokens, so they must not key the memo"
+        );
+    }
+
     #[test]
     fn every_input_that_changes_the_state_changes_the_key() {
         let base = LlamaCppEngine::prefix_key_for(&cfg());
