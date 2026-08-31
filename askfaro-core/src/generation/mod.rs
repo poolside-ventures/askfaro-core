@@ -300,6 +300,18 @@ pub struct Timings {
     /// number a reasoning budget moves.
     pub decode_ms: u64,
     pub prompt_tokens: u32,
+    /// Prompt tokens the turn did NOT have to prefill, because the cache
+    /// already held them: a live slot, an SWA checkpoint, or the persisted
+    /// prefix restored from disk.
+    ///
+    /// Reported because it is the only DIRECT answer to "did the cache hold?".
+    /// A host can otherwise only infer it from `prefill_ms`, and that inference
+    /// is wrong: prefill time scales with the tokens BEYOND the reuse point, so
+    /// a long transcript on a perfectly restored prefix is indistinguishable
+    /// from a short one on no prefix at all. Scope's desktop app shipped that
+    /// inference as an assertion and it misfired on five of seven firings.
+    #[serde(default, skip_serializing_if = "crate::generation::is_zero_u32")]
+    pub cached_tokens: u32,
     pub output_tokens: u32,
     /// True when generation stopped at a cap rather than at end-of-turn, so a
     /// truncated answer is never mistaken for a brief one.

@@ -3221,6 +3221,7 @@ impl LlamaCppEngine {
                 prefill_ms,
                 decode_ms,
                 prompt_tokens: tokens.len() as u32,
+                cached_tokens: reuse as u32,
                 output_tokens: output_tokens as u32,
                 truncated,
                 draft_proposed: draft_proposed as u32,
