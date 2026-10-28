@@ -9,7 +9,7 @@
 //!
 //! ```sh
 //! cargo run --release --features llama-cpp --example build_prefix -- \
-//!   <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> <n_ctx> <n_slots>
+//!   <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> <n_ctx> <n_slots> <tool-registry.json> <instructions-index.json>
 //! ```
 //!
 //! The engine config below MUST mirror the desktop's `brain_config` for every
@@ -74,7 +74,7 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> \
-                 <n_ctx> <n_slots> <tool-registry.json>"
+                 <n_ctx> <n_slots> <tool-registry.json> <instructions-index.json>"
             );
             std::process::exit(2);
         }
@@ -136,10 +136,26 @@ fn main() {
         }
     };
 
+    // The instruction index moves with the tool set: each set ships the manual
+    // for the tools it has. Hardcoding the full set's index built every other
+    // set's prefix from a prompt its app never sends, so the app discarded it.
+    let index_file: String = match args.next() {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "error: pass the instruction index filename explicitly, relative \
+                 to <scope-repo-root>/frontend/src/platform (e.g. \
+                 scopy_instructions_index.json or scopy_instructions_index_v1.json); \
+                 it belongs to the tool set"
+            );
+            std::process::exit(2);
+        }
+    };
+
     let platform = format!("{repo}/frontend/src/platform");
     let registry = read_json(&format!("{platform}/{registry_file}"));
     let prompt_consts = read_json(&format!("{platform}/scopy_prompt.json"));
-    let index = read_json(&format!("{platform}/scopy_instructions_index.json"));
+    let index = read_json(&format!("{platform}/{index_file}"));
 
     // Identical assembly to llama_bench and desktop.ts `onDeviceSystemPrompt`.
     // A prefix built from a different prompt is a 178MB file the app validates
