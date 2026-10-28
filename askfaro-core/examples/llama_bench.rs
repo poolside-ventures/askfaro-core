@@ -178,6 +178,14 @@ fn main() {
     let cache_type_k = cache_type_from_env("FARO_BENCH_CACHE_TYPE_K");
     let cache_type_v = cache_type_from_env("FARO_BENCH_CACHE_TYPE_V");
     eprintln!("n_ubatch {n_ubatch} | KV cache k={cache_type_k:?} v={cache_type_v:?}");
+    // FARO_BENCH_CPU_OVERRIDES: comma-separated tensor patterns kept off the
+    // accelerator (`cpu_tensor_overrides`). They do nothing under mmap, so
+    // FARO_BENCH_NO_MMAP=1 is the other half of the same experiment.
+    let cpu_tensor_overrides: Vec<String> = std::env::var("FARO_BENCH_CPU_OVERRIDES")
+        .map(|v| v.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect())
+        .unwrap_or_default();
+    let use_mmap = std::env::var("FARO_BENCH_NO_MMAP").map_or(true, |v| v != "1");
+    eprintln!("mmap {use_mmap} | cpu overrides {cpu_tensor_overrides:?}");
     let mut engine = LlamaCppEngine::new(LlamaCppConfig {
         model_path: model_path.clone(),
         draft_path: draft.map(Into::into),
@@ -186,6 +194,8 @@ fn main() {
         n_ubatch: Some(n_ubatch),
         cache_type_k,
         cache_type_v,
+        cpu_tensor_overrides,
+        use_mmap,
         ..Default::default()
     });
 

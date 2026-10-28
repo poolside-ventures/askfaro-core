@@ -103,6 +103,18 @@ pub const GEMMA4_E2B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
 /// than a requantisation, not better. Ours keeps `per_layer_model_proj` at F16
 /// and its histogram is exactly 344 Q4_0 + 321 F32 + 1 F16.
 ///
+/// **`per_layer_token_embd` sits first in the file**, and the order is the
+/// point. With mmap, llama.cpp hands the GPU ONE contiguous range per file,
+/// from the first to the last byte of the tensors it computes with. In Google's
+/// order this 1,512 MiB CPU lookup table sat between `per_layer_model_proj`
+/// and the blocks, so the whole of it was wired into Metal for nothing. Moved
+/// to the front, the Metal range falls from 4,043 to 2,531 MiB and the table
+/// stays clean file-backed pages the OS can drop. Measured 2026-10-28 on an
+/// M-series Mac with 16 GB: 1.5 GB less wired memory, all 30 parity cases
+/// byte-identical to the previous file, same decode speed. All 666 tensors are
+/// byte-identical to the previous file; only their order and the description
+/// differ, which is why it is a new name and the old one is superseded.
+///
 /// **Licence.** Gemma 4 is Apache-2.0 (the Gemma Terms of Use appendix does not
 /// list it), which permits distributing a modified copy. The obligations are
 /// met in the file itself: Google's `general.license`, `general.license.link`
@@ -112,14 +124,17 @@ pub const GEMMA4_E2B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
 pub const GEMMA4_E4B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
     id: "gemma-4-e4b-it-qat-q4_0",
     display_name: "Gemma 4 E4B (instruction-tuned, QAT q4_0, embeddings q4_0)",
-    supersedes: &[],
+    // A new name, not new bytes under the old one: presence is checked by name
+    // and size alone, so a same-named file would never reach an upgrading
+    // machine, and this list is what removes the 4.26 GB it replaces.
+    supersedes: &["gemma-4-E4B_q4_0-it-embd-q4_0.gguf"],
     files: &[ModelFile {
         // Content-addressed on the sha below, so republishing different bytes
         // can never be served from a cache of the old ones.
-        name: "gemma-4-E4B_q4_0-it-embd-q4_0.gguf",
-        url: "https://files.scopy.app/ondevice/weights/gemma-4-e4b-it-qat-q4_0-embd-q4_0/7a06b5147b6e/gemma-4-E4B_q4_0-it-embd-q4_0.gguf",
-        sha256: "7a06b5147b6e0e6f64734cc7f2050224041a59edea98c9d70860dfa83ccd2724",
-        size: 4_255_263_488,
+        name: "gemma-4-E4B_q4_0-it-embd-q4_0-ple-first.gguf",
+        url: "https://files.scopy.app/ondevice/weights/gemma-4-e4b-it-qat-q4_0-embd-q4_0/e2e844c9b770/gemma-4-E4B_q4_0-it-embd-q4_0-ple-first.gguf",
+        sha256: "e2e844c9b770266b6deb61cebd2abb79f2fe557d648a1ca1c91c6e35cc02a927",
+        size: 4_255_263_552,
     }],
 };
 
