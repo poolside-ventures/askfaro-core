@@ -2,14 +2,14 @@
 //!
 //! The release pipeline runs this once per (app prompt, weights) pair so a
 //! fresh install can DOWNLOAD the prefix instead of spending ~40s of GPU
-//! computing it during onboarding. It assembles the exact on-device prompt the
-//! way `llama_bench` does (same platform JSONs, same registry), builds the
-//! prefix through the same `ensure_prefix` the app calls, and copies the
-//! resulting state file to the requested output path.
+//! computing it during onboarding. It takes the exact on-device prompt from a
+//! file the caller writes, builds the prefix through the same `ensure_prefix`
+//! the app calls, and copies the resulting state file to the requested output
+//! path.
 //!
 //! ```sh
 //! cargo run --release --features llama-cpp --example build_prefix -- \
-//!   <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> <n_ctx> <n_slots> <tool-registry.json> <instructions-index.json>
+//!   <model.gguf> <prompt.json> <drafter.gguf> <out.kv> <n_ctx> <n_slots>
 //! ```
 //!
 //! The engine config below MUST mirror the desktop's `brain_config` for every
@@ -68,17 +68,17 @@ fn main() {
         return;
     }
 
-    let (model_path, repo, draft, out) = match (args.next(), args.next(), args.next(), args.next())
-    {
-        (Some(m), Some(r), Some(d), Some(o)) => (m, r, d, o),
-        _ => {
-            eprintln!(
-                "usage: build_prefix <model.gguf> <scope-repo-root> <drafter.gguf> <out.kv> \
-                 <n_ctx> <n_slots> <tool-registry.json> <instructions-index.json>"
-            );
-            std::process::exit(2);
-        }
-    };
+    let (model_path, prompt_path, draft, out) =
+        match (args.next(), args.next(), args.next(), args.next()) {
+            (Some(m), Some(p), Some(d), Some(o)) => (m, p, d, o),
+            _ => {
+                eprintln!(
+                    "usage: build_prefix <model.gguf> <prompt.json> <drafter.gguf> <out.kv> \
+                     <n_ctx> <n_slots>"
+                );
+                std::process::exit(2);
+            }
+        };
     // REQUIRED, and deliberately not defaulted. It used to inherit
     // `LlamaCppConfig::default()`, which was 16,384 and happened to equal the
     // desktop's window — until the desktop moved to 65,536 on 2026-08-20 and
@@ -111,75 +111,31 @@ fn main() {
         }
     };
 
-    // The registry FILENAME, not a flag and not a default. The caller ships more
-    // than one tool set now (a first release exposes a generated subset of the
-    // registry, with its own wording), and each set is a different prompt, so a
-    // different prefix, so a different artifact. This example does not know
-    // which sets exist or what they mean: it builds a prefix for the tool list
-    // it is handed, which keeps release policy on the caller's side where it
-    // belongs.
-    //
-    // Required, for the reason `n_ctx` is required above: defaulting to
-    // `scope_tools.json` would silently agree with one caller, and the day a
-    // second set became the common case this would publish the wrong bytes
-    // under a URL that cannot say so.
-    let registry_file: String = match args.next() {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
-            eprintln!(
-                "error: pass the tool registry filename explicitly, relative to \
-                 <scope-repo-root>/frontend/src/platform (e.g. scope_tools.json \
-                 or scope_tools_v1.json); the prompt, and so the artifact, \
-                 differs per tool set"
-            );
-            std::process::exit(2);
-        }
-    };
-
-    // The instruction index moves with the tool set: each set ships the manual
-    // for the tools it has. Hardcoding the full set's index built every other
-    // set's prefix from a prompt its app never sends, so the app discarded it.
-    let index_file: String = match args.next() {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
-            eprintln!(
-                "error: pass the instruction index filename explicitly, relative \
-                 to <scope-repo-root>/frontend/src/platform (e.g. \
-                 scopy_instructions_index.json or scopy_instructions_index_v1.json); \
-                 it belongs to the tool set"
-            );
-            std::process::exit(2);
-        }
-    };
-
-    let platform = format!("{repo}/frontend/src/platform");
-    let registry = read_json(&format!("{platform}/{registry_file}"));
-    let prompt_consts = read_json(&format!("{platform}/scopy_prompt.json"));
-    let index = read_json(&format!("{platform}/{index_file}"));
-
-    // Identical assembly to llama_bench and desktop.ts `onDeviceSystemPrompt`.
-    // A prefix built from a different prompt is a 178MB file the app validates
-    // once, discards, and rebuilds over: worse than no artifact.
-    let style_rules = prompt_consts["styleRules"]
+    // The prompt arrives whole, `{system, tools: [{name, description,
+    // parameters}]}`, written by the caller from the code its app runs (Scope's
+    // `scripts/prefix_fingerprint.mjs --inputs`). This used to assemble it from
+    // the caller's registry and index files, and that copy drifted twice: it
+    // always read the full set's index, and it never had the tool the app's
+    // harness adds on top of the registry. Each drift made every published
+    // prefix one the app discards whole on first use. Taking the prompt instead
+    // of rebuilding it leaves nothing here to drift.
+    let prompt = read_json(&prompt_path);
+    let system = prompt["system"].as_str().unwrap_or_else(|| {
+        eprintln!("{prompt_path} has no string `system`");
+        std::process::exit(2);
+    });
+    let system = system.to_string();
+    let tools: Vec<ToolSchema> = prompt["tools"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
-        .unwrap_or_default();
-    let system = format!(
-        "You are Scopy, a fast on-device assistant.\n\n\
-         response_style: {style} {rules}\n\n{loop_guidance}\n\n{index}",
-        style = prompt_consts["responseStyle"].as_str().unwrap_or(""),
-        rules = style_rules,
-        loop_guidance = prompt_consts["toolLoopGuidance"].as_str().unwrap_or(""),
-        index = index["index"].as_str().unwrap_or(""),
-    );
-    let tools: Vec<ToolSchema> = registry
-        .as_array()
-        .expect("registry is an array")
+        .unwrap_or_else(|| {
+            eprintln!("{prompt_path} has no array `tools`");
+            std::process::exit(2);
+        })
         .iter()
         .map(|t| ToolSchema {
-            name: t["function"]["name"].as_str().unwrap_or_default().to_string(),
-            description: t["function"]["description"].as_str().unwrap_or_default().to_string(),
-            parameters: t["function"]["parameters"].clone(),
+            name: t["name"].as_str().unwrap_or_default().to_string(),
+            description: t["description"].as_str().unwrap_or_default().to_string(),
+            parameters: t["parameters"].clone(),
         })
         .collect();
 
