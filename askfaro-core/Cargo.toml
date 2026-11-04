@@ -157,6 +157,10 @@ required-features = ["llama-cpp"]
 name = "slot_isolation"
 required-features = ["llama-cpp"]
 
+[[example]]
+name = "adapter_switch"
+required-features = ["llama-cpp"]
+
 # Regression test for the persisted KV prefix's invalidation. A stale restore
 # answers fluently and wrongly rather than erroring, so it needs a check that
 # reads the answer, not the timings. Same gate.

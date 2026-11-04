@@ -599,6 +599,19 @@ pub struct LlamaCppConfig {
     /// batching and model-load callbacks included, so a host that does not want
     /// a stop button pays nothing for one.
     pub cancel: Option<CancelHandle>,
+    /// Add-ons (LoRA adapters, llama.cpp GGUF format) loaded with the weights,
+    /// each selectable per request by name through
+    /// [`GenerateRequest::adapter`](crate::generation::GenerateRequest::adapter).
+    /// Each costs its own tensors on top of the shared weights (48 MB for the
+    /// rank-16 E2B tool add-on); none is applied unless a request names it.
+    pub adapters: Vec<AdapterSpec>,
+}
+
+/// One add-on file and the name requests select it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSpec {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 impl Default for LlamaCppConfig {
@@ -625,6 +638,7 @@ impl Default for LlamaCppConfig {
             cache_type_k: KvCacheType::F16,
             cache_type_v: KvCacheType::F16,
             cancel: None,
+            adapters: Vec::new(),
         }
     }
 }
@@ -833,6 +847,15 @@ struct Loaded {
     /// stable identity worth a file. Slot 0 never pins; the disk prefix
     /// already covers it.
     pinned_heads: std::collections::HashMap<u32, SwaCheckpoint>,
+    /// The configured add-ons that loaded, by name. llama.cpp frees an
+    /// add-on with the weights it was loaded against, so these need no drop
+    /// order of their own.
+    adapters: std::collections::HashMap<String, llama_cpp_2::model::LlamaLoraAdapter>,
+    /// The add-on each context decodes with now, indexed like `decs`.
+    ctx_adapter: Vec<Option<String>>,
+    /// The add-on each slot's cache was computed under; absent is the plain
+    /// model. A slot is only reused under the add-on that filled it.
+    slot_adapter: std::collections::HashMap<u32, String>,
     /// Boxed for a stable address the drafter's context borrows. Dropped after
     /// `decs`, which holds that context. Only the base context drafts.
     #[allow(dead_code)]
@@ -1330,13 +1353,33 @@ impl LlamaCppEngine {
             }
         }
 
+        // A missing or unreadable add-on is not fatal: the plain model is still
+        // correct for every request that does not name it, and a request that
+        // does is refused rather than answered without it.
+        let mut adapters = std::collections::HashMap::new();
+        for spec in &self.cfg.adapters {
+            if !spec.path.exists() {
+                eprintln!("llama_cpp: add-on {} not found at {}", spec.name, spec.path.display());
+                continue;
+            }
+            match model.lora_adapter_init(&spec.path) {
+                Ok(a) => {
+                    adapters.insert(spec.name.clone(), a);
+                }
+                Err(e) => eprintln!("llama_cpp: add-on {} did not load from {}: {e}", spec.name, spec.path.display()),
+            }
+        }
+
         self.loaded = Some(Loaded {
+            ctx_adapter: vec![None; decs.len()],
             decs,
             slots: Self::slot_map(&specs),
             cached,
             prefix,
             checkpoints: Default::default(),
             pinned_heads: Default::default(),
+            adapters,
+            slot_adapter: Default::default(),
             draft_model,
             model,
         });
@@ -1345,6 +1388,57 @@ impl LlamaCppEngine {
         self.caps = Some(chat.caps());
         self.chat = Some(chat);
         Ok(t.elapsed().as_millis() as u64)
+    }
+
+    /// Puts `at`'s context on add-on `want` (`None`: the plain model), first
+    /// dropping whatever the slot holds from under a different one.
+    ///
+    /// A KV cache is a function of the weights that computed it, so tokens a
+    /// slot decoded under one add-on are wrong under another however exactly
+    /// the next prompt repeats them. The slot's cache, its checkpoint ring and
+    /// its pinned head all go, and the prompt is prefilled again. That makes a
+    /// switch cost one full prefill of the slot, which is why each workload
+    /// keeps its add-on on its own slot. The context's add-on is set on every
+    /// request rather than per slot, because llama.cpp applies it to the whole
+    /// context and a context may hold slots of different workloads.
+    fn use_adapter(&mut self, at: SlotAddr, want: Option<&str>) -> Result<(), GenError> {
+        let loaded = self.loaded.as_mut().expect("loaded");
+        if let Some(name) = want {
+            if !loaded.adapters.contains_key(name) {
+                return Err(GenError::Invalid(format!(
+                    "add-on {name:?} is configured but did not load; the load log says why"
+                )));
+            }
+        }
+        if loaded.slot_adapter.get(&at.slot).map(String::as_str) != want {
+            loaded.decs[at.ctx]
+                .ctx()
+                .kv_cache_seq_rm(at.seq, None, None)
+                .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+            loaded.cached.remove(&at.slot);
+            loaded.checkpoints.remove(&at.slot);
+            loaded.pinned_heads.remove(&at.slot);
+            match want {
+                Some(name) => loaded.slot_adapter.insert(at.slot, name.to_string()),
+                None => loaded.slot_adapter.remove(&at.slot),
+            };
+        }
+        let current = loaded.ctx_adapter[at.ctx].clone();
+        if current.as_deref() != want {
+            let ctx = loaded.decs[at.ctx].ctx();
+            match (want, current.as_deref()) {
+                (Some(name), _) => ctx
+                    .lora_adapter_set(loaded.adapters.get_mut(name).expect("checked above"), 1.0)
+                    .map_err(|e| GenError::Generate(format!("add-on {name}: {e}")))?,
+                // Clears every add-on on the context; the argument is unused.
+                (None, Some(old)) => ctx
+                    .lora_adapter_remove(loaded.adapters.get_mut(old).expect("set from this map"))
+                    .map_err(|e| GenError::Generate(format!("add-on {old}: {e}")))?,
+                (None, None) => {}
+            }
+            loaded.ctx_adapter[at.ctx] = want.map(str::to_string);
+        }
+        Ok(())
     }
 
     /// Where this configuration's persisted prefix lives, if enabled.
@@ -2030,8 +2124,16 @@ impl LlamaCppEngine {
                 "no prefix_cache_dir configured, so there is nowhere to persist a prefix".into(),
             ));
         };
+        if req.adapter.is_some() {
+            return Err(GenError::Invalid(
+                "the persisted prefix is the plain model's; it is never built under an add-on".into(),
+            ));
+        }
         self.clear_cancel();
         self.ensure_loaded()?;
+        // Slot 0 may hold an add-on's tokens and its context the add-on.
+        let at = self.loaded.as_ref().expect("loaded").addr(0);
+        self.use_adapter(at, None)?;
         let prefix = self.stable_prefix(req)?;
         let current = {
             let loaded = self.loaded.as_ref().expect("loaded");
@@ -2203,6 +2305,11 @@ impl LlamaCppEngine {
                     .into(),
             ));
         }
+        if let Some(name) = &req.adapter {
+            if !self.cfg.adapters.iter().any(|a| &a.name == name) {
+                return Err(GenError::Invalid(format!("no add-on named {name:?} is configured")));
+            }
+        }
 
         let load_ms = self.ensure_loaded()?;
         // Both read up front so the code below stays readable once `loaded`
@@ -2215,6 +2322,10 @@ impl LlamaCppEngine {
         // splitting below stays field-level.
         let at = self.loaded.as_ref().expect("just loaded").addr(req.slot);
         let n_ctx = at.n_ctx;
+        // Before the persisted prefix is consulted: that prefix is the plain
+        // model's, and a slot 0 still holding an add-on's tokens must not be
+        // validated against it, let alone saved as it.
+        self.use_adapter(at, req.adapter.as_deref())?;
 
         // --- render the prompt through the model's own template -------------
         let applied = self
@@ -2280,7 +2391,8 @@ impl LlamaCppEngine {
         //
         // Slot 0 only. Other slots carry a host's background one-shots, which
         // are short, varied and have no prefix worth a file.
-        let prefix_ms = if req.slot == 0 {
+        // Not under an add-on either: the file holds the plain model's KV.
+        let prefix_ms = if req.slot == 0 && req.adapter.is_none() {
             self.settle_prefix(&req, &tokens)?
         } else {
             0

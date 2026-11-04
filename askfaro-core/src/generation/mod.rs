@@ -54,7 +54,7 @@ pub mod llama_cpp;
 pub mod models;
 
 #[cfg(feature = "llama-cpp")]
-pub use llama_cpp::{ContextSpec, KvCacheType, LlamaCppConfig, LlamaCppEngine, PrefixReport};
+pub use llama_cpp::{AdapterSpec, ContextSpec, KvCacheType, LlamaCppConfig, LlamaCppEngine, PrefixReport};
 
 /// One conversation turn. `role` is the OpenAI role (`"system"`, `"user"`,
 /// `"assistant"`, `"tool"`); the engine maps it to the provider's transcript.
@@ -238,6 +238,18 @@ pub struct GenerateRequest {
     /// than dropped silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_schema: Option<Value>,
+    /// The add-on (a LoRA adapter) to decode this request with, by the name the
+    /// engine was configured with; `None` is the plain model.
+    ///
+    /// Per request because one engine serves workloads trained apart: the
+    /// tool-calling add-on for the agent and a memory add-on for extraction.
+    /// They cannot be one file folded into the weights: the tool add-on
+    /// folded into the Q4_0 GGUF scored 50% on its 248-case bench against 88%
+    /// as a separate file, because the change is smaller than one 4-bit step
+    /// and rounding erases it. An engine that cannot apply add-ons rejects a
+    /// request that names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
 }
 
 /// A single tool invocation the model emitted.
