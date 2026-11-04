@@ -29,8 +29,11 @@
 //!    and `generation_prompt`, leaving the compiled PEG arena empty. Gemma 4
 //!    resolves to the `peg-gemma4` format, so an empty arena means every tool
 //!    call falls through to raw `content`. The shim wires the arena explicitly.
-//! 2. `prompt` and `generation_prompt` are separate fields. Send only the first
-//!    and the model emits its own turn opener, which defeats the parser.
+//! 2. `prompt` and `generation_prompt` are separate fields, and whether the
+//!    first already ends in the second depends on the upstream version (it does
+//!    from 0.1.154). Missing it, the model emits its own turn opener, which
+//!    defeats the parser; doubling it put E2B into repetition loops. Always go
+//!    through `Applied::full_prompt`.
 //! 3. The end-of-turn token must stay in the text handed to the parser, because
 //!    the grammar matches a COMPLETE assistant turn.
 
@@ -748,6 +751,10 @@ pub struct LlamaCppEngine {
     /// reload of the SAME weights can reuse it and a different model cannot
     /// collide with it.
     prefix_tokens_memo: Option<(String, Vec<llama_cpp_2::token::LlamaToken>)>,
+    /// Set once this call's decoded tokens are written back to the slot, so
+    /// the KV cache and its bookkeeping agree. Any error after that point is a
+    /// parse failure about the text, not damage to the engine.
+    written_back: bool,
 }
 
 /// Where one host slot lives: which context, which sequence inside it, and how
@@ -922,6 +929,7 @@ impl LlamaCppEngine {
             log_full_reprefill: LogThrottle::new(),
             log_pinned_restore: LogThrottle::new(),
             prefix_tokens_memo: None,
+            written_back: false,
         }
     }
 
@@ -1489,7 +1497,7 @@ impl LlamaCppEngine {
             .expect("chat is set with loaded")
             .apply(&r, enable_thinking)
             .map_err(|e| GenError::Generate(format!("chat template: {e}")))?;
-        let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
+        let prompt = applied.full_prompt();
         self.loaded
             .as_ref()
             .expect("loaded")
@@ -2066,11 +2074,17 @@ impl LlamaCppEngine {
 /// `LlamaSampler::sample` auto-accepts into the CHAIN it is called on, but
 /// `grmr` lives outside the chain, so the double-accept corruption the
 /// decode loop's invariant documents cannot recur through this path.
+///
+/// `banned` is a token the chain already forbids (the thinking channel's
+/// opener when thinking is off). The rejection path reads the raw logits, not
+/// the chain's, and Gemma 4's response-format grammar admits that opener, so it
+/// is forbidden there again.
 fn sample_with_grammar(
     ctx: &mut LlamaContext<'static>,
     chain: &mut LlamaSampler,
     grmr: Option<&mut LlamaSampler>,
     idx: i32,
+    banned: Option<llama_cpp_2::token::LlamaToken>,
 ) -> llama_cpp_2::token::LlamaToken {
     let token = chain.sample(ctx, idx);
     let Some(grmr) = grmr else {
@@ -2097,6 +2111,11 @@ fn sample_with_grammar(
     // admits SOMETHING from a live state: a complete grammar admits the EOG
     // token, an incomplete one admits at least one continuation.
     let mut cands = ctx.token_data_array_ith(idx);
+    if let Some(b) = banned {
+        for d in cands.data.iter_mut().filter(|d| d.id() == b) {
+            d.set_logit(f32::NEG_INFINITY);
+        }
+    }
     cands.apply_sampler(grmr);
     let token = cands.sample_token_greedy();
     grmr.accept(token);
@@ -2112,6 +2131,7 @@ impl GenerationEngine for LlamaCppEngine {
 
     fn generate(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
         self.clear_cancel();
+        self.written_back = false;
         let out = self.generate_impl(req);
         match &out {
             // Fires before any decode touches the KV cache, and hosts retry it
@@ -2131,6 +2151,12 @@ impl GenerationEngine for LlamaCppEngine {
             // makes the engine reusable, so unloading here would throw away
             // multi-gigabyte warm weights, and the reload, to fix nothing.
             Err(GenError::Cancelled) => {}
+            // A reply the chat parser cannot read (the silent-drop guard, a
+            // strict parse error) arrives after the write-back, with the decode
+            // finished and the cache consistent. Unloading there cost the
+            // desktop's 2026-11-03 E4B dream 20 loads of the 6 GB weights and,
+            // with its memory guard holding the reloads, three of four passes.
+            Err(_) if self.written_back => {}
             // Any other failure may have left llama.cpp's state inconsistent
             // with the slot bookkeeping, and the engine cannot tell from here.
             // The desktop's memory deriver found the concrete case: a Metal
@@ -2231,8 +2257,8 @@ impl LlamaCppEngine {
             }
         };
 
-        // prompt + generation_prompt. See failure mode 2 in the module docs.
-        let prompt = format!("{}{}", applied.prompt, applied.generation_prompt);
+        // One turn opener, never two. See failure mode 2 in the module docs.
+        let prompt = applied.full_prompt();
 
         let tokens = self
             .loaded
@@ -2382,15 +2408,37 @@ impl LlamaCppEngine {
                     .ok()?;
                 Some((close.first().copied()?, bias))
             });
-        let mut sampler = match close_bias {
-            Some((first, bias)) => LlamaSampler::chain_simple([
-                LlamaSampler::logit_bias(
-                    loaded.model.n_vocab(),
-                    &[llama_cpp_2::token::logit_bias::LlamaLogitBias::new(first, bias)],
-                ),
+        // Thinking OFF is a template switch, not a guarantee: it only leaves the
+        // "think" instruction out of the prompt, and the model may still open
+        // the channel itself. Measured 2026-11-02 on Honcho's deriver prompt
+        // (one user turn, no system): E2B thought on 14 of 14 calls and E4B on
+        // 3 of 14 with `enable_thinking: false`, which tripled E2B's time per
+        // call (28s against 11s) for the same memories. So when thinking is
+        // off, the channel's opening token cannot be sampled at all.
+        let think_ban = (!enable_thinking && !applied.thinking_start.is_empty())
+            .then(|| {
+                loaded
+                    .model
+                    .str_to_token(&applied.thinking_start, AddBos::Never)
+                    .ok()?
+                    .first()
+                    .copied()
+            })
+            .flatten();
+        let biases: Vec<_> = close_bias
+            .map(|(t, b)| llama_cpp_2::token::logit_bias::LlamaLogitBias::new(t, b))
+            .into_iter()
+            .chain(think_ban.map(|t| {
+                llama_cpp_2::token::logit_bias::LlamaLogitBias::new(t, f32::NEG_INFINITY)
+            }))
+            .collect();
+        let mut sampler = if biases.is_empty() {
+            LlamaSampler::chain_simple([LlamaSampler::greedy()])
+        } else {
+            LlamaSampler::chain_simple([
+                LlamaSampler::logit_bias(loaded.model.n_vocab(), &biases),
                 LlamaSampler::greedy(),
-            ]),
-            None => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+            ])
         };
         let mut grmr = match grammar {
             Some(g) => Some(LlamaSampler::grammar(&loaded.model, g, "root").map_err(|e| {
@@ -2822,6 +2870,7 @@ impl LlamaCppEngine {
                 &mut sampler,
                 grmr.as_mut(),
                 batch.n_tokens() - 1,
+                think_ban,
             ),
         };
 
@@ -2923,6 +2972,7 @@ impl LlamaCppEngine {
                             &mut sampler,
                             grmr.as_mut(),
                             batch.n_tokens() - 1,
+                            think_ban,
                         ),
                     };
                 }
@@ -3077,6 +3127,7 @@ impl LlamaCppEngine {
             }
         }
         loaded.cached.insert(slot, cached);
+        self.written_back = true;
         // After the write-back, so the tokens this turn did decode stay
         // reusable: an identical retry reuses everything up to its divergence
         // exactly as it would after a completed turn. Before the parse, because
@@ -3152,7 +3203,12 @@ impl LlamaCppEngine {
         // nothing" is not a possible reading. Fail loudly instead: an error the
         // agent loop can see and retry beats a blank turn the user cannot
         // distinguish from a refusal.
-        if parsed.tool_calls.is_empty() && parsed.content.trim().is_empty() && !raw.trim().is_empty()
+        // `parse_input`, not `raw`: a turn that is only its end-of-turn token
+        // is an empty reply (a dream specialist's "done" after its last call),
+        // not a dropped one.
+        if parsed.tool_calls.is_empty()
+            && parsed.content.trim().is_empty()
+            && !parse_input.trim().is_empty()
         {
             return Err(GenError::Generate(format!(
                 "chat parse produced neither a tool call nor content from {} raw chars \

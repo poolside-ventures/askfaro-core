@@ -184,6 +184,19 @@ impl ReasoningBudget {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_turn_opener_appears_once_whichever_way_upstream_reports_it() {
+        let applied = |prompt: &str| -> Applied {
+            serde_json::from_value(serde_json::json!({
+                "prompt": prompt, "generation_prompt": "<|turn>model\n",
+            }))
+            .expect("applied")
+        };
+        let want = "<|turn>user\nhi<turn|>\n<|turn>model\n";
+        assert_eq!(applied(want).full_prompt(), want);
+        assert_eq!(applied("<|turn>user\nhi<turn|>\n").full_prompt(), want);
+    }
+
     /// Drives the UPSTREAM sampler (no model needed: tokens are just ids) and
     /// checks the mirrored bookkeeping stays in lockstep with its states.
     #[test]
@@ -256,8 +269,9 @@ mod tests {
 #[derive(Debug, Deserialize)]
 pub struct Applied {
     pub prompt: String,
-    /// Separate from `prompt` on purpose; both are needed. See the module docs
-    /// on `llama_cpp` for what happens when only the first is sent.
+    /// The turn opener the model continues from. Upstream reports it beside
+    /// `prompt` and, since llama-cpp-sys 0.1.154, ALSO leaves it at the end of
+    /// `prompt`; read the two through [`Applied::full_prompt`].
     #[serde(default)]
     pub generation_prompt: String,
     /// Upstream's grammar for this turn, from the model family's own chat
@@ -298,6 +312,22 @@ pub struct Applied {
     /// rather than from a constant we would have to maintain per family.
     #[serde(default)]
     pub additional_stops: Vec<String>,
+}
+
+impl Applied {
+    /// What the model reads: the prompt ending in exactly one turn opener.
+    ///
+    /// Appending `generation_prompt` unconditionally sent Gemma 4 a doubled
+    /// `<|turn>model\n<|turn>model\n` on every call from the 0.1.154 bump
+    /// (2026-08-13) until 2026-11-03, when a memory replay showed E2B looping on
+    /// threads llama-server answered cleanly from the single opener.
+    pub fn full_prompt(&self) -> String {
+        if self.prompt.ends_with(&self.generation_prompt) {
+            self.prompt.clone()
+        } else {
+            format!("{}{}", self.prompt, self.generation_prompt)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
