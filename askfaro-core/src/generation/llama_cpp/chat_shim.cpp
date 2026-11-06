@@ -147,6 +147,22 @@ char * scope_chat_apply(scope_chat_ctx * ctx,
         out["generation_prompt"] = ctx->last.generation_prompt;
         out["grammar"]           = ctx->last.grammar;
         out["grammar_lazy"]      = ctx->last.grammar_lazy;
+        // What wakes a lazy grammar (Gemma 4: the word `<|tool_call>`). Without
+        // these the call grammar cannot be applied at all, which is how tool
+        // calls ran unconstrained here while llama-server constrained them.
+        json triggers = json::array();
+        for (const auto & t : ctx->last.grammar_triggers) {
+            const char * kind = "word";
+            switch (t.type) {
+                case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:        kind = "token"; break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:         kind = "word"; break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:      kind = "pattern"; break;
+                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: kind = "pattern_full"; break;
+            }
+            triggers.push_back({{"kind", kind}, {"value", t.value}, {"token", (int) t.token}});
+        }
+        out["grammar_triggers"]  = triggers;
+        out["preserved_tokens"]  = ctx->last.preserved_tokens;
         out["supports_thinking"] = ctx->last.supports_thinking;
         out["thinking_start"]    = ctx->last.thinking_start_tag;
         // llama.cpp #25544 pluralised this to `thinking_end_tags`, because a

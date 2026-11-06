@@ -265,6 +265,17 @@ mod tests {
     }
 }
 
+/// One trigger of a lazy grammar, as upstream's `common_grammar_trigger`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrammarTrigger {
+    /// `token`, `word`, `pattern` or `pattern_full`.
+    pub kind: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub token: i32,
+}
+
 /// What the model's template produced for this turn.
 #[derive(Debug, Deserialize)]
 pub struct Applied {
@@ -280,10 +291,11 @@ pub struct Applied {
     /// - a `json_schema` request compiles into it (response-format grammar,
     ///   eager) — the engine APPLIES it, that is the whole constrained-output
     ///   feature;
-    /// - tool schemas alone also generate one (call grammar, usually lazy) —
-    ///   deliberately NOT applied: the first measurement showed Gemma emitting
-    ///   a valid call unconstrained, so constraining would be paying for a
-    ///   problem we have not observed.
+    /// - tool schemas alone also generate one (call grammar, lazy) — applied
+    ///   from its trigger on, so a tool call cannot come out malformed. It was
+    ///   left off at first because Gemma emitted valid calls unconstrained;
+    ///   E2B's Honcho dream calls then closed nested lists with `}` (6 dropped
+    ///   calls in 30 minutes, 2026-11-06), which the call grammar forbids.
     #[serde(default)]
     pub grammar: String,
     /// True when `grammar` is trigger-gated (tool-call style) rather than
@@ -291,6 +303,13 @@ pub struct Applied {
     /// grammar is eager; the engine refuses to treat a lazy grammar as one.
     #[serde(default)]
     pub grammar_lazy: bool,
+    /// What wakes a lazy `grammar`, from the family's chat handler.
+    #[serde(default)]
+    pub grammar_triggers: Vec<GrammarTrigger>,
+    /// Tokens the template treats as atomic (Gemma 4's `<|tool_call>`...). A
+    /// word trigger that is one of these is matched as that token.
+    #[serde(default)]
+    pub preserved_tokens: Vec<String>,
     /// Whether the model's own template declares a reasoning channel.
     #[allow(dead_code)]
     #[serde(default)]

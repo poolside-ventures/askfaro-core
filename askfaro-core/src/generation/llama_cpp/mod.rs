@@ -2162,6 +2162,67 @@ impl LlamaCppEngine {
     }
 }
 
+/// The lazy tool-call grammar, armed with the template's triggers the way
+/// upstream's `common_sampler_init` and llama-server arm theirs: a WORD that
+/// is one of the template's preserved tokens becomes a TOKEN trigger (Gemma
+/// 4's `<|tool_call>`), any other word an escaped pattern.
+fn call_grammar_sampler(
+    model: &llama_cpp_2::model::LlamaModel,
+    grammar: &str,
+    applied: &ffi::Applied,
+) -> Result<LlamaSampler, GenError> {
+    let escape = |s: &str| {
+        s.chars().fold(String::new(), |mut out, c| {
+            if r"\^$.|?*+()[]{}".contains(c) {
+                out.push('\\');
+            }
+            out.push(c);
+            out
+        })
+    };
+    let mut patterns = Vec::new();
+    let mut tokens = Vec::new();
+    for t in &applied.grammar_triggers {
+        match t.kind.as_str() {
+            "token" => tokens.push(llama_cpp_2::token::LlamaToken(t.token)),
+            "word" => {
+                let ids = model
+                    .str_to_token(&t.value, AddBos::Never)
+                    .map_err(|e| GenError::Generate(format!("tokenize grammar trigger: {e}")))?;
+                if ids.len() == 1 && applied.preserved_tokens.iter().any(|p| p == &t.value) {
+                    tokens.push(ids[0]);
+                } else {
+                    patterns.push(escape(&t.value));
+                }
+            }
+            "pattern" => patterns.push(t.value.clone()),
+            "pattern_full" => {
+                let v = &t.value;
+                patterns.push(if v.is_empty() {
+                    "^$".to_string()
+                } else {
+                    format!(
+                        "{}{}{}",
+                        if v.starts_with('^') { "" } else { "^" },
+                        v,
+                        if v.ends_with('$') { "" } else { "$" }
+                    )
+                });
+            }
+            other => {
+                return Err(GenError::Generate(format!("unknown grammar trigger kind {other:?}")))
+            }
+        }
+    }
+    if patterns.is_empty() && tokens.is_empty() {
+        return Err(GenError::Generate(
+            "the template produced a lazy tool-call grammar with no trigger".into(),
+        ));
+    }
+    LlamaSampler::grammar_lazy_patterns(model, grammar, "root", &patterns, &tokens)
+        .map_err(|e| GenError::Generate(format!("tool-call grammar: {e}")))
+}
+
 /// Sample at `idx`, holding the token to `grmr` when a grammar is active.
 ///
 /// Upstream's rejection-sampling pattern (common/sampling.cpp with
@@ -2367,6 +2428,19 @@ impl LlamaCppEngine {
                 Some(applied.grammar.as_str())
             }
         };
+        // The tool-call grammar: lazy, asleep until the template's trigger
+        // (Gemma 4: the `<|tool_call>` token), then holding the call to the
+        // family's call syntax, so a call cannot come out with mismatched
+        // brackets or an unterminated string and be dropped by the parser.
+        // Independent of `grammar` above, which stays the eager response-format
+        // constraint with its own rules (no speculation, no thinking budget);
+        // this one leaves both alone, because before its trigger it admits
+        // every token and after it the thinking channel is closed.
+        let call_grammar: Option<&str> = (grammar.is_none()
+            && !req.tools.is_empty()
+            && applied.grammar_lazy
+            && !applied.grammar.is_empty())
+        .then_some(applied.grammar.as_str());
 
         // One turn opener, never two. See failure mode 2 in the module docs.
         let prompt = applied.full_prompt();
@@ -2408,10 +2482,10 @@ impl LlamaCppEngine {
         // "shape the thinking, never truncate the answer" knob: MAX_OUTPUT_TOKENS
         // above is a runaway backstop, not a latency control.
         //
-        // Grammar-constrained turns are excluded on purpose: their operating
-        // point is thinking-off extraction, and upstream itself sequences the
-        // budget sampler against LAZY grammars only, which this engine does not
-        // run (its json_schema grammar is eager). Tags come from the template
+        // Response-format (json_schema) turns are excluded on purpose: their
+        // operating point is thinking-off extraction, and their grammar is
+        // eager. The lazy tool-call grammar does not exclude the budget: it is
+        // asleep through the thinking channel and wakes at the call. Tags come from the template
         // via the chat shim, so a model family without a declared think channel
         // degrades to "no budget" rather than to guessed tags.
         let mut rbudget: Option<ffi::ReasoningBudget> = None;
@@ -2552,11 +2626,12 @@ impl LlamaCppEngine {
                 LlamaSampler::greedy(),
             ])
         };
-        let mut grmr = match grammar {
-            Some(g) => Some(LlamaSampler::grammar(&loaded.model, g, "root").map_err(|e| {
+        let mut grmr = match (grammar, call_grammar) {
+            (Some(g), _) => Some(LlamaSampler::grammar(&loaded.model, g, "root").map_err(|e| {
                 GenError::Invalid(format!("json_schema produced an unusable grammar: {e}"))
             })?),
-            None => None,
+            (None, Some(g)) => Some(call_grammar_sampler(&loaded.model, g, &applied)?),
+            (None, None) => None,
         };
 
         // --- prefix reuse -----------------------------------------------------
@@ -3129,7 +3204,20 @@ impl LlamaCppEngine {
                     let mut accepted = 0usize;
                     let mut correction = None;
                     for (i, d) in drafts.iter().enumerate() {
-                        let t = sampler.sample(spec.target_context_mut(), i as i32);
+                        // Through the call grammar when there is one: a draft
+                        // the grammar rejects is a mismatch like any other.
+                        // Every token sampled here is committed (the accepted
+                        // drafts, then the correction or `follow`), except
+                        // after an end of turn, which ends the grammar's use,
+                        // or a thinking-budget cut, which only happens before
+                        // the call's trigger, while the lazy grammar is asleep.
+                        let t = sample_with_grammar(
+                            spec.target_context_mut(),
+                            &mut sampler,
+                            grmr.as_mut(),
+                            i as i32,
+                            think_ban,
+                        );
                         if t == *d {
                             accepted += 1;
                         } else {
@@ -3141,7 +3229,13 @@ impl LlamaCppEngine {
                     // verify pass already computed it.
                     let follow = match correction {
                         Some(t) => t,
-                        None => sampler.sample(spec.target_context_mut(), drafts.len() as i32),
+                        None => sample_with_grammar(
+                            spec.target_context_mut(),
+                            &mut sampler,
+                            grmr.as_mut(),
+                            drafts.len() as i32,
+                            think_ban,
+                        ),
                     };
                     draft_accepted += accepted;
 
