@@ -7,7 +7,11 @@
 use crate::model::{ModelFile, ModelSpec};
 
 /// Gemma 4 E2B, instruction-tuned, **quantization-aware-trained q4_0**.
-/// **The mobile brain, and only that.**
+///
+/// The desktop brain's successor (decided 2026-11): the tool-calling failures
+/// described below are what the E2B tool add-on (desktop `E2B_TOOLS_ADDON`)
+/// was trained against, 49% -> 88% on the 248-case tool bench. It ships with
+/// [`GEMMA4_E2B_MTP_DRAFTER_Q4_0`], as E4B does with its own.
 ///
 /// This spec was removed on 2026-08-09 and is restored deliberately, for a
 /// workload the disqualification never covered. It was cut because the 20-case
@@ -21,28 +25,55 @@ use crate::model::{ModelFile, ModelSpec};
 /// lost on engaging with specifics, 60% against 90%. See
 /// `scope/docs/on-device-capability-status.md`.
 ///
-/// **Do not promote this to the desktop brain on the strength of that.** The
-/// tool-calling failures are still real and still unfixed; nothing here
-/// re-litigates them.
+/// What forces the choice on mobile is memory. E4B is 5.15 GB of weights before
+/// KV cache and Metal compute buffers, which no shipping iPhone can hold in a
+/// foregrounded app. E2B is the only member of the family that is even a
+/// candidate, and whether it fits is itself measured, not assumed.
 ///
-/// What forces the choice is memory. E4B is 5.15 GB of weights before KV cache
-/// and Metal compute buffers, which no shipping iPhone can hold in a
-/// foregrounded app. E2B at 3.35 GB is the only member of the family that is
-/// even a candidate, and whether it fits is itself measured, not assumed.
-///
-/// Google's own QAT GGUF, chosen over the community requantizations so the
-/// existing measurements transfer rather than needing to be re-established.
-/// Byte-comparable to what Ollama serves as `gemma4:e2b-it-qat`: 3,349,516,256
-/// here against Ollama's 3,349,514,112, a 2,144-byte difference that is Ollama's
-/// GGUF metadata rewriting, not different weights. Swapping quant (Q4_K_M,
-/// IQ4_XS, a UD variant) is a **measurable change, not a free one**.
+/// Swapping quant (Q4_K_M, IQ4_XS, a UD variant) is a **measurable change, not
+/// a free one**; the two-table requantisation below was measured, see there.
 ///
 /// One file, unlike the ONNX specs: a GGUF carries weights, tokenizer and chat
 /// template together, which is also why the engine can read the chat template
 /// straight out of the model rather than being told which family it is.
+///
+/// # Ours, not Google's: the per-layer table moved out of the GPU's range
+///
+/// Google's file with `per_layer_token_embd`, a 1,837 MiB CPU lookup table,
+/// moved to the front, and nothing else changed: all 541 tensors keep their
+/// bytes ([`GEMMA4_E2B_IT_QAT_Q4_0_UPSTREAM`] is the input). llama.cpp hands
+/// the GPU one contiguous range of a mapped file, and in Google's order that
+/// table sat inside it, wired for nothing. Measured 2026-11-06 with
+/// `kv_footprint` at the desktop shape (64K agent + 16K background context,
+/// `n_ubatch` 128): Metal working set 3,936 -> 2,099 MiB, and all 30 F-7
+/// engine cases byte-identical to Google's file.
+///
+/// **Unlike E4B's file, the embedding tables stay Q6_K.** Requantising both to
+/// Q4_0 as E4B's was saved only 99 MiB more here and changed 11 of the 30 F-7
+/// answers (fully correct 19 -> 17); `token_embd` is also the output
+/// projection, so it touches every token. Requantising only the per-layer table
+/// changed 8. Neither was worth it once the move alone took the table off the
+/// GPU. Byte-identical weights also keep the E2B add-ons exactly as trained.
 pub const GEMMA4_E2B_IT_QAT_Q4_0: ModelSpec = ModelSpec {
     id: "gemma-4-e2b-it-qat-q4_0",
     display_name: "Gemma 4 E2B (instruction-tuned, QAT q4_0)",
+    // Presence is checked by name and size, so the new bytes take a new name
+    // and this list removes the Google file they replace.
+    supersedes: &["gemma-4-E2B_q4_0-it.gguf"],
+    files: &[ModelFile {
+        name: "gemma-4-E2B_q4_0-it-ple-first.gguf",
+        url: "https://files.scopy.app/ondevice/weights/gemma-4-e2b-it-qat-q4_0-ple-first/1477e4c249d5/gemma-4-E2B_q4_0-it-ple-first.gguf",
+        sha256: "1477e4c249d527a3073e4f5be36321474b6b3835dd196c77f871e23d89658118",
+        size: 3_349_516_640,
+    }],
+};
+
+/// Google's unmodified E2B QAT q4_0, the INPUT to the requantisation above.
+/// Nothing loads it; the release workflow reads it to fetch and verify Google's
+/// original before transforming it, as for [`GEMMA4_E4B_IT_QAT_Q4_0_UPSTREAM`].
+pub const GEMMA4_E2B_IT_QAT_Q4_0_UPSTREAM: ModelSpec = ModelSpec {
+    id: "gemma-4-e2b-it-qat-q4_0-upstream",
+    display_name: "Gemma 4 E2B (instruction-tuned, QAT q4_0, Google original)",
     supersedes: &[],
     files: &[ModelFile {
         name: "gemma-4-E2B_q4_0-it.gguf",
@@ -182,5 +213,30 @@ pub const GEMMA4_E4B_MTP_DRAFTER_Q4_0: ModelSpec = ModelSpec {
         url: "https://huggingface.co/cascade-tech/gemma-4-E4B-it-qat-q4_0-unquantized-assistant-gguf/resolve/main/gemma-4-E4B-it-qat-assistant-q4_0.gguf",
         sha256: "866800a8c56e77cc788340e47d79c03e4368451467d757985666dcdbf8c06e90",
         size: 76_978_624,
+    }],
+};
+
+/// The Multi-Token Prediction drafter for E2B, the counterpart of
+/// [`GEMMA4_E4B_MTP_DRAFTER_Q4_0`].
+///
+/// Measured 2026-11-06 on the 30-case F-7 engine bench (M1 Pro): all 30 answers
+/// byte-identical with and without it, 68-75% of drafted tokens accepted,
+/// decode 52 -> 59 tok/s, latency p50 4,317 -> 4,027 ms and p95 8,446 -> 7,759
+/// ms. Smaller than E4B's +30% because E2B already decodes fast; it still pays
+/// for its 77 MB and its ~187 MiB of Metal (weights plus its own compute buffer).
+///
+/// Ours: Google's `gemma-4-E2B-it-qat-q4_0-unquantized-assistant` converted
+/// with llama.cpp's `convert_hf_to_gguf.py` (ggml-org/llama.cpp 18ab62a, bf16)
+/// and `llama-quantize ... q4_0`, the same recipe as E4B's drafter. The public
+/// E2B conversions declare `gemma4_mtp`, which llama.cpp here does not load.
+pub const GEMMA4_E2B_MTP_DRAFTER_Q4_0: ModelSpec = ModelSpec {
+    id: "gemma-4-e2b-it-qat-assistant-q4_0",
+    display_name: "Gemma 4 E2B MTP drafter (QAT q4_0)",
+    supersedes: &[],
+    files: &[ModelFile {
+        name: "gemma-4-E2B-it-qat-assistant-q4_0.gguf",
+        url: "https://files.scopy.app/ondevice/drafters/gemma-4-e2b-it-qat-assistant-q4_0/ed25f3aff1bd/gemma-4-E2B-it-qat-assistant-q4_0.gguf",
+        sha256: "ed25f3aff1bdd6447dbe26ec3ea1718d3657cb7428ea69ebc6785361a7d04195",
+        size: 76_536_928,
     }],
 };

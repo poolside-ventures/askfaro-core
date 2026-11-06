@@ -9,7 +9,7 @@
 //!
 //! ```sh
 //! cargo run --release --features llama-cpp --example build_prefix -- \
-//!   <model.gguf> <prompt.json> <drafter.gguf> <out.kv> <n_ctx> <n_slots>
+//!   <model.gguf> <prompt.json> <drafter.gguf> <out.kv> <n_ctx> <n_slots> <thinking on|off>
 //! ```
 //!
 //! The engine config below MUST mirror the desktop's `brain_config` for every
@@ -20,6 +20,23 @@
 
 use askfaro_core::generation::{GenerateRequest, LlamaCppConfig, LlamaCppEngine, ToolSchema};
 use serde_json::Value;
+
+/// `on` / `off`, the agent's thinking state. Required for the reason `n_ctx` is:
+/// it renders into the prompt and is hashed into the shape, and the two brains
+/// differ (E4B's agent thinks, E2B's does not).
+fn thinking_arg(v: Option<&str>) -> bool {
+    match v {
+        Some("on") => true,
+        Some("off") => false,
+        _ => {
+            eprintln!(
+                "error: pass the agent's thinking state, on|off; it must equal the brain's \
+                 `agent_thinks` (desktop lib.rs) / profile `agentThinking`"
+            );
+            std::process::exit(2);
+        }
+    }
+}
 
 fn read_json(path: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|e| {
@@ -54,14 +71,16 @@ fn main() {
     if argv.first().map(String::as_str) == Some("--print-shape") {
         let mut shape = argv.iter().skip(1).map(|v| v.parse::<u32>());
         let (Some(Ok(n_ctx)), Some(Ok(n_slots))) = (shape.next(), shape.next()) else {
-            eprintln!("usage: build_prefix --print-shape <n_ctx> <n_slots>");
+            eprintln!("usage: build_prefix --print-shape <n_ctx> <n_slots> <thinking on|off>");
             std::process::exit(2);
         };
+        let enable_thinking = thinking_arg(argv.get(3).map(String::as_str));
         println!(
             "{}",
             LlamaCppEngine::prefix_shape_id(&LlamaCppConfig {
                 n_ctx,
                 n_slots,
+                enable_thinking,
                 ..Default::default()
             })
         );
@@ -74,7 +93,7 @@ fn main() {
             _ => {
                 eprintln!(
                     "usage: build_prefix <model.gguf> <prompt.json> <drafter.gguf> <out.kv> \
-                     <n_ctx> <n_slots>"
+                     <n_ctx> <n_slots> <thinking on|off>"
                 );
                 std::process::exit(2);
             }
@@ -90,8 +109,8 @@ fn main() {
         Some(Ok(v)) => v,
         _ => {
             eprintln!(
-                "error: pass n_ctx explicitly; it must equal the app's \
-                 GEMMA4_E4B.contextWindow (shared/src/agent/model-profile.ts)"
+                "error: pass n_ctx explicitly; it must equal the brain profile's \
+                 contextWindow (shared/src/agent/model-profile.ts)"
             );
             std::process::exit(2);
         }
@@ -110,6 +129,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let enable_thinking = thinking_arg(args.next().as_deref());
 
     // The prompt arrives whole, `{system, tools: [{name, description,
     // parameters}]}`, written by the caller from the code its app runs (Scope's
@@ -143,10 +163,11 @@ fn main() {
     let _ = std::fs::remove_dir_all(&staging);
     let cfg = LlamaCppConfig {
         model_path: model_path.clone().into(),
-        draft_path: Some(draft.into()),
+        draft_path: Some(draft.clone().into()),
         prefix_cache_dir: Some(staging.clone()),
         n_ctx,
         n_slots,
+        enable_thinking,
         // Only the file NAME depends on this; the artifact is renamed by the
         // installing host anyway. Content depends on the fields above.
         state_key: "prefix-artifact".into(),
@@ -187,11 +208,32 @@ fn main() {
     // token check cannot catch, because in both cases the tokens are right and
     // the cached VALUES belong to something else: to a different model in the
     // weights case, and to a differently laid-out cache in the shape case.
-    use askfaro_core::generation::models::{GEMMA4_E4B_IT_QAT_Q4_0, GEMMA4_E4B_MTP_DRAFTER_Q4_0};
+    //
+    // The brain is recognised by the files it was given, so an E2B build can
+    // never print E4B's subpath. Anything else is refused: a subpath this
+    // cannot name is one no install would ever ask for.
+    use askfaro_core::generation::models::{
+        GEMMA4_E2B_IT_QAT_Q4_0, GEMMA4_E2B_MTP_DRAFTER_Q4_0, GEMMA4_E4B_IT_QAT_Q4_0,
+        GEMMA4_E4B_MTP_DRAFTER_Q4_0,
+    };
+    let file_name = |p: &str| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned());
+    let (brain, drafter) = [
+        (&GEMMA4_E4B_IT_QAT_Q4_0, &GEMMA4_E4B_MTP_DRAFTER_Q4_0),
+        (&GEMMA4_E2B_IT_QAT_Q4_0, &GEMMA4_E2B_MTP_DRAFTER_Q4_0),
+    ]
+    .into_iter()
+    .find(|(b, d)| {
+        file_name(&model_path).as_deref() == Some(b.files[0].name)
+            && file_name(&draft).as_deref() == Some(d.files[0].name)
+    })
+    .unwrap_or_else(|| {
+        eprintln!("no brain spec names {model_path} with drafter {draft}; refusing to print a subpath");
+        std::process::exit(1);
+    });
     println!(
         "artifact-subpath: {}-{}+{}/{shape}",
-        GEMMA4_E4B_IT_QAT_Q4_0.id,
-        &GEMMA4_E4B_IT_QAT_Q4_0.files[0].sha256[..12],
-        &GEMMA4_E4B_MTP_DRAFTER_Q4_0.files[0].sha256[..12],
+        brain.id,
+        &brain.files[0].sha256[..12],
+        &drafter.files[0].sha256[..12],
     );
 }
