@@ -605,6 +605,23 @@ pub struct LlamaCppConfig {
     /// Each costs its own tensors on top of the shared weights (48 MB for the
     /// rank-16 E2B tool add-on); none is applied unless a request names it.
     pub adapters: Vec<AdapterSpec>,
+    /// The add-on the persisted prefix is computed under: the one slot 0's
+    /// requests name, or `None` for the plain model.
+    ///
+    /// A KV state belongs to the weights that computed it, add-on included, so
+    /// a host whose slot-0 workload runs under an add-on gets nothing from a
+    /// plain-model prefix: the slot is cleared on the first request and the
+    /// whole prompt is read again. Measured on the desktop, 2026-11-10: 26.8s
+    /// on 7,873 tokens on every turn, with the plain prefix restored 32ms
+    /// earlier and unusable, and the host's after-turn `ensure_prefix` then
+    /// clearing the conversation to rebuild the plain one. Naming the add-on
+    /// here builds, saves and restores the prefix under it instead.
+    ///
+    /// Part of the file's key and of [`LlamaCppEngine::prefix_shape_id`]. An
+    /// add-on named here that did not load turns the persisted prefix off for
+    /// that load rather than falling back to a plain one: requests under any
+    /// other add-on, the plain model included, never touch the file.
+    pub prefix_adapter: Option<String>,
 }
 
 /// One add-on file and the name requests select it by.
@@ -639,6 +656,7 @@ impl Default for LlamaCppConfig {
             cache_type_v: KvCacheType::F16,
             cancel: None,
             adapters: Vec::new(),
+            prefix_adapter: None,
         }
     }
 }
@@ -1323,36 +1341,6 @@ impl LlamaCppEngine {
             decs.push(Decoder::Plain(c));
         }
 
-        let mut cached = std::collections::HashMap::new();
-        let mut prefix = PrefixState::Disabled;
-        if let Some(path) = Self::prefix_path_for(&self.cfg) {
-            prefix = PrefixState::Missing;
-            if path.exists() {
-                let t_restore = Instant::now();
-                match decs[0]
-                    .ctx()
-                    .state_seq_load_file(&path, 0, self.cfg.n_ctx as usize)
-                {
-                    Ok((toks, bytes)) => {
-                        eprintln!(
-                            "llama_cpp: restored a {}-token KV prefix from {} ({:.1} MB) in {}ms",
-                            toks.len(),
-                            path.display(),
-                            bytes as f64 / 1e6,
-                            t_restore.elapsed().as_millis(),
-                        );
-                        prefix = PrefixState::Restored(toks.len());
-                        cached.insert(0, toks);
-                    }
-                    Err(e) => eprintln!(
-                        "llama_cpp: could not restore the KV prefix from {} ({e}); \
-                         this launch pays a cold prefill and will rewrite it",
-                        path.display()
-                    ),
-                }
-            }
-        }
-
         // A missing or unreadable add-on is not fatal: the plain model is still
         // correct for every request that does not name it, and a request that
         // does is refused rather than answered without it.
@@ -1370,6 +1358,56 @@ impl LlamaCppEngine {
             }
         }
 
+        let mut cached = std::collections::HashMap::new();
+        let mut prefix = PrefixState::Disabled;
+        let mut slot_adapter = std::collections::HashMap::new();
+        // After the add-ons, because a prefix computed under one is only worth
+        // restoring when that add-on is here to decode on top of it.
+        let prefix_adapter_missing = self
+            .cfg
+            .prefix_adapter
+            .as_ref()
+            .is_some_and(|name| !adapters.contains_key(name));
+        if prefix_adapter_missing {
+            eprintln!(
+                "llama_cpp: the persisted prefix is computed under add-on {:?}, which did not \
+                 load; no prefix is restored or saved this load",
+                self.cfg.prefix_adapter.as_deref().unwrap_or_default(),
+            );
+        } else if let Some(path) = Self::prefix_path_for(&self.cfg) {
+            prefix = PrefixState::Missing;
+            if path.exists() {
+                let t_restore = Instant::now();
+                match decs[0]
+                    .ctx()
+                    .state_seq_load_file(&path, 0, self.cfg.n_ctx as usize)
+                {
+                    Ok((toks, bytes)) => {
+                        eprintln!(
+                            "llama_cpp: restored a {}-token KV prefix from {} ({:.1} MB) in {}ms",
+                            toks.len(),
+                            path.display(),
+                            bytes as f64 / 1e6,
+                            t_restore.elapsed().as_millis(),
+                        );
+                        prefix = PrefixState::Restored(toks.len());
+                        cached.insert(0, toks);
+                        // The slot now holds cells computed under the add-on,
+                        // and says so, or the first request under it would
+                        // clear them as another add-on's.
+                        if let Some(name) = &self.cfg.prefix_adapter {
+                            slot_adapter.insert(0, name.clone());
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "llama_cpp: could not restore the KV prefix from {} ({e}); \
+                         this launch pays a cold prefill and will rewrite it",
+                        path.display()
+                    ),
+                }
+            }
+        }
+
         self.loaded = Some(Loaded {
             ctx_adapter: vec![None; decs.len()],
             decs,
@@ -1379,7 +1417,7 @@ impl LlamaCppEngine {
             checkpoints: Default::default(),
             pinned_heads: Default::default(),
             adapters,
-            slot_adapter: Default::default(),
+            slot_adapter,
             draft_model,
             model,
         });
@@ -1503,6 +1541,12 @@ impl LlamaCppEngine {
         h.update([u8::from(cfg.enable_thinking)]);
         h.update([u8::from(cfg.swa_full)]);
         h.update([cfg.cache_type_k as u8, cfg.cache_type_v as u8]);
+        // WHICH add-on, by name. Its file is weights, so like the brain's it
+        // is the publisher's half of the key, not this one's.
+        if let Some(name) = &cfg.prefix_adapter {
+            h.update(b"\0prefix-adapter\0");
+            h.update(name.as_bytes());
+        }
         hex::encode(&h.finalize()[..6])
     }
 
@@ -1572,6 +1616,18 @@ impl LlamaCppEngine {
         // being caught means a silent full re-prefill on every launch rather
         // than an error anyone sees.
         h.update([cfg.cache_type_k as u8, cfg.cache_type_v as u8]);
+        // The add-on the state was computed under changes every value in it
+        // and nothing llama.cpp checks at restore. Hashed only when one is
+        // named, so a plain-model host keeps the file it already has.
+        if let Some(name) = &cfg.prefix_adapter {
+            h.update(b"\0prefix-adapter\0");
+            h.update(name.as_bytes());
+            h.update(b"\0");
+            if let Some(spec) = cfg.adapters.iter().find(|a| &a.name == name) {
+                h.update(spec.path.as_os_str().as_encoded_bytes());
+                h.update(len(&spec.path).to_le_bytes());
+            }
+        }
         hex::encode(&h.finalize()[..8])
     }
 
@@ -2124,16 +2180,22 @@ impl LlamaCppEngine {
                 "no prefix_cache_dir configured, so there is nowhere to persist a prefix".into(),
             ));
         };
-        if req.adapter.is_some() {
-            return Err(GenError::Invalid(
-                "the persisted prefix is the plain model's; it is never built under an add-on".into(),
-            ));
+        if req.adapter != self.cfg.prefix_adapter {
+            return Err(GenError::Invalid(format!(
+                "the persisted prefix is built under {:?} (`prefix_adapter`; None is the plain \
+                 model), and this request names {:?}",
+                self.cfg.prefix_adapter, req.adapter,
+            )));
         }
         self.clear_cancel();
         self.ensure_loaded()?;
-        // Slot 0 may hold an add-on's tokens and its context the add-on.
+        // Slot 0 may hold another add-on's tokens and its context that add-on.
+        // Under the prefix's own add-on this clears nothing, which is what
+        // lets a host call this right after a turn: the conversation in the
+        // slot starts with the prefix and stays.
         let at = self.loaded.as_ref().expect("loaded").addr(0);
-        self.use_adapter(at, None)?;
+        let under = self.cfg.prefix_adapter.clone();
+        self.use_adapter(at, under.as_deref())?;
         let prefix = self.stable_prefix(req)?;
         let current = {
             let loaded = self.loaded.as_ref().expect("loaded");
@@ -2383,9 +2445,9 @@ impl LlamaCppEngine {
         // splitting below stays field-level.
         let at = self.loaded.as_ref().expect("just loaded").addr(req.slot);
         let n_ctx = at.n_ctx;
-        // Before the persisted prefix is consulted: that prefix is the plain
-        // model's, and a slot 0 still holding an add-on's tokens must not be
-        // validated against it, let alone saved as it.
+        // Before the persisted prefix is consulted: that prefix belongs to one
+        // add-on (or the plain model), and a slot 0 still holding another's
+        // tokens must not be validated against it, let alone saved as it.
         self.use_adapter(at, req.adapter.as_deref())?;
 
         // --- render the prompt through the model's own template -------------
@@ -2465,8 +2527,10 @@ impl LlamaCppEngine {
         //
         // Slot 0 only. Other slots carry a host's background one-shots, which
         // are short, varied and have no prefix worth a file.
-        // Not under an add-on either: the file holds the plain model's KV.
-        let prefix_ms = if req.slot == 0 && req.adapter.is_none() {
+        // And only under the add-on the file was computed with
+        // (`prefix_adapter`; `None` is the plain model): a KV state is a
+        // function of the weights that wrote it.
+        let prefix_ms = if req.slot == 0 && req.adapter == self.cfg.prefix_adapter {
             self.settle_prefix(&req, &tokens)?
         } else {
             0
@@ -3700,6 +3764,31 @@ mod tests {
         assert_eq!(
             LlamaCppEngine::prefix_key_for(&cfg()),
             LlamaCppEngine::prefix_key_for(&c)
+        );
+    }
+
+    /// A prefix computed under an add-on is a different state from the plain
+    /// model's over the same tokens, and from another add-on's. The file name
+    /// and the published shape id both have to say which, because nothing at
+    /// restore can: the token list is identical and the values are not.
+    #[test]
+    fn the_prefix_adapter_moves_the_key_and_the_shape() {
+        let mut c = cfg();
+        c.adapters = vec![AdapterSpec { name: "tools".into(), path: "/w/tools.gguf".into() }];
+        // Configured but not the prefix's: the plain prefix is untouched.
+        assert_eq!(LlamaCppEngine::prefix_key_for(&cfg()), LlamaCppEngine::prefix_key_for(&c));
+        assert_eq!(LlamaCppEngine::prefix_shape_id(&cfg()), LlamaCppEngine::prefix_shape_id(&c));
+
+        c.prefix_adapter = Some("tools".into());
+        assert_ne!(LlamaCppEngine::prefix_key_for(&cfg()), LlamaCppEngine::prefix_key_for(&c));
+        assert_ne!(LlamaCppEngine::prefix_shape_id(&cfg()), LlamaCppEngine::prefix_shape_id(&c));
+
+        let mut other = c.clone();
+        other.adapters[0].path = "/w/tools-r3.gguf".into();
+        assert_ne!(
+            LlamaCppEngine::prefix_key_for(&c),
+            LlamaCppEngine::prefix_key_for(&other),
+            "a retrained add-on at another path is another state"
         );
     }
 

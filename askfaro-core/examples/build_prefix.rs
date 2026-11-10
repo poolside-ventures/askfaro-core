@@ -9,8 +9,14 @@
 //!
 //! ```sh
 //! cargo run --release --features llama-cpp --example build_prefix -- \
-//!   <model.gguf> <prompt.json> <drafter.gguf> <out.kv> <n_ctx> <n_slots> <thinking on|off>
+//!   <model.gguf> <prompt.json> <drafter.gguf> <out.kv> <n_ctx> <n_slots> <thinking on|off> \
+//!   [<add-on name> <add-on.gguf>]
 //! ```
+//!
+//! The add-on pair is for a host whose agent turn runs under one
+//! (`LlamaCppConfig::prefix_adapter`): the state is then computed under it,
+//! and a plain-model state is one that host never restores. Its name goes into
+//! the shape and its file's sha256 into the printed subpath.
 //!
 //! The engine config below MUST mirror the desktop's `brain_config` for every
 //! field that shapes the state (n_ctx, n_slots, swa_full, drafter): a state
@@ -18,7 +24,9 @@
 //! than an error, which is why the app also validates the token list against
 //! its first real prompt before trusting anything it downloaded.
 
-use askfaro_core::generation::{GenerateRequest, LlamaCppConfig, LlamaCppEngine, ToolSchema};
+use askfaro_core::generation::{
+    AdapterSpec, GenerateRequest, LlamaCppConfig, LlamaCppEngine, ToolSchema,
+};
 use serde_json::Value;
 
 /// `on` / `off`, the agent's thinking state. Required for the reason `n_ctx` is:
@@ -71,7 +79,9 @@ fn main() {
     if argv.first().map(String::as_str) == Some("--print-shape") {
         let mut shape = argv.iter().skip(1).map(|v| v.parse::<u32>());
         let (Some(Ok(n_ctx)), Some(Ok(n_slots))) = (shape.next(), shape.next()) else {
-            eprintln!("usage: build_prefix --print-shape <n_ctx> <n_slots> <thinking on|off>");
+            eprintln!(
+                "usage: build_prefix --print-shape <n_ctx> <n_slots> <thinking on|off> [<add-on name>]"
+            );
             std::process::exit(2);
         };
         let enable_thinking = thinking_arg(argv.get(3).map(String::as_str));
@@ -81,6 +91,7 @@ fn main() {
                 n_ctx,
                 n_slots,
                 enable_thinking,
+                prefix_adapter: argv.get(4).cloned(),
                 ..Default::default()
             })
         );
@@ -93,7 +104,7 @@ fn main() {
             _ => {
                 eprintln!(
                     "usage: build_prefix <model.gguf> <prompt.json> <drafter.gguf> <out.kv> \
-                     <n_ctx> <n_slots> <thinking on|off>"
+                     <n_ctx> <n_slots> <thinking on|off> [<add-on name> <add-on.gguf>]"
                 );
                 std::process::exit(2);
             }
@@ -130,6 +141,17 @@ fn main() {
         }
     };
     let enable_thinking = thinking_arg(args.next().as_deref());
+    // The add-on the agent turn runs under, when the host's does. Both or
+    // neither: a name without its file would hash a shape no state was built
+    // for.
+    let adapter: Option<(String, String)> = match (args.next(), args.next()) {
+        (Some(name), Some(path)) => Some((name, path)),
+        (None, _) => None,
+        (Some(name), None) => {
+            eprintln!("error: add-on {name} needs its .gguf path as the next argument");
+            std::process::exit(2);
+        }
+    };
 
     // The prompt arrives whole, `{system, tools: [{name, description,
     // parameters}]}`, written by the caller from the code its app runs (Scope's
@@ -171,13 +193,23 @@ fn main() {
         // Only the file NAME depends on this; the artifact is renamed by the
         // installing host anyway. Content depends on the fields above.
         state_key: "prefix-artifact".into(),
+        adapters: adapter
+            .iter()
+            .map(|(name, path)| AdapterSpec { name: name.clone(), path: path.into() })
+            .collect(),
+        prefix_adapter: adapter.as_ref().map(|(name, _)| name.clone()),
         ..Default::default()
     };
     let shape = LlamaCppEngine::prefix_shape_id(&cfg);
     let artifact_src = LlamaCppEngine::prefix_artifact_path(&cfg).expect("cache dir configured");
 
     let mut engine = LlamaCppEngine::new(cfg);
-    let req = GenerateRequest { system, tools, ..Default::default() };
+    let req = GenerateRequest {
+        system,
+        tools,
+        adapter: adapter.as_ref().map(|(name, _)| name.clone()),
+        ..Default::default()
+    };
     match engine.ensure_prefix(&req) {
         Ok(r) => eprintln!(
             "prefix: {} tokens, {:.1} MB, {}ms",
@@ -230,8 +262,23 @@ fn main() {
         eprintln!("no brain spec names {model_path} with drafter {draft}; refusing to print a subpath");
         std::process::exit(1);
     });
+    // An add-on is weights too: retrained under the same name it leaves the
+    // tokens and the shape as they were and changes every value, so its file's
+    // hash is part of the weights third of the key. Hashed here rather than
+    // looked up, because add-ons are the host's and this crate names none.
+    let addon = adapter
+        .as_ref()
+        .map(|(name, path)| {
+            use sha2::{Digest, Sha256};
+            let bytes = std::fs::read(path).unwrap_or_else(|e| {
+                eprintln!("cannot read add-on {path}: {e}");
+                std::process::exit(1);
+            });
+            format!("+{name}-{}", &hex::encode(Sha256::digest(&bytes))[..12])
+        })
+        .unwrap_or_default();
     println!(
-        "artifact-subpath: {}-{}+{}/{shape}",
+        "artifact-subpath: {}-{}+{}{addon}/{shape}",
         brain.id,
         &brain.files[0].sha256[..12],
         &drafter.files[0].sha256[..12],

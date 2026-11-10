@@ -161,6 +161,11 @@ required-features = ["llama-cpp"]
 name = "adapter_switch"
 required-features = ["llama-cpp"]
 
+# The persisted prefix under the add-on slot 0 runs with (`prefix_adapter`).
+[[example]]
+name = "adapter_prefix"
+required-features = ["llama-cpp"]
+
 # Regression test for the persisted KV prefix's invalidation. A stale restore
 # answers fluently and wrongly rather than erroring, so it needs a check that
 # reads the answer, not the timings. Same gate.
