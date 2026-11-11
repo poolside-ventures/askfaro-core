@@ -166,6 +166,11 @@ required-features = ["llama-cpp"]
 name = "adapter_prefix"
 required-features = ["llama-cpp"]
 
+# A streamed plain reply adds up to the returned one (`generate_streaming`).
+[[example]]
+name = "stream_text"
+required-features = ["llama-cpp"]
+
 # Regression test for the persisted KV prefix's invalidation. A stale restore
 # answers fluently and wrongly rather than erroring, so it needs a check that
 # reads the answer, not the timings. Same gate.

@@ -55,6 +55,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel, Special};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token_type::LlamaTokenAttr;
 use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 
@@ -739,6 +740,10 @@ enum PrefixState {
 pub struct LlamaCppEngine {
     cfg: LlamaCppConfig,
     loaded: Option<Loaded>,
+    /// The text sink of the call in progress, set only by
+    /// [`Self::generate_streaming`] and taken by `generate_impl`, so it
+    /// belongs to exactly one call.
+    stream_sink: Option<TextSink>,
     /// Kept beside `loaded` rather than inside it: the shim holds no borrow of
     /// the model (it is built from the template STRING), so it does not
     /// participate in the drop-order constraint above.
@@ -970,6 +975,7 @@ impl LlamaCppEngine {
             log_full_reprefill: LogThrottle::new(),
             log_pinned_restore: LogThrottle::new(),
             prefix_tokens_memo: None,
+            stream_sink: None,
             written_back: false,
         }
     }
@@ -2400,7 +2406,37 @@ impl GenerationEngine for LlamaCppEngine {
     }
 }
 
+/// Receives a reply's text as it is decoded. See
+/// [`LlamaCppEngine::generate_streaming`].
+pub type TextSink = Box<dyn FnMut(&str) + Send>;
+
 impl LlamaCppEngine {
+    /// [`GenerationEngine::generate`], handing the reply's text to `sink` as it
+    /// is decoded, so a host can show a reply being written rather than a wait.
+    ///
+    /// Only a PLAIN reply streams: no tools, no response schema, thinking off.
+    /// Those are the requests whose decoded text IS the answer. A tool call is
+    /// syntax until the parser reads it, a schema reply is JSON for the host,
+    /// and a thinking turn's reasoning is plain text the user must not be
+    /// shown as the answer, so for any of them `sink` is never called and this
+    /// is `generate`. Control tokens (the turn's end among them) are never
+    /// passed on.
+    ///
+    /// The pieces are the decoded text exactly as `generate` assembles it, so
+    /// together they are the returned `text` before its trim. The returned
+    /// response is still the authority: a host shows the stream, then the
+    /// result.
+    pub fn generate_streaming(
+        &mut self,
+        req: GenerateRequest,
+        sink: TextSink,
+    ) -> Result<GenerateResponse, GenError> {
+        self.stream_sink = Some(sink);
+        let out = self.generate(req);
+        self.stream_sink = None;
+        out
+    }
+
     fn generate_impl(&mut self, req: GenerateRequest) -> Result<GenerateResponse, GenError> {
         // Request validation FIRST, ahead of the weight load: a malformed
         // request must cost an error, not a multi-gigabyte model load. The
@@ -3092,6 +3128,11 @@ impl LlamaCppEngine {
         // appended below so the next turn's common-prefix scan sees them too.
         let mut cached = tokens.clone();
         let mut raw = String::new();
+        // A sink only for a plain reply (`generate_streaming` says why).
+        let mut sink = self
+            .stream_sink
+            .take()
+            .filter(|_| req.tools.is_empty() && req.json_schema.is_none() && !enable_thinking);
         let mut output_tokens = 0usize;
         let mut truncated = true;
         // The rendered text of the token that ended the turn, so it can be
@@ -3158,6 +3199,11 @@ impl LlamaCppEngine {
                 .token_to_str(next, Special::Tokenize)
                 .map_err(|e| GenError::Generate(e.to_string()))?;
             raw.push_str(&piece);
+            if let Some(s) = sink.as_mut() {
+                if !loaded.model.token_attr(next).contains(LlamaTokenAttr::Control) {
+                    s(&piece);
+                }
+            }
             output_tokens += 1;
             // Every committed token feeds the budget's state machine, exactly
             // once, in emission order: upstream's `common_sampler_accept`
@@ -3337,6 +3383,11 @@ impl LlamaCppEngine {
                             .token_to_str(*d, Special::Tokenize)
                             .map_err(|e| GenError::Generate(e.to_string()))?;
                         raw.push_str(&piece);
+                        if let Some(s) = sink.as_mut() {
+                            if !loaded.model.token_attr(*d).contains(LlamaTokenAttr::Control) {
+                                s(&piece);
+                            }
+                        }
                         output_tokens += 1;
                         cached.push(*d);
                         committed += 1;
