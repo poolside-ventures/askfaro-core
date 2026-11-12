@@ -123,6 +123,30 @@ const SWA_CHECKPOINTS_PER_SLOT: usize = 2;
 /// not as new evidence about the head.
 const PINNED_HEAD_MIN_TOKENS: usize = 64;
 
+/// How many kinds of request keep a head of their own at once. Each is a full
+/// sequence state of its head, a few MB at the desktop's head sizes; the
+/// desktop's background slot sends about six kinds.
+const MAX_GROUP_HEADS: usize = 12;
+
+/// How much of a kind's last prompt is kept to learn its head from.
+const GROUP_PREV_MAX_TOKENS: usize = 8192;
+
+/// A request kind's head: its slot, the add-on its cells were computed under,
+/// and the host's name for the kind (`GenerateRequest::cache_group`).
+type GroupKey = (u32, Option<String>, String);
+
+/// Which checkpoint a capture point is for.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Capture {
+    /// The per-turn ring (partial state: the base cache rewinds by trim).
+    Ring,
+    /// The slot's single shared head (partial state).
+    Pinned,
+    /// A request kind's head (FULL state: restored after any other kind ran,
+    /// when none of its base-cache cells are still in the sequence).
+    Group,
+}
+
 /// How long a throttled engine log stays quiet between emissions.
 ///
 /// The rewind guard's per-occurrence lines are diagnostic at one occurrence
@@ -764,6 +788,18 @@ pub struct LlamaCppEngine {
     /// shrinks, which is safe: a pin shorter than the true head restores
     /// less but is never wrong.
     head_len: std::collections::HashMap<u32, usize>,
+    /// Per request kind (`GenerateRequest::cache_group`): the length of the
+    /// head its prompts share, learned from the kind's last two prompts, and
+    /// the last prompt it was learned from. On the engine, like `head_len`, so
+    /// a reload can re-capture at once.
+    ///
+    /// The slot's single head above cannot serve a slot that alternates
+    /// kinds: it is learned as the overlap of CONSECUTIVE prompts, which for
+    /// two kinds is template boilerplate, and its restore needs the previous
+    /// prompt's cells still in the sequence. Measured on the desktop
+    /// (2026-11-10): 103 of 263 background calls re-read their whole prompt.
+    group_len: std::collections::HashMap<GroupKey, usize>,
+    group_prev: std::collections::HashMap<GroupKey, Vec<llama_cpp_2::token::LlamaToken>>,
     /// Throttles for the rewind guard's per-occurrence lines, which flood at
     /// backlog-drain volume (one line per background job).
     log_full_reprefill: LogThrottle,
@@ -870,6 +906,12 @@ struct Loaded {
     /// stable identity worth a file. Slot 0 never pins; the disk prefix
     /// already covers it.
     pinned_heads: std::collections::HashMap<u32, SwaCheckpoint>,
+    /// Each request kind's head, as a FULL sequence state (see `group_len`).
+    /// Valid only against this context, so it goes with it. Keyed by the
+    /// add-on too: cells computed under one are wrong under another, and an
+    /// add-on switch clears the slot but leaves these, each still right for
+    /// its own add-on.
+    group_heads: std::collections::HashMap<GroupKey, SwaCheckpoint>,
     /// The configured add-ons that loaded, by name. llama.cpp frees an
     /// add-on with the weights it was loaded against, so these need no drop
     /// order of their own.
@@ -972,6 +1014,8 @@ impl LlamaCppEngine {
             caps: None,
             warned: Default::default(),
             head_len: Default::default(),
+            group_len: Default::default(),
+            group_prev: Default::default(),
             log_full_reprefill: LogThrottle::new(),
             log_pinned_restore: LogThrottle::new(),
             prefix_tokens_memo: None,
@@ -1422,6 +1466,7 @@ impl LlamaCppEngine {
             prefix,
             checkpoints: Default::default(),
             pinned_heads: Default::default(),
+            group_heads: Default::default(),
             adapters,
             slot_adapter,
             draft_model,
@@ -2762,6 +2807,82 @@ impl LlamaCppEngine {
         // In tokens, because prefill_span sizes its batch to hold this: the
         // batch it returns is the one the speculative steps below reuse.
         let draft_slots = if speculative { 1 + draft_n_max } else { 0 };
+
+        // --- a request kind's own head -----------------------------------------
+        // Learned from the kind's previous prompt, and restored whole when this
+        // prompt starts with it and the sequence holds less of it: after a
+        // different kind of job ran on the slot, the cells are gone and the
+        // partial checkpoints below cannot bring them back.
+        let group: Option<GroupKey> = req
+            .cache_group
+            .as_ref()
+            .filter(|_| slot != 0)
+            .map(|g| (slot, req.adapter.clone(), g.clone()));
+        if let Some(key) = &group {
+            // A head this prompt starts with stays as it is: re-learning it
+            // from every pair moved it by a token or two and paid a fresh
+            // capture each time for nothing.
+            let head_fits = loaded
+                .group_heads
+                .get(key)
+                .is_some_and(|h| h.tokens.len() < tokens.len() && tokens.starts_with(&h.tokens));
+            if let Some(prev) = self.group_prev.get(key).filter(|_| !head_fits) {
+                let shared = prev.iter().zip(tokens.iter()).take_while(|(a, b)| a == b).count();
+                // The latest overlap, not the smallest ever seen: a kind's head
+                // moves with what it carries (a draft's voice and language
+                // come early in its prompt), and one odd pair must not shrink
+                // it for good. A head this prompt does not start with is just
+                // not used.
+                if shared >= PINNED_HEAD_MIN_TOKENS {
+                    self.group_len.insert(key.clone(), shared.min(tokens.len() - 1));
+                }
+            }
+            self.group_prev.insert(key.clone(), tokens[..tokens.len().min(GROUP_PREV_MAX_TOKENS)].to_vec());
+
+            let held = loaded
+                .cached
+                .get(&slot)
+                .map_or(0, |p| p.iter().zip(tokens.iter()).take_while(|(a, b)| a == b).count());
+            let head = loaded
+                .group_heads
+                .get(key)
+                .filter(|h| h.tokens.len() > held && h.tokens.len() < tokens.len() && tokens.starts_with(&h.tokens));
+            if let Some(h) = head {
+                let head_tokens = h.tokens.clone();
+                // Restoring clears the destination sequence first
+                // (state_read_meta), so nothing of the previous job survives.
+                match loaded.decs[at.ctx].ctx().state_seq_set(&h.state, at.seq) {
+                    Ok(()) => {
+                        if let Some(sup) = self.log_pinned_restore.permit() {
+                            eprintln!(
+                                "llama_cpp: slot {slot} restored the {}-token head of {:?}, \
+                                 re-prefilling {} instead of {} tokens{}",
+                                head_tokens.len(),
+                                key.2,
+                                tokens.len() - head_tokens.len(),
+                                tokens.len() - held,
+                                suppressed_note(sup),
+                            );
+                        }
+                        loaded.cached.insert(slot, head_tokens);
+                        loaded.checkpoints.remove(&slot);
+                    }
+                    Err(e) => {
+                        // Whatever a failed restore left behind is not
+                        // trusted: the slot starts empty and pays in full.
+                        eprintln!("llama_cpp: slot {slot} could not restore the head of {:?} ({e})", key.2);
+                        loaded.decs[at.ctx]
+                            .ctx()
+                            .kv_cache_seq_rm(at.seq, None, None)
+                            .map_err(|e| GenError::Generate(format!("kv clear: {e}")))?;
+                        loaded.cached.remove(&slot);
+                        loaded.checkpoints.remove(&slot);
+                        loaded.group_heads.remove(key);
+                    }
+                }
+            }
+        }
+
         let prior = loaded.cached.entry(slot).or_default();
         let common = prior
             .iter()
@@ -3042,7 +3163,7 @@ impl LlamaCppEngine {
         // The second entry of a same-position tie is dropped; positions never
         // coincide persistently (the head is fixed, prompt lengths vary), so
         // a skipped capture just retries next turn.
-        let mut capture: Vec<(usize, bool)> = Vec::new(); // (position, is_pinned)
+        let mut capture: Vec<(usize, Capture)> = Vec::new();
         if !self.cfg.swa_full {
             if tokens.len() > SWA_CHECKPOINT_TAIL_MARGIN {
                 let p = reuse.max(tokens.len() - SWA_CHECKPOINT_TAIL_MARGIN);
@@ -3051,7 +3172,7 @@ impl LlamaCppEngine {
                     .get(&slot)
                     .is_some_and(|r| r.iter().any(|c| c.tokens.len() == p && tokens.starts_with(&c.tokens)));
                 if !dup && p < tokens.len() {
-                    capture.push((p, false));
+                    capture.push((p, Capture::Ring));
                 }
             }
             if slot != 0 {
@@ -3065,16 +3186,29 @@ impl LlamaCppEngine {
                     // head has nothing to recapture, and a turn reusing past
                     // it will be covered by a later divergent turn's prefill.
                     if stale && reuse < h && h < tokens.len() {
-                        capture.push((h, true));
+                        capture.push((h, Capture::Pinned));
                     }
                 }
             }
         }
-        capture.sort_by_key(|&(p, _)| p);
-        capture.dedup_by_key(|e| e.0);
+        // A request kind's head, with or without a windowed cache: it is a full
+        // state either way, and what it saves is the head's prefill.
+        if let Some(key) = &group {
+            if let Some(&h) = self.group_len.get(key) {
+                let stale = loaded
+                    .group_heads
+                    .get(key)
+                    .is_none_or(|c| c.tokens.len() != h || !tokens.starts_with(&c.tokens));
+                if stale && reuse < h && h < tokens.len() {
+                    capture.push((h, Capture::Group));
+                }
+            }
+        }
+        capture.sort();
+        capture.dedup();
 
         let mut prefilled = reuse;
-        for &(cap, pin) in &capture {
+        for &(cap, kind) in &capture {
             // Decode up to the capture point first (no-op when the reuse
             // boundary already IS the capture point, i.e. an appended turn
             // whose fresh tail is shorter than the margin).
@@ -3082,26 +3216,51 @@ impl LlamaCppEngine {
                 Self::prefill_span(loaded, at, &tokens, prefilled, cap, draft_slots, cancel.as_ref())?;
                 prefilled = cap;
             }
+            // A kind's head is restored into an emptied sequence, so it has to
+            // carry every cell; the others restore over cells still there.
+            let flags = if kind == Capture::Group {
+                LlamaStateSeqFlags::empty()
+            } else {
+                LlamaStateSeqFlags::PARTIAL_ONLY
+            };
             // Best-effort: a turn without a checkpoint is a turn that may pay
             // a full re-prefill later, not a wrong turn.
-            match loaded.decs[at.ctx]
-                .ctx()
-                .state_seq_get(at.seq, LlamaStateSeqFlags::PARTIAL_ONLY)
-            {
+            match loaded.decs[at.ctx].ctx().state_seq_get(at.seq, flags) {
                 Ok(state) => {
                     let ckpt = SwaCheckpoint {
                         tokens: tokens[..cap].to_vec(),
                         state,
                     };
-                    if pin {
-                        eprintln!(
-                            "llama_cpp: pinned the {cap}-token shared head on slot {slot}"
-                        );
-                        loaded.pinned_heads.insert(slot, ckpt);
-                    } else {
-                        let ring = loaded.checkpoints.entry(slot).or_default();
-                        ring.push_front(ckpt);
-                        ring.truncate(SWA_CHECKPOINTS_PER_SLOT);
+                    match kind {
+                        Capture::Pinned => {
+                            eprintln!(
+                                "llama_cpp: pinned the {cap}-token shared head on slot {slot}"
+                            );
+                            loaded.pinned_heads.insert(slot, ckpt);
+                        }
+                        Capture::Ring => {
+                            let ring = loaded.checkpoints.entry(slot).or_default();
+                            ring.push_front(ckpt);
+                            ring.truncate(SWA_CHECKPOINTS_PER_SLOT);
+                        }
+                        Capture::Group => {
+                            let key = group.clone().expect("a Group capture has a group");
+                            if !loaded.group_heads.contains_key(&key)
+                                && loaded.group_heads.len() >= MAX_GROUP_HEADS
+                            {
+                                // Any one: kinds are few and their heads cheap
+                                // to re-learn, so no recency bookkeeping.
+                                if let Some(evict) = loaded.group_heads.keys().next().cloned() {
+                                    loaded.group_heads.remove(&evict);
+                                }
+                            }
+                            eprintln!(
+                                "llama_cpp: kept the {cap}-token head of {:?} on slot {slot} ({:.1} MB)",
+                                key.2,
+                                ckpt.state.byte_len() as f64 / 1e6,
+                            );
+                            loaded.group_heads.insert(key, ckpt);
+                        }
                     }
                 }
                 Err(e) => eprintln!("llama_cpp: checkpoint capture failed on slot {slot} ({e})"),

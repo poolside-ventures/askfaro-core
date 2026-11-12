@@ -171,6 +171,11 @@ required-features = ["llama-cpp"]
 name = "stream_text"
 required-features = ["llama-cpp"]
 
+# A request kind keeps its head across other kinds on one slot (`cache_group`).
+[[example]]
+name = "group_heads"
+required-features = ["llama-cpp"]
+
 # Regression test for the persisted KV prefix's invalidation. A stale restore
 # answers fluently and wrongly rather than erroring, so it needs a check that
 # reads the answer, not the timings. Same gate.

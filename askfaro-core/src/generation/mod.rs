@@ -250,6 +250,13 @@ pub struct GenerateRequest {
     /// request that names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+    /// The KIND of request this is, for a host that sends several kinds to one
+    /// slot: prompts of one kind share an instruction head, and the engine
+    /// keeps that head's cache per kind, restoring it whatever ran on the slot
+    /// in between. `None` keeps the slot's single shared head. Ignored on
+    /// slot 0, which has the persisted prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_group: Option<String>,
 }
 
 /// A single tool invocation the model emitted.
